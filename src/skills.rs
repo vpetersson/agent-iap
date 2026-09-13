@@ -34,7 +34,7 @@ pub struct Skill {
 
 /// The `skill://` URI namespace. MCP resource URIs are opaque to the client, so
 /// the only requirement is that ours cannot collide with a fronted server's.
-const SCHEME: &str = "skill://mcp-iap/";
+const SCHEME: &str = "skill://agent-iap/";
 
 /// The text served in the `initialize` response's `instructions` field, which
 /// is where an MCP client puts standing guidance in front of the model.
@@ -55,7 +55,7 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
     };
 
     let mut text = format!(
-        "mcp-iap is an identity-aware proxy. Call third-party APIs through \
+        "agent-iap is an identity-aware proxy. Call third-party APIs through \
          `iap_request` instead of over the network directly: it holds the \
          credentials, so you never need one and should never ask for one.\n\n\
          Reachable from here: {names}.\n\n\
@@ -120,7 +120,7 @@ fn reachable_upstreams<'a>(
 fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
     let mut text = String::new();
     text.push_str(
-        "# Calling APIs through mcp-iap\n\n\
+        "# Calling APIs through agent-iap\n\n\
          You do not hold the credentials for the services below, and you do not \
          need them. `iap_request` performs the call, attaches the real \
          credential inside the proxy, and returns you the response.\n\n\
@@ -192,7 +192,7 @@ fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
         uri: format!("{SCHEME}using-this-gateway"),
         name: "using-this-gateway".into(),
         title: "Using this gateway".into(),
-        description: "How to call APIs through mcp-iap, and how to read a refusal.".into(),
+        description: "How to call APIs through agent-iap, and how to read a refusal.".into(),
         text,
     }
 }
@@ -431,7 +431,7 @@ action = "allow"
     fn a_skill_is_reachable_by_short_name_or_by_uri() {
         let state = state();
         let agent = agent(&state, "claude");
-        let by_uri = find(&state, &agent, "skill://mcp-iap/upstream/anthropic").unwrap();
+        let by_uri = find(&state, &agent, "skill://agent-iap/upstream/anthropic").unwrap();
         let by_name = find(&state, &agent, "upstream/anthropic").unwrap();
         assert_eq!(by_uri.uri, by_name.uri);
         assert!(find(&state, &agent, "nothing-like-this").is_none());

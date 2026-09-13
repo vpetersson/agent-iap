@@ -64,7 +64,7 @@ pub async fn run(config: crate::config::Config, options: StdioOptions) -> Result
             .body(line)
             .send()
             .await
-            .context("the mcp-iap daemon did not answer")?;
+            .context("the agent-iap daemon did not answer")?;
 
         // 202 is the daemon acknowledging a notification. Nothing to relay, and
         // inventing a frame for it would desynchronise the ids.
@@ -99,7 +99,7 @@ pub async fn run(config: crate::config::Config, options: StdioOptions) -> Result
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": { "code": -32603, "message": format!("mcp-iap: {detail}") },
+                    "error": { "code": -32603, "message": format!("agent-iap: {detail}") },
                 })
             }
         };
@@ -121,15 +121,15 @@ async fn probe(http: &reqwest::Client, endpoint: &str, token: &str) -> Result<()
         .send()
         .await
         .with_context(|| {
-            format!("cannot reach the mcp-iap daemon at {endpoint} — start `mcp-iap run` first")
+            format!("cannot reach the agent-iap daemon at {endpoint} — start `agent-iap run` first")
         })?;
 
     match response.status() {
         status if status.is_success() => Ok(()),
         reqwest::StatusCode::UNAUTHORIZED => bail!("the agent token was not recognised"),
         reqwest::StatusCode::NOT_FOUND => bail!(
-            "the proxy at {endpoint} has no MCP gateway — it is an older mcp-iap than this one"
+            "the proxy at {endpoint} has no MCP gateway — it is an older agent-iap than this one"
         ),
-        status => bail!("the mcp-iap daemon answered the gateway probe with {status}"),
+        status => bail!("the agent-iap daemon answered the gateway probe with {status}"),
     }
 }

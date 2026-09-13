@@ -90,7 +90,7 @@ impl AppState {
             .connect_timeout(Duration::from_secs(
                 config.server.upstream_connect_timeout_secs,
             ))
-            .user_agent(concat!("mcp-iap/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("agent-iap/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the upstream HTTP client")?;
 
@@ -235,13 +235,13 @@ token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
     #[test]
     fn every_broken_reference_is_reported_not_just_the_first() {
         // Twenty upstreams should not mean twenty restarts to find three typos.
-        let config = config_with(&["env:MCP_IAP_NOT_SET_ONE", "env:MCP_IAP_NOT_SET_TWO"]);
+        let config = config_with(&["env:AGENT_IAP_NOT_SET_ONE", "env:AGENT_IAP_NOT_SET_TWO"]);
         let resolver = SecretResolver::new("op");
         let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
 
         assert!(error.contains("2 of 2"), "{error}");
-        assert!(error.contains("MCP_IAP_NOT_SET_ONE"), "{error}");
-        assert!(error.contains("MCP_IAP_NOT_SET_TWO"), "{error}");
+        assert!(error.contains("AGENT_IAP_NOT_SET_ONE"), "{error}");
+        assert!(error.contains("AGENT_IAP_NOT_SET_TWO"), "{error}");
     }
 
     #[test]
@@ -249,7 +249,7 @@ token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
         // The whole defect: `op` is not invoked unless a reference asks for it,
         // so naming it here sends the operator to sign into a vault this config
         // does not mention.
-        let config = config_with(&["env:MCP_IAP_NOT_SET_ONE"]);
+        let config = config_with(&["env:AGENT_IAP_NOT_SET_ONE"]);
         let resolver = SecretResolver::new("op");
         let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
 
@@ -259,10 +259,10 @@ token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn the_1password_hint_appears_when_an_op_reference_is_the_one_failing() {
-        let config = config_with(&["env:MCP_IAP_NOT_SET_ONE", "op://Vault/Item/field"]);
+        let config = config_with(&["env:AGENT_IAP_NOT_SET_ONE", "op://Vault/Item/field"]);
         // A binary that cannot exist, so the `op` branch fails without needing
         // the real CLI installed or signed in.
-        let resolver = SecretResolver::new("mcp-iap-no-such-op-binary");
+        let resolver = SecretResolver::new("agent-iap-no-such-op-binary");
         let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
 
         assert!(error.contains("is `op` signed in?"), "{error}");

@@ -4,8 +4,8 @@
 //! reader while the process keeps running, which is exactly what an in-process
 //! test of the reader cannot show.
 
-use mcp_iap::audit::{AuditLog, AuditRecord};
-use mcp_iap::config::AuditConfig;
+use agent_iap::audit::{AuditLog, AuditRecord};
+use agent_iap::config::AuditConfig;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -46,7 +46,7 @@ struct Tailer {
 
 impl Tailer {
     fn spawn(args: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-iap"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-iap"))
             .arg("audit")
             .arg("tail")
             .args(args)
@@ -167,7 +167,7 @@ fn without_follow_it_dumps_and_exits() {
     record(&log, "bravo", "/repos/one");
     record(&log, "bravo", "/repos/two");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mcp-iap"))
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-iap"))
         .args(["audit", "tail", path.to_str().unwrap(), "-n", "1"])
         .output()
         .unwrap();
@@ -183,7 +183,7 @@ fn a_named_log_that_is_not_there_is_an_error_rather_than_silence() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("nope.jsonl");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mcp-iap"))
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-iap"))
         .args(["audit", "tail", missing.to_str().unwrap()])
         .output()
         .unwrap();

@@ -5,11 +5,11 @@
 //! for, and that stops working the moment it is renewed or revoked — while the
 //! ACL keeps the last word on all of it.
 
+use agent_iap::config::Config;
+use agent_iap::state::AppState;
 use axum::extract::Request;
 use axum::routing::any;
 use axum::{Json, Router};
-use mcp_iap::config::Config;
-use mcp_iap::state::AppState;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -98,8 +98,8 @@ paths = ["/v1/messages"]
 action = "allow"
 "#,
         audit = audit_path.display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
-        other_hash = mcp_iap::identity::token_hash("iap_other_token"),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
+        other_hash = agent_iap::identity::token_hash("iap_other_token"),
         key = UPSTREAM_KEY,
     );
 
@@ -115,7 +115,7 @@ action = "allow"
         tokio::spawn(async move {
             axum::serve(
                 proxy_listener,
-                mcp_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                agent_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             .unwrap();
@@ -127,7 +127,7 @@ action = "allow"
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            axum::serve(control_listener, mcp_iap::admin::router(state))
+            axum::serve(control_listener, agent_iap::admin::router(state))
                 .await
                 .unwrap();
         });

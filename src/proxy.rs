@@ -46,7 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             crate::tokens::PROXY_PREFIX,
             Arc::clone(&state),
         ))
-        // mcp-iap's own MCP server. Same reserved prefix, and mounted before the
+        // agent-iap's own MCP server. Same reserved prefix, and mounted before the
         // fallback so it is a route rather than an upstream called `_iap`.
         .merge(crate::gateway::routes(Arc::clone(&state)))
         .fallback(handle)
@@ -104,7 +104,7 @@ impl Rejection {
         }
         let body = serde_json::json!({
             "error": { "type": self.code, "message": self.message },
-            "proxy": "mcp-iap",
+            "proxy": "agent-iap",
         });
         let mut response = (self.status, axum::Json(body)).into_response();
         response

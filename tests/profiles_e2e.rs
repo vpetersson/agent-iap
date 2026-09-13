@@ -6,12 +6,12 @@
 //! or rules are wrong fails here rather than against the vendor, and a change
 //! to `enroll` that stops producing what the proxy loads cannot pass.
 
+use agent_iap::config::Config;
+use agent_iap::profiles::{self, AddOptions};
+use agent_iap::state::AppState;
 use axum::extract::Request;
 use axum::routing::any;
 use axum::{Json, Router};
-use mcp_iap::config::Config;
-use mcp_iap::profiles::{self, AddOptions};
-use mcp_iap::state::AppState;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -71,11 +71,11 @@ async fn harness_from_profiles(specs: &[(&str, AddOptions)], upstream: SocketAdd
     let path = dir.path().join("iap.toml");
     let audit_path = dir.path().join("audit.jsonl");
 
-    mcp_iap::init::init(&mcp_iap::init::InitOptions {
+    agent_iap::init::init(&agent_iap::init::InitOptions {
         path: path.clone(),
         agent: "workflow-agent".into(),
         secret: None,
-        template: mcp_iap::init::Template::Minimal,
+        template: agent_iap::init::Template::Minimal,
         force: true,
     })
     .unwrap();
@@ -102,7 +102,7 @@ async fn harness_from_profiles(specs: &[(&str, AddOptions)], upstream: SocketAdd
 id = "workflow-agent"
 token_sha256 = "{}"
 "#,
-        mcp_iap::identity::token_hash(AGENT_TOKEN)
+        agent_iap::identity::token_hash(AGENT_TOKEN)
     ))
     .unwrap()];
     config.validate().unwrap();
@@ -115,7 +115,7 @@ token_sha256 = "{}"
     tokio::spawn(async move {
         axum::serve(
             listener,
-            mcp_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            agent_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
         .unwrap();
@@ -255,11 +255,11 @@ async fn graylog_authenticates_the_token_as_the_user_and_never_writes_it_down() 
     opts.vars = vec!["host=graylog.example.com:9000".into()];
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("iap.toml");
-    mcp_iap::init::init(&mcp_iap::init::InitOptions {
+    agent_iap::init::init(&agent_iap::init::InitOptions {
         path: path.clone(),
         agent: "a".into(),
         secret: None,
-        template: mcp_iap::init::Template::Minimal,
+        template: agent_iap::init::Template::Minimal,
         force: true,
     })
     .unwrap();
@@ -403,11 +403,11 @@ async fn every_mcp_profile_admits_the_handshake_it_would_otherwise_deny() {
         for level in &profile.access {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("iap.toml");
-            mcp_iap::init::init(&mcp_iap::init::InitOptions {
+            agent_iap::init::init(&agent_iap::init::InitOptions {
                 path: path.clone(),
                 agent: "a".into(),
                 secret: None,
-                template: mcp_iap::init::Template::Minimal,
+                template: agent_iap::init::Template::Minimal,
                 force: true,
             })
             .unwrap();
@@ -423,10 +423,10 @@ async fn every_mcp_profile_admits_the_handshake_it_would_otherwise_deny() {
                 .unwrap_or_else(|error| panic!("{}/{}: {error:#}", profile.id, level.name));
 
             let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            let acl = mcp_iap::acl::Acl::compile(&config).unwrap();
-            let request = mcp_iap::acl::AccessRequest {
+            let acl = agent_iap::acl::Acl::compile(&config).unwrap();
+            let request = agent_iap::acl::AccessRequest {
                 agent: "any-agent".into(),
-                kind: mcp_iap::acl::Kind::Mcp,
+                kind: agent_iap::acl::Kind::Mcp,
                 target: config.mcp_servers[0].name.clone(),
                 method: "initialize".into(),
                 // `initialize` names no tool, which is exactly why it is the
@@ -435,7 +435,7 @@ async fn every_mcp_profile_admits_the_handshake_it_would_otherwise_deny() {
             };
             assert_eq!(
                 acl.evaluate(&request).action,
-                mcp_iap::config::Action::Allow,
+                agent_iap::config::Action::Allow,
                 "{}/{}: `initialize` is not allowed, so the session never opens",
                 profile.id,
                 level.name
@@ -453,11 +453,11 @@ fn every_profile_produces_a_policy_file_the_proxy_would_load() {
         for level in &profile.access {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("iap.toml");
-            mcp_iap::init::init(&mcp_iap::init::InitOptions {
+            agent_iap::init::init(&agent_iap::init::InitOptions {
                 path: path.clone(),
                 agent: "a".into(),
                 secret: None,
-                template: mcp_iap::init::Template::Minimal,
+                template: agent_iap::init::Template::Minimal,
                 force: true,
             })
             .unwrap();
@@ -508,11 +508,11 @@ fn every_profile_produces_a_policy_file_the_proxy_would_load() {
 fn a_dry_run_writes_nothing_and_prints_what_it_would_have() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("iap.toml");
-    mcp_iap::init::init(&mcp_iap::init::InitOptions {
+    agent_iap::init::init(&agent_iap::init::InitOptions {
         path: path.clone(),
         agent: "a".into(),
         secret: None,
-        template: mcp_iap::init::Template::Minimal,
+        template: agent_iap::init::Template::Minimal,
         force: true,
     })
     .unwrap();

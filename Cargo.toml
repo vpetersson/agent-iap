@@ -1,10 +1,10 @@
 [package]
-name = "mcp-iap"
+name = "agent-iap"
 version = "2026.9.0"
 edition = "2021"
 description = "Identity-Aware Proxy for LLM agents: authenticated, ACL-gated, fully audited access to APIs and MCP servers without ever handing the agent the real credential."
 license = "MIT"
-repository = "https://github.com/vpetersson/mcp-iap"
+repository = "https://github.com/vpetersson/agent-iap"
 readme = "README.md"
 keywords = ["proxy", "mcp", "agent", "security", "audit"]
 categories = ["command-line-utilities", "network-programming"]
