@@ -623,6 +623,37 @@ impl Config {
         Ok(config)
     }
 
+    /// Where the audit log lives, read from the policy file without validating
+    /// the rest of it. Inspecting the log is how a proxy that will not start
+    /// gets investigated, so a policy error elsewhere must not stand between an
+    /// operator and the evidence.
+    pub fn audit_path_of(config_path: &Path) -> Result<PathBuf> {
+        #[derive(Deserialize, Default)]
+        struct AuditSection {
+            path: Option<PathBuf>,
+        }
+        #[derive(Deserialize, Default)]
+        struct AuditOnly {
+            #[serde(default)]
+            audit: AuditSection,
+        }
+
+        let text = std::fs::read_to_string(config_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "no config at `{}` — run `mcp-iap init` to write one, or name the audit log to read",
+                    config_path.display()
+                )
+            } else {
+                anyhow::Error::new(error)
+                    .context(format!("reading config `{}`", config_path.display()))
+            }
+        })?;
+        let parsed: AuditOnly = toml::from_str(&text)
+            .with_context(|| format!("parsing config `{}`", config_path.display()))?;
+        Ok(parsed.audit.path.unwrap_or_else(default_audit_path))
+    }
+
     pub fn upstream(&self, name: &str) -> Option<&UpstreamConfig> {
         self.upstreams.iter().find(|u| u.name == name)
     }
@@ -1261,6 +1292,53 @@ type = "service_account_jwt"
             .expect("a bare key_file is the Google case");
         assert_eq!(config.secret_refs(), vec!["env:SA"]);
         assert!(config.upstreams[0].auth.mints_tokens());
+    }
+
+    #[test]
+    fn the_audit_path_is_read_from_the_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+
+        std::fs::write(
+            &path,
+            format!("{MINIMAL}\n[audit]\npath = \"logs/iap.jsonl\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            Config::audit_path_of(&path).unwrap(),
+            PathBuf::from("logs/iap.jsonl")
+        );
+
+        // No `[audit]` section is the same log the proxy would write.
+        std::fs::write(&path, MINIMAL).unwrap();
+        assert_eq!(Config::audit_path_of(&path).unwrap(), default_audit_path());
+    }
+
+    #[test]
+    fn the_audit_path_survives_a_policy_the_proxy_would_reject() {
+        // Reading the log is how a proxy that will not start gets investigated,
+        // so an unrelated policy error must not hide where the evidence is.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        let broken = format!(
+            "{MINIMAL}\n[audit]\npath = \"logs/iap.jsonl\"\n             [server.workload_identity]\nlifetime_secs = 1\n"
+        );
+        std::fs::write(&path, &broken).unwrap();
+
+        assert!(Config::load(&path).is_err(), "the policy is invalid");
+        assert_eq!(
+            Config::audit_path_of(&path).unwrap(),
+            PathBuf::from("logs/iap.jsonl")
+        );
+    }
+
+    #[test]
+    fn a_missing_policy_file_says_so_rather_than_guessing_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = Config::audit_path_of(&dir.path().join("absent.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no config at"), "{error}");
     }
 
     #[test]
