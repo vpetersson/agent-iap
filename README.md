@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Agent IAP" width="420">
+</p>
+
 # mcp-iap
 
 [![CI](https://github.com/vpetersson/mcp-iap/actions/workflows/ci.yml/badge.svg)](https://github.com/vpetersson/mcp-iap/actions/workflows/ci.yml)
