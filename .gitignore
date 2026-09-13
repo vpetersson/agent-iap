@@ -1,5 +1,15 @@
 /target
-/iap.toml
-/audit
+
+# Policy config. A real one carries credential references, agent tokens and the
+# ACL — `--config`/`IAP_CONFIG` accept any path, so do not anchor to the root.
+# The documented template stays tracked.
+iap.toml
+iap.*.toml
+!iap.example.toml
+
+# Audit log, wherever `audit.path` puts it, and the control-plane bearer token
+# `run` writes beside it.
+audit/
+iap-audit.*
 *.jsonl
 admin-token
