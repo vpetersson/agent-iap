@@ -29,17 +29,33 @@ The PNGs are cropped to the ink with a 48px margin, flattened onto a flat
 `#fbf9f5` (the master's field carries a little generation noise) and saved as
 64-colour palette PNGs.
 
-The SVGs are a per-colour contour trace of the same master: background found by
-colour distance to the cream — under 15 is background, including the enclosed
-holes like the shackle opening and the letter counters — ink quantised to 18
-colours, each colour's mask traced with `potrace --alphamax 0 --opttolerance 0`
-so edges stay polygonal, and each mask grown a pixel before tracing so adjacent
-colours cannot leave a hairline crack between them. Plain `<path fill="#rrggbb">`
-only: no filters, no gradients, no embedded raster, no fonts, nothing that
-renders differently between one SVG engine and the next.
+The SVGs are not a trace of the raster — a trace just re-encodes the raster's
+grain. They are a rebuild. The source is pixel-art *styled* but it is not drawn
+on a pixel grid: fitting a lattice to its edges gives a circular concentration
+of 0.36 with residuals of 2-3px on a 12px period, cut spacings spread evenly
+over 8-18px with no mode, and the wordmark's apparent step (~18px) differs from
+the mark's (~12px). So the rebuild works in two stages. First the artwork is
+reduced to the seven flat colours a designer would have picked, with the
+antialiasing, the drop shadow, the inner bevels and the navy gradient all
+resolved into whichever real colour they were sitting between — those are raster
+decoration, and on a transparent background they read as grey grime. Then each
+colour region's boundary is regularised to the artwork's own step size (12px
+across the mark's silhouette, 4px over the node icons, the connectors and the
+wordmark, where the source edges are already clean) and polygonised on pixel
+boundaries, so every segment comes out horizontal or vertical with long runs
+instead of 1px jitter.
 
-Two properties worth preserving if these are ever regenerated: no boundary pixel
-of the artwork may be light — an antialiasing blend toward the cream, promoted
-to its own pale ink colour, shows up as a halo the moment the logo lands on a
-dark background — and adjacent colour regions must not separate into hairline
-seams.
+The palette is exactly `#001c44`, `#044ca4`, `#0868d8`, `#0cccfc`, `#24f4d8`,
+`#58d8d8` and `#e0f0f0`. Plain `<path fill="#rrggbb">` only: no filters, no
+gradients, no embedded raster, no fonts, nothing that renders differently
+between one SVG engine and the next — rsvg and cairosvg render them
+pixel-identically.
+
+Three properties worth checking if these are ever regenerated. No fill may be a
+desaturated grey — a grey means an antialiasing blend or a shadow survived
+classification, and it reads as a halo the moment the logo lands on a dark
+background. Every path segment must be horizontal or vertical, with a median run
+length in the neighbourhood of the artwork's step size rather than 1px. And the
+features that every failed attempt has destroyed are the globe's grid, the
+server's bars, the dial needle, and the "I" of IAP, whose serif bars vanish the
+moment the wordmark is snapped to a lattice — check those four by eye.
