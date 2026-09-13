@@ -25,17 +25,27 @@ max_body_bytes = 10485760
 # [server.tls]
 # cert = "file:/etc/mcp-iap/fullchain.pem"     # PEM chain, leaf first
 # key  = "op://Infra/mcp-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
+# ca   = "file:/etc/mcp-iap/root_ca.crt"       # the CA that signed `cert`
 #
-# Any provider works — these are a PEM chain and a PEM key, nothing more. The
-# two shortest paths, both written up in the README under "TLS":
+# `ca` is optional and is what `mcp-iap mcp` verifies the control plane against.
+# Omit it for a public CA, which every trust store already has, and for a
+# self-signed certificate, which is its own CA. Name it for a private CA, so the
+# anchor is the root rather than whatever the served chain happens to contain.
+# It is read by this process only — agents are other processes, and they need
+# the root through their own trust store.
+#
+# Any provider works — these are PEM files, nothing more. The two shortest
+# paths, both written up in the README under "TLS":
 #
 #   tailscale  sudo tailscale cert --cert-file … --key-file … host.tailnet.ts.net
-#              A publicly trusted certificate, so agents need no CA anywhere.
-#              Valid for the ts.net name only, so bind `listen` to the tailnet
-#              address rather than 0.0.0.0.
+#              A publicly trusted certificate, so no `ca` and nothing for agents
+#              to install. Valid for the ts.net name only, so bind `listen` to
+#              the tailnet address rather than 0.0.0.0. 90 days, and renewing
+#              means re-running the command and restarting.
 #   step-ca    step ca certificate iap.internal.example.com fullchain.pem key.pem
-#              Your own CA, the way internal x509 usually works: every host an
-#              agent runs on has to be given `step ca root`'s output.
+#              step ca root root_ca.crt
+#              Your own CA, the way internal x509 usually works: `ca` points at
+#              the root, and every host an agent runs on has to be given it too.
 #
 # The control plane follows onto HTTPS with the same certificate. Give it one of
 # its own when that certificate does not name the address the control plane is
@@ -45,6 +55,7 @@ max_body_bytes = 10485760
 # [server.admin_tls]
 # cert = "file:/etc/mcp-iap/admin-fullchain.pem"
 # key  = "file:/etc/mcp-iap/admin-key.pem"
+# ca   = "file:/etc/mcp-iap/root_ca.crt"
 
 # Workload identity. The agent token above says *who* is calling; it is
 # long-lived and identical for every call that agent ever makes. A workload

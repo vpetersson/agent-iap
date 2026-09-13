@@ -244,7 +244,8 @@ approval_timeout_secs = 120      # an unanswered `ask` denies after this
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
 # control plane follows onto HTTPS with the same certificate. Any provider
 # works; `tailscale cert` and `step ca certificate` are the two the README
-# walks through.
+# walks through. Add `ca = "file:…"` for a private CA, so `mcp-iap mcp`
+# verifies the control plane against the root rather than the served chain.
 # [server.tls]
 # cert = "file:/etc/mcp-iap/fullchain.pem"
 # key = "op://Infra/mcp-iap tls/private key"
@@ -282,7 +283,8 @@ approval_timeout_secs = 120      # an unanswered `ask` denies after this
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
 # control plane follows onto HTTPS with the same certificate. Any provider
 # works; `tailscale cert` and `step ca certificate` are the two the README
-# walks through.
+# walks through. Add `ca = "file:…"` for a private CA, so `mcp-iap mcp`
+# verifies the control plane against the root rather than the served chain.
 # [server.tls]
 # cert = "file:/etc/mcp-iap/fullchain.pem"
 # key = "op://Infra/mcp-iap tls/private key"

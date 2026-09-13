@@ -85,7 +85,37 @@ pub fn scheme(tls: bool) -> &'static str {
 fn load_one(tls: &TlsConfig, resolver: &SecretResolver) -> Result<Arc<rustls::ServerConfig>> {
     let cert = resolver.resolve(&tls.cert).context("cert")?;
     let key = resolver.resolve(&tls.key).context("key")?;
+    // The listener never uses `ca` — the bridge does, in a different process
+    // started at a different time. Prove it anyway, here, where a human is
+    // watching the daemon come up: a CA reference that does not resolve is a
+    // policy file that is already wrong, and the alternative is finding out
+    // from an agent whose MCP server would not start.
+    if tls.ca.is_some() {
+        trust_anchors(tls, resolver).context("ca")?;
+    }
     build(cert.expose(), key.expose())
+}
+
+/// The certificates a client of this listener should verify it against.
+///
+/// `ca` when the policy file names one: the CA is the trust anchor, and the
+/// chain the listener serves is just a path to it. Otherwise `cert` itself,
+/// which makes the certificate its own anchor — correct for the self-signed
+/// case, and the only thing available when nobody said otherwise.
+fn trust_anchors(tls: &TlsConfig, resolver: &SecretResolver) -> Result<Vec<reqwest::Certificate>> {
+    let (reference, field) = match &tls.ca {
+        Some(ca) => (ca, "ca"),
+        None => (&tls.cert, "cert"),
+    };
+    let pem = resolver
+        .resolve(reference)
+        .with_context(|| format!("resolving `{field}`"))?;
+    let anchors = reqwest::Certificate::from_pem_bundle(pem.expose().as_bytes())
+        .with_context(|| format!("parsing `{field}`"))?;
+    if anchors.is_empty() {
+        bail!("the `{field}` reference resolved to no PEM certificate");
+    }
+    Ok(anchors)
 }
 
 /// Turn a PEM chain and a PEM key into a server config.
@@ -163,24 +193,22 @@ pub fn serve(
     })
 }
 
-/// An HTTP client that trusts the control plane's own certificate.
+/// An HTTP client that trusts whatever signed the control plane's certificate.
 ///
 /// The MCP bridge reads the same policy file as the daemon, so when the control
 /// plane serves a certificate no public root signs — the normal case for a
-/// loopback listener — the bridge can trust exactly that one and nothing else
-/// new. Public roots stay trusted, so a real certificate needs nothing here.
+/// loopback listener — the bridge can trust exactly that one CA and nothing
+/// else new. Public roots stay trusted, so a real certificate needs nothing
+/// here, and verification is never turned off in any of the three cases.
 pub fn control_plane_client(
     material: Option<&TlsConfig>,
     resolver: &SecretResolver,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Some(tls) = material {
-        let pem = resolver
-            .resolve(&tls.cert)
-            .context("resolving the control plane's certificate")?;
-        let certificates = reqwest::Certificate::from_pem_bundle(pem.expose().as_bytes())
-            .context("parsing the control plane's certificate")?;
-        for certificate in certificates {
+        for certificate in
+            trust_anchors(tls, resolver).context("the control plane's TLS material")?
+        {
             builder = builder.add_root_certificate(certificate);
         }
     }
@@ -276,6 +304,7 @@ mod tests {
         let material = TlsConfig {
             cert: format!("literal:{cert}"),
             key: format!("literal:{key}"),
+            ca: None,
         };
 
         let mut server = ServerConfig {
@@ -295,6 +324,7 @@ mod tests {
         let own = TlsConfig {
             cert: format!("literal:{other_cert}"),
             key: format!("literal:{other_key}"),
+            ca: None,
         };
         server.admin_tls = Some(own.clone());
         assert_eq!(server.admin_tls_material(), Some(&own));
@@ -320,6 +350,7 @@ mod tests {
             admin_tls: Some(TlsConfig {
                 cert: format!("literal:{cert}"),
                 key: format!("literal:{key}"),
+                ca: None,
             }),
             ..Default::default()
         };
@@ -329,11 +360,54 @@ mod tests {
     }
 
     #[test]
+    fn a_ca_that_does_not_resolve_stops_startup_and_names_the_field() {
+        // The listener itself would come up fine without ever reading `ca`.
+        // Finding out it is wrong from an agent whose MCP server will not start
+        // is strictly worse than finding out here.
+        let (cert, key) = self_signed();
+        let server = ServerConfig {
+            admin_tls: Some(TlsConfig {
+                cert: format!("literal:{cert}"),
+                key: format!("literal:{key}"),
+                ca: Some("file:/nonexistent/mcp-iap/root_ca.crt".into()),
+            }),
+            ..Default::default()
+        };
+        let error = format!(
+            "{:#}",
+            ServerTls::load(&server, &SecretResolver::new("op")).unwrap_err()
+        );
+        assert!(error.contains("server.admin_tls"), "{error}");
+        assert!(error.contains("ca"), "{error}");
+    }
+
+    #[test]
+    fn a_ca_holding_no_certificate_is_caught_at_startup_rather_than_trusting_nothing() {
+        // An empty bundle parses to an empty anchor list, which would load
+        // happily and then refuse every connection the bridge makes.
+        let (cert, key) = self_signed();
+        let server = ServerConfig {
+            tls: Some(TlsConfig {
+                cert: format!("literal:{cert}"),
+                key: format!("literal:{key}"),
+                ca: Some("literal:# a comment, and no certificate".into()),
+            }),
+            ..Default::default()
+        };
+        let error = format!(
+            "{:#}",
+            ServerTls::load(&server, &SecretResolver::new("op")).unwrap_err()
+        );
+        assert!(error.contains("`ca`"), "{error}");
+    }
+
+    #[test]
     fn the_error_names_which_section_failed() {
         let server = ServerConfig {
             tls: Some(TlsConfig {
                 cert: "file:/nonexistent/mcp-iap/cert.pem".into(),
                 key: "file:/nonexistent/mcp-iap/key.pem".into(),
+                ca: None,
             }),
             ..Default::default()
         };

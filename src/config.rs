@@ -88,6 +88,17 @@ pub struct TlsConfig {
     pub cert: String,
     /// PEM private key — PKCS#8, PKCS#1 or SEC1.
     pub key: String,
+    /// The CA that signed `cert`, for the clients this project runs itself —
+    /// today, the MCP bridge dialling the control plane.
+    ///
+    /// Absent, those clients verify against `cert` instead. That is exactly
+    /// right for a self-signed certificate, which is its own CA, and an
+    /// accident for anything else: it makes the trust anchor whatever the
+    /// chain file happens to contain, so the same deployment works or does not
+    /// depending on whether someone bundled the intermediate. Naming the CA
+    /// says which certificate is the anchor instead of inferring it.
+    #[serde(default)]
+    pub ca: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -699,6 +710,9 @@ impl Config {
             let Some(tls) = tls else { continue };
             SecretRef::parse(&tls.cert).with_context(|| format!("{label}.cert"))?;
             SecretRef::parse(&tls.key).with_context(|| format!("{label}.key"))?;
+            if let Some(ca) = &tls.ca {
+                SecretRef::parse(ca).with_context(|| format!("{label}.ca"))?;
+            }
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -811,6 +825,9 @@ impl Config {
         {
             refs.push(tls.cert.clone());
             refs.push(tls.key.clone());
+            if let Some(ca) = &tls.ca {
+                refs.push(ca.clone());
+            }
         }
         for agent in &self.agents {
             if let Some(reference) = &agent.token_ref {
@@ -1152,6 +1169,51 @@ min_version = "1.0"
         .unwrap_err()
         .to_string();
         assert!(error.contains("min_version"), "{error}");
+    }
+
+    #[test]
+    fn a_ca_is_optional_and_is_preloaded_like_any_other_reference() {
+        let without: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/c.pem"
+key = "file:/k.pem"
+"#
+        ))
+        .unwrap();
+        without.validate().unwrap();
+        assert_eq!(without.server.tls.as_ref().unwrap().ca, None);
+
+        let with: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/c.pem"
+key = "file:/k.pem"
+ca = "file:/root_ca.crt"
+"#
+        ))
+        .unwrap();
+        with.validate().unwrap();
+        // `check` resolves what it lists, so a CA missing from here would be a
+        // reference nobody proves until the bridge needs it.
+        assert!(with
+            .secret_refs()
+            .contains(&"file:/root_ca.crt".to_string()));
+    }
+
+    #[test]
+    fn a_ca_that_is_not_a_reference_is_rejected_with_the_field_named() {
+        let config: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/c.pem"
+key = "file:/k.pem"
+ca = "/root_ca.crt"
+"#
+        ))
+        .unwrap();
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert!(error.contains("server.tls.ca"), "{error}");
     }
 
     #[test]
