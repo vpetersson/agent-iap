@@ -239,6 +239,17 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic
 export ANTHROPIC_AUTH_TOKEN=iap_...        # the token from step 2, not your API key
 ```
 
+Or, for an agent rather than an SDK, give it the proxy as an MCP server and let
+it discover the rest — what it can reach, and how to call it, come back from the
+policy itself. See § MCP:
+
+```json
+{ "mcpServers": { "iap": {
+    "type": "http",
+    "url": "http://127.0.0.1:8080/_iap/mcp",
+    "headers": { "Authorization": "Bearer iap_..." } } } }
+```
+
 `init` writes the proxy and nothing else, on purpose: a starter file that
 guesses at an upstream is a file you have to read before you can trust it, and a
 token minted for an agent you may never create is a live credential sitting in
@@ -1043,6 +1054,95 @@ agent token for nothing but asking again.
 
 ## MCP
 
+Two things share the name here and point in opposite directions.
+
+- **The gateway** makes *mcp-iap itself* an MCP server. An agent gets the REST
+  APIs this proxy fronts as tools, plus skills generated from the policy that is
+  actually running. This is the default way to hand an agent an API.
+- **The bridge** points the other way: it fronts somebody else's MCP server, the
+  way an upstream fronts somebody else's REST API.
+
+### The gateway
+
+The HTTP proxy is the right surface for a program: point an SDK at
+`http://127.0.0.1:8080/<upstream>` and it works unchanged. It is the wrong one
+for an agent, which has to be told out of band that the proxy exists, what it
+fronts and what it will refuse — none of which is discoverable from a base URL.
+MCP is the idiom agents already discover, so the same upstreams are offered over
+it:
+
+```json
+{ "mcpServers": { "iap": {
+    "type": "http",
+    "url": "http://127.0.0.1:8080/_iap/mcp",
+    "headers": { "Authorization": "Bearer iap_..." } } } }
+```
+
+For a client that only spawns commands, `mcp-iap gateway` is the same server on
+stdio — a thin relay to the daemon, holding no credential but the agent's token:
+
+```json
+{ "mcpServers": { "iap": {
+    "command": "mcp-iap",
+    "args": ["gateway", "--config", "/etc/mcp-iap/iap.toml"],
+    "env": { "IAP_TOKEN": "iap_..." } } } }
+```
+
+Three tools, and no new policy to write — `iap_request` is decided by the same
+`kind = "http"` rules the proxy already uses, through the same function:
+
+| Tool | What it does |
+| --- | --- |
+| `iap_request` | One HTTP call against a configured upstream. The proxy attaches the credential. |
+| `iap_catalog` | The upstreams this agent may reach, with base URL and credential scheme. |
+| `iap_skill` | One generated skill document. |
+
+```jsonc
+// tools/call → iap_request
+{ "upstream": "anthropic", "method": "POST", "path": "/v1/messages",
+  "query": { "limit": 10 }, "body": { "model": "…" } }
+```
+
+`path` is the path the upstream sees, never a full URL. A credential header the
+agent sets is dropped rather than forwarded, so it cannot ride alongside the one
+the proxy attaches. A refusal comes back as an MCP tool error — `policy_denied`,
+`target_not_permitted`, `approval_denied`, `scope_exceeded` — rather than a
+JSON-RPC error, because the model is the one that has to read it and pick
+something else. The upstream's own `4xx` is a normal result, labelled with its
+status so it does not read as a refusal.
+
+#### Skills, and why they are generated
+
+An agent that finds a tool called `iap_request` learns nothing from the name
+about which upstreams exist or which paths are allowed, and a static README
+would go stale the first time a rule changed. So the gateway serves documents
+built from the running policy, for the agent that asked — two agents on one
+daemon are told two different things, each describing only what that one can
+actually reach:
+
+- The `initialize` response's `instructions` field: what this proxy is, that
+  credentials are never the agent's to hold, that refusals are final and
+  approvals are slow.
+- `using-this-gateway` — how to call, how to read each refusal code, and what
+  is recorded.
+- `upstream/<name>` — base URL, the credential *scheme* the proxy attaches, and
+  the rules that apply to this agent in match order.
+
+They are readable both as MCP resources (`skill://mcp-iap/…`) and through
+`iap_skill`, for clients that only do tools. A skill names the scheme —
+`header x-api-key` — because that is how an agent stops trying to set the header
+itself. The secret behind it stays in the daemon.
+
+#### What the gateway does not do
+
+Responses are buffered, not streamed: a JSON-RPC result cannot be a stream, so a
+response is read up to `max_body_bytes` and truncation is reported in the
+result. Streaming output is what the HTTP proxy is for, and it is still there —
+the gateway is the default way in, not the only one. JSON-RPC batching is not
+accepted, having been dropped from the protocol revision this implements.
+
+### The bridge
+
 MCP over HTTP is just HTTP — front it as an upstream. For stdio servers, the
 agent runs the bridge as its MCP server:
 
@@ -1338,7 +1438,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 233 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 281 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -1347,6 +1447,11 @@ The end-to-end suite starts a proxy in front of a mock upstream and asserts the
 properties that matter: the upstream receives the real key, the agent's token
 stops at the proxy, denied calls never reach the network, an `ask` releases only
 when a human answers, and the resulting log verifies.
+
+`tests/gateway_e2e.rs` holds the MCP gateway to the same properties over its own
+surface, and asserts the one that spans both: the same call, refused through the
+proxy, is refused through the gateway with the same sentence. A second way in is
+a second way out if it does not enforce the same things.
 
 `tests/profiles_e2e.rs` does the same for the profiles, and builds its policy
 with `profile add` rather than a fixture — so a profile whose base URL, scheme
