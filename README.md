@@ -673,6 +673,10 @@ questions:
 ```bash
 mcp-iap audit tail --agent ci-runner
 mcp-iap audit tail --agent ci-runner --target github
+
+# `-f` follows, and the filter applies to the live stream too — one terminal
+# per agent while a run is in flight.
+mcp-iap audit tail -f --agent ci-runner
 ```
 
 Approvals are per agent too: a "remember for this session" answer is keyed by
@@ -868,6 +872,21 @@ mcp-iap audit verify
 # a rotated log, or one copied off the host.
 mcp-iap audit verify audit/iap-audit.jsonl.1
 ```
+
+`tail -f` follows the log the way the name implies: the last `-n` entries, then
+every entry as the proxy writes it, until Ctrl-C. Filters apply to the stream as
+well as to the history, so `-f --agent ci-runner` is one terminal watching one
+agent work.
+
+```bash
+mcp-iap audit tail -f
+mcp-iap audit tail -f -n 0 --target github
+```
+
+A follower may be started before the proxy is — it waits for the log to appear
+rather than refusing — and it survives rotation: when the file it is reading is
+renamed away or truncated, it says so and picks up the new one, which is what
+keeps a terminal left open overnight still useful in the morning.
 
 Editing or removing a line is detected by `verify`. The chain resumes across
 restarts, so one file covers the life of the deployment.
