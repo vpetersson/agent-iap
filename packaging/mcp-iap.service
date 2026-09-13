@@ -1,0 +1,72 @@
+# mcp-iap as a daemon. README.md § Deployment has the install steps this
+# assumes: the binary at /usr/local/bin, an `mcp-iap` system user, the policy
+# file at /etc/mcp-iap/iap.toml owned by that user and mode 0600.
+#
+#   install -m0644 packaging/mcp-iap.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now mcp-iap
+
+[Unit]
+Description=mcp-iap — identity-aware proxy for LLM agents
+Documentation=https://github.com/vpetersson/mcp-iap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=mcp-iap
+Group=mcp-iap
+
+# Every subcommand reads this, so `systemd-run` and `machinectl shell` one-offs
+# find the same policy file the daemon is running.
+Environment=IAP_CONFIG=/etc/mcp-iap/iap.toml
+# Credentials the policy file reaches for by `env:` reference. Owner-only, and
+# 1Password's OP_SERVICE_ACCOUNT_TOKEN goes here too if you use `op://`.
+EnvironmentFile=-/etc/mcp-iap/env
+
+# The proxy resolves every credential at startup and would fail there anyway;
+# failing here says which reference did not resolve, before anything binds.
+ExecStartPre=/usr/local/bin/mcp-iap check
+# No console: an `ask` is answered over the control plane (README.md § Control
+# plane) or it denies. A rule set that is all `allow`/`deny` needs no answerer.
+ExecStart=/usr/local/bin/mcp-iap run --no-tui
+
+# /var/lib/mcp-iap, created owner-only on first start. The audit log and the
+# `admin-token` written beside it live here, and it is the only path the proxy
+# writes to.
+StateDirectory=mcp-iap
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/mcp-iap
+
+Restart=on-failure
+RestartSec=5s
+
+# This process holds every upstream credential in the policy file. The sandbox
+# below is not defence against the agents it fronts — they never get a shell
+# here — but against everything else that ends up on the same box.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/mcp-iap
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Anything this writes — the audit log, admin-token — is owner-only by default
+# rather than by remembering to say so.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
