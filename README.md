@@ -170,8 +170,8 @@ export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
 # 4. See what the policy exposes, and to whom.
 ./target/release/mcp-iap list --config iap.toml
 
-# 5. Run it, with the approval console.
-./target/release/mcp-iap run --config iap.toml --tui
+# 5. Run it. On a terminal that is the approval console.
+./target/release/mcp-iap run --config iap.toml
 ```
 
 Point the agent at the proxy:
@@ -399,6 +399,32 @@ sequenceDiagram
    it took. Then the response is streamed straight back — token-by-token
    responses stay token-by-token.
 
+### The approval console
+
+`mcp-iap run` *is* the console. Step 5 parks a request until a human answers
+it, and the one thing that must never happen is parking it in a queue nobody is
+looking at — so the console is what `run` opens wherever there is a terminal to
+draw it on, and no flag asks for it:
+
+```bash
+mcp-iap run                             # the console, on a terminal
+mcp-iap run --no-tui                    # the log stream on stderr instead
+mcp-iap run --tui                       # insist, for a terminal we did not recognise
+```
+
+Where there is no terminal — a unit file, a container, a pipe into `tee` —
+`run` is the log stream it has always been, so nothing already deployed has to
+learn a flag. What it gives up is the keyboard: unless something is polling the
+control plane, an `ask` denies immediately rather than parking, and the startup
+banner says which of the two you are getting.
+
+The console owns the terminal, so diagnostics go to `mcp-iap.log` beside the
+audit log instead of to stdout, and the bottom pane is a live tail of the audit
+log — what the agent has been doing while you decide what to allow next.
+`↑`/`↓` moves, `a`/`d` answers, `A`/`D` answers and remembers it for this
+session, `f` forgets what was remembered, and `q` quits the console and stops
+the proxy with it.
+
 ## The policy file
 
 `mcp-iap init` writes one; `iap.example.toml` is the commented walk-through it
@@ -508,7 +534,7 @@ be overridden at run time by a deployment that does not own that file:
 ```bash
 mcp-iap run --listen 0.0.0.0:8080       # full address
 mcp-iap run --listen 9000               # bare port: keeps the configured interface
-mcp-iap run --admin-listen off          # no control plane, so no TUI and no bridge
+mcp-iap run --admin-listen off          # no control plane, so no MCP bridge and no curl
 IAP_LISTEN=0.0.0.0:8080 mcp-iap run     # same, for a container or a unit file
 ```
 
