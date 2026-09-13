@@ -1423,6 +1423,13 @@ What it does not give you, and you should know before relying on it:
 - Audit hash-chaining detects tampering by anyone who cannot rewrite the whole
   file; it is not an append-only store. Ship the lines somewhere else for that.
 
+Found something that breaks one of the properties in the first list, rather than
+one of the limitations in the second? [`SECURITY.md`](SECURITY.md) has the
+private reporting channel, what counts as in scope, and what to expect after a
+report. Please don't open a public issue for it — the tracker is world-readable,
+and a working description of how to get past the ACL is a usable exploit against
+every deployment that has not upgraded yet.
+
 ## Not built yet
 
 Rate limits and spend caps per agent; hot config reload, which is also what a
@@ -1486,8 +1493,11 @@ A consequence worth knowing: Cargo reads the year as the major, so every new
 month looks like a breaking change to a `^` constraint. That is the honest
 default here — this is a daemon you deploy, not a library you link, and the
 compatibility surface that matters is the policy file, not a Rust API. Changes
-that make an existing `iap.toml` stop loading are called out in the release
-notes for that version.
+that make an existing `iap.toml` stop loading are called out in the
+[release notes](https://github.com/vpetersson/agent-iap/releases) for that
+version. Those are generated from the titles of the pull requests in the tag, so
+a change that stops a policy file loading has to say so in its title — or be
+written into the release body before the release is announced.
 
 Cutting a release:
 
