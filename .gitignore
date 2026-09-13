@@ -13,3 +13,6 @@ audit/
 iap-audit.*
 *.jsonl
 admin-token
+
+# Binaries staged for the container image (see Dockerfile).
+/dist

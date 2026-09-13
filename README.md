@@ -1,6 +1,7 @@
 # mcp-iap
 
 [![CI](https://github.com/vpetersson/mcp-iap/actions/workflows/ci.yml/badge.svg)](https://github.com/vpetersson/mcp-iap/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/vpetersson/mcp-iap?label=release)](https://github.com/vpetersson/mcp-iap/releases/latest)
 
 An identity-aware proxy for LLM agents.
 
@@ -145,33 +146,90 @@ The credentials the proxy mints *upstream* expire too
 (`oauth2_client_credentials`, `service_account_jwt`), on the provider's clock
 rather than yours. The agent never sees those at all.
 
-## Quickstart
+## Install
+
+Every `v…` tag builds a binary for each platform, checksums it, and attaches it
+to a GitHub Release — plus a container image on ghcr.io from the same bytes.
+Pick whichever suits the box:
 
 ```bash
-cargo build --release
+# linux-x86_64 · linux-aarch64 · macos-arm64 · macos-x86_64
+v=2026.9.1 platform=linux-x86_64
+base=https://github.com/vpetersson/mcp-iap/releases/download/v$v
 
+curl -sSfLO "$base/mcp-iap-$v-$platform.tar.gz"
+curl -sSfLO "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS     # macOS: shasum -a 256 -c
+
+tar xzf "mcp-iap-$v-$platform.tar.gz"
+sudo install -m0755 "mcp-iap-$v-$platform/mcp-iap" /usr/local/bin/mcp-iap
+mcp-iap --version
+```
+
+The Linux binaries are statically linked against musl: no glibc floor, so the
+same file runs on a current Ubuntu and on whatever the box in the rack is
+running, and there is no runtime to install beside it. The TLS roots are
+compiled in too, so it needs nothing from `/etc/ssl` either. The macOS builds
+are not signed or notarised — `curl` sets no quarantine attribute so this works,
+but a binary downloaded through a browser needs
+`xattr -d com.apple.quarantine mcp-iap` first.
+
+Or the image, which is the same binary on a distroless base — no shell, no
+package manager, nothing to run but the proxy:
+
+```bash
+docker run --rm ghcr.io/vpetersson/mcp-iap:2026.9.1 --version
+```
+
+Tags are `2026.9.1`, the floating `2026.9` within a month, and `latest` — which
+moves only when the tag being built really is the newest one, so a backport does
+not walk it backwards. There is no `2026` tag: the year is the major only
+because semver needs one (§ Versioning), and a year-wide alias would imply a
+promise nothing here makes.
+[§ Deployment](#deployment) has what to mount and what the image deliberately
+cannot do.
+
+With a Rust toolchain, from source:
+
+```bash
+cargo install --locked --git https://github.com/vpetersson/mcp-iap
+```
+
+`cargo install mcp-iap` — the crates.io form — does not work yet: nothing is
+published there. The crate packages cleanly and the release workflow already
+carries the job, dormant until a `CARGO_REGISTRY_TOKEN` secret exists, because
+publishing cannot be undone and is worth deciding on rather than defaulting
+into. Until then `--git` is the toolchain path.
+
+## Quickstart
+
+Everything below writes `./iap.toml` in the current directory, so it needs no
+root and nothing installed anywhere: this is the proxy on a laptop, in front of
+one upstream. [§ Deployment](#deployment) is the same thing as a daemon.
+
+```bash
 # 1. Write a policy file. No agents, no upstreams, default deny — it starts a
 #    proxy that grants nothing, and mints no credential you did not ask for.
-./target/release/mcp-iap init
+mcp-iap init
 
 # 2. Say what it fronts, what is allowed, and who may ask. No editor.
-./target/release/mcp-iap upstream add anthropic \
+mcp-iap upstream add anthropic \
     --base-url https://api.anthropic.com \
     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY
-./target/release/mcp-iap acl add --target anthropic \
+mcp-iap acl add --target anthropic \
     --methods POST --paths /v1/messages
-./target/release/mcp-iap agent add claude-code --target anthropic
+mcp-iap agent add claude-code --target anthropic
 #    ^ prints the agent's token once. Only its sha256 goes in the file.
 
 # 3. Check the policy and prove every credential reference resolves.
 export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
-./target/release/mcp-iap check --config iap.toml
+mcp-iap check --config iap.toml
 
 # 4. See what the policy exposes, and to whom.
-./target/release/mcp-iap list --config iap.toml
+mcp-iap list --config iap.toml
 
 # 5. Run it. On a terminal that is the approval console.
-./target/release/mcp-iap run --config iap.toml
+mcp-iap run --config iap.toml
 ```
 
 Point the agent at the proxy:
@@ -1114,6 +1172,113 @@ Polling `/pending` counts as watching the queue for 30 seconds, so `curl` alone
 can answer an `ask` without the TUI. With nobody watching, `ask` denies
 immediately rather than parking the request for the full timeout.
 
+## Deployment
+
+Everything so far has been the proxy in a terminal, reading `./iap.toml`. As a
+daemon it is the process on the box that holds every upstream credential the
+policy file names, so where its files live and who can read them *is* the
+security boundary.
+
+| Path | What | Mode |
+| --- | --- | --- |
+| `/usr/local/bin/mcp-iap` | The binary. | `0755 root:root` |
+| `/etc/mcp-iap/iap.toml` | Policy: the ACL, the agents' token hashes, the credential *references*. | `0600 mcp-iap:mcp-iap` |
+| `/etc/mcp-iap/env` | Values for the `env:` references, and `OP_SERVICE_ACCOUNT_TOKEN` if you use `op://`. | `0600 mcp-iap:mcp-iap` |
+| `/var/lib/mcp-iap/audit/iap-audit.jsonl` | The hash-chained audit log. | `0600 mcp-iap:mcp-iap` |
+| `/var/lib/mcp-iap/audit/admin-token` | Control-plane bearer token, written at every start. | `0600 mcp-iap:mcp-iap` |
+
+The policy file holds no credential — agent tokens are stored as sha256, and an
+upstream's key is a reference to somewhere else. It still wants `0600`: readable
+it is a map of every credential worth going after and every agent entitled to
+one, and writable it *is* the ACL. The audit log's own claim is weaker than the
+mode suggests — chaining detects tampering, it does not prevent it (§ Security
+model), and a log an attacker can delete outright proves nothing. Ship the lines
+somewhere append-only if that matters.
+
+### systemd
+
+[`packaging/mcp-iap.service`](packaging/mcp-iap.service) runs it as its own user
+under a tight sandbox — `ProtectSystem=strict`, `ReadWritePaths` limited to the
+state directory, `UMask=0077` so everything it writes is owner-only without
+anyone remembering to say so:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin mcp-iap
+sudo install -d -m0755 /etc/mcp-iap
+
+# Build the policy with the same commands as § Quickstart, then hand it over.
+sudo mcp-iap init --config /etc/mcp-iap/iap.toml
+# `init` writes whatever the umask allows — usually group- and world-readable.
+# The mode is the step, not a flourish.
+sudo chown mcp-iap:mcp-iap /etc/mcp-iap/iap.toml
+sudo chmod 0600 /etc/mcp-iap/iap.toml
+
+sudo install -m0644 packaging/mcp-iap.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcp-iap
+```
+
+`/var/lib/mcp-iap` is created `0700` by `StateDirectory=` on first start — the
+audit log and the `admin-token` beside it land there, and it is the only path
+the service can write to. The unit sets `IAP_CONFIG`, so `mcp-iap list`,
+`mcp-iap audit verify` and the rest read the daemon's policy file with no
+`--config`.
+
+Two things worth knowing before the first restart:
+
+- **`ExecStartPre=mcp-iap check` resolves every credential reference.** A
+  reference that no longer resolves fails startup with the name of the one that
+  broke, rather than at some later call. It also means a 1Password outage stops
+  a restart — which is the honest behaviour, since the proxy could not inject
+  anything anyway.
+- **`admin-token` is regenerated at every start.** Anything holding the old one
+  — a script polling `/status`, a detached MCP bridge — re-reads the file after
+  a restart. The audit log is not regenerated: the hash chain continues across
+  restarts, and `mcp-iap audit verify` spans them.
+
+There is no console: `--no-tui` logs to the journal and an `ask` is answered
+over the control plane (§ Control plane) or denied. A rule set that is entirely
+`allow`/`deny` needs no answerer; one that uses `ask` needs something watching,
+or those calls fail closed.
+
+### Container
+
+The image is the same binary on `distroless/static` — no shell, no package
+manager, running as uid `65532`. Two mounts and one override:
+
+```bash
+# The uid inside the image owns neither mount by default, and a 0600 policy
+# file it cannot read is a `Permission denied` at startup, not a warning.
+sudo chown 65532:65532 /etc/mcp-iap/iap.toml /var/lib/mcp-iap
+
+docker run -d --name mcp-iap \
+    -e IAP_LISTEN=0.0.0.0:8080 \
+    --env-file /etc/mcp-iap/env \
+    -v /etc/mcp-iap:/etc/mcp-iap:ro \
+    -v /var/lib/mcp-iap:/var/lib/mcp-iap \
+    -p 8080:8080 \
+    ghcr.io/vpetersson/mcp-iap:2026.9.1
+```
+
+`IAP_LISTEN` is the override that matters: the policy file's `127.0.0.1:8080` is
+loopback *inside* the container, which nothing can reach. Leave `admin_listen`
+on loopback — it is the control plane, and publishing it puts a bearer token's
+worth of authority on the network.
+
+If the host already runs it under systemd and you would rather keep one owner
+for those files, `--user "$(id -u mcp-iap):$(id -g mcp-iap)"` runs the image as
+that user instead; the binary needs no uid in particular.
+
+What the image deliberately cannot do, both following from the distroless base:
+
+- **`op://` references.** They shell out to the 1Password CLI, which is not in
+  here and has no shell to run in. Use `env:` or `file:` references, or build a
+  layer on a base that carries `op`.
+- **stdio MCP servers.** A `command = [...]` server is a child process, and
+  there is no `npx` or `uvx` to be one. Front those over HTTP instead — which
+  § Security model already recommends, since the stdio bridge is not a process
+  boundary anyway.
+
 ## Security model
 
 What this gives you:
@@ -1195,6 +1360,11 @@ and `scripts/check-version.sh`, described below. Dependabot opens weekly grouped
 PRs for Cargo and for the actions themselves. Windows is not covered: the
 credential file permissions and the MCP stdio bridge are Unix-shaped today.
 
+`.github/workflows/release.yml` is the other half, and it runs the suite again
+per target rather than trusting CI's: the Linux artifacts link musl, which is
+not the libc CI's Linux job builds against, so passing there is not the same
+claim as passing in what ships.
+
 ## Versioning
 
 CalVer, `YYYY.MM.PATCH`: `2026.9.0`, then `2026.9.1` for the next release that
@@ -1221,9 +1391,17 @@ git tag v2026.9.1 && git push && git push --tags
 `scripts/bump-version.sh` works out the next version itself — the patch
 continues within a month and resets when the month rolls over — and refuses to
 leave the tree edited if what it produced is not valid. Pass a version to
-override it. `scripts/check-version.sh` runs in CI on every push and pull
-request, and on a `v…` tag it additionally requires the tag and `Cargo.toml` to
-agree, so a release cannot report a version that is nowhere in the history.
+override it.
+
+The tag is the whole trigger: pushing it runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which builds
+the four platforms in [§ Install](#install), runs the test suite on each target
+the runner can execute, attaches the tarballs and a `SHA256SUMS` to a GitHub
+Release, and pushes the container image built from those same binaries. Nothing
+in it starts until `scripts/check-version.sh` has passed: it runs in CI on every
+push and pull request, and on a `v…` tag it additionally requires the tag and
+`Cargo.toml` to agree — so a release cannot report a version that is nowhere in
+the history, and a mismatched tag fails before anything is published.
 
 ## License
 
