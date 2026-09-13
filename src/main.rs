@@ -13,6 +13,7 @@ use mcp_iap::list::{Inventory, ListOptions, What};
 use mcp_iap::mcp;
 use mcp_iap::profiles;
 use mcp_iap::state::AppState;
+use mcp_iap::stdio;
 use mcp_iap::tls::{self, ServerTls};
 use mcp_iap::tui::{self, Console};
 
@@ -98,6 +99,18 @@ enum Command {
         /// Control-plane address of the running proxy.
         #[arg(long, env = "IAP_ADMIN_URL")]
         admin_url: Option<String>,
+    },
+    /// Serve mcp-iap's own MCP gateway on stdio for a client that cannot speak
+    /// HTTP MCP. Requires a running `mcp-iap run`.
+    Gateway {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// The agent's IAP token.
+        #[arg(long, env = "IAP_TOKEN", hide_env_values = true)]
+        token: String,
+        /// Data-plane address of the running proxy.
+        #[arg(long, env = "IAP_PROXY_URL")]
+        proxy_url: Option<String>,
     },
     /// Show every service this proxy exposes: agents, upstreams, MCP servers, ACL.
     List {
@@ -629,6 +642,26 @@ fn main() -> Result<()> {
                     server,
                     agent_token: token,
                     admin_url,
+                },
+            ))
+        }
+        Command::Gateway {
+            config,
+            token,
+            proxy_url,
+        } => {
+            let config = Config::load(&config.config)?;
+            // stdout belongs to the JSON-RPC stream; diagnostics go to stderr.
+            init_tracing(Console::Headless, &config)?;
+            let proxy_url = proxy_url.unwrap_or_else(|| {
+                let scheme = tls::scheme(config.server.tls.is_some());
+                format!("{scheme}://{}", config.server.listen)
+            });
+            tokio_runtime()?.block_on(stdio::run(
+                config,
+                stdio::StdioOptions {
+                    agent_token: token,
+                    proxy_url,
                 },
             ))
         }
