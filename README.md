@@ -645,8 +645,8 @@ the agent that caused it, so one interleaved log still answers per-agent
 questions:
 
 ```bash
-mcp-iap audit tail audit/iap-audit.jsonl --agent ci-runner
-mcp-iap audit tail audit/iap-audit.jsonl --agent ci-runner --target github
+mcp-iap audit tail --agent ci-runner
+mcp-iap audit tail --agent ci-runner --target github
 ```
 
 Approvals are per agent too: a "remember for this session" answer is keyed by
@@ -834,9 +834,13 @@ revoked because of it, and it means either a workload racing its own renewal or
 a second holder of a token that should have had exactly one.
 
 ```bash
-mcp-iap audit tail  audit/iap-audit.jsonl -n 20
-mcp-iap audit verify audit/iap-audit.jsonl
+mcp-iap audit tail -n 20
+mcp-iap audit verify
 # 9 entries verified — the hash chain is intact.
+
+# Both read `audit.path` from the policy file. Name a file to read another one —
+# a rotated log, or one copied off the host.
+mcp-iap audit verify audit/iap-audit.jsonl.1
 ```
 
 Editing or removing a line is detected by `verify`. The chain resumes across

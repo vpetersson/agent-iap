@@ -506,10 +506,20 @@ impl ActionArg {
 #[derive(Subcommand)]
 enum AuditCommand {
     /// Prove the log has not been edited, reordered or truncated.
-    Verify { path: PathBuf },
+    Verify {
+        /// Log to read. Defaults to `audit.path` from the policy file, which is
+        /// the one the proxy is writing.
+        path: Option<PathBuf>,
+        #[command(flatten)]
+        config: ConfigArg,
+    },
     /// Print the last N entries, one line each.
     Tail {
-        path: PathBuf,
+        /// Log to read. Defaults to `audit.path` from the policy file, which is
+        /// the one the proxy is writing.
+        path: Option<PathBuf>,
+        #[command(flatten)]
+        config: ConfigArg,
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
         /// Only this agent. One proxy fronts many agents, so the log is
@@ -713,13 +723,21 @@ fn main() -> Result<()> {
             println!("{}", identity::token_hash(&token));
             Ok(())
         }
-        Command::Audit(AuditCommand::Verify { path }) => verify_audit(&path),
+        Command::Audit(AuditCommand::Verify { path, config }) => {
+            verify_audit(&audit_log_path(path, &config.config)?)
+        }
         Command::Audit(AuditCommand::Tail {
             path,
+            config,
             lines,
             agent,
             target,
-        }) => tail_audit(&path, lines, agent.as_deref(), target.as_deref()),
+        }) => tail_audit(
+            &audit_log_path(path, &config.config)?,
+            lines,
+            agent.as_deref(),
+            target.as_deref(),
+        ),
     }
 }
 
@@ -1313,6 +1331,31 @@ fn gen_token(id: &str) -> Result<()> {
     println!("token_sha256 = \"{hash}\"");
     println!("# targets = [\"anthropic\"]   # optional: restrict which upstreams it may address");
     Ok(())
+}
+
+/// The log an `audit` subcommand should read: the one named on the command
+/// line, or — since the policy file already says where the proxy writes — the
+/// one it points at. Naming it is for the exceptions: a rotated file, or a log
+/// copied off the host it was written on.
+fn audit_log_path(path: Option<PathBuf>, config: &Path) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path),
+        None => {
+            let path = Config::audit_path_of(config)?;
+            // A relative `audit.path` resolves against the working directory —
+            // the proxy's when it wrote, ours when we read. Say where the name
+            // came from, so a mismatch reads as that rather than a lost log.
+            if !path.exists() {
+                bail!(
+                    "no audit log at `{}` — that is `audit.path` from `{}`, and a relative path \
+                     resolves against the current directory",
+                    path.display(),
+                    config.display()
+                );
+            }
+            Ok(path)
+        }
+    }
 }
 
 fn verify_audit(path: &Path) -> Result<()> {
