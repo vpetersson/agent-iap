@@ -7,12 +7,12 @@
 //! ask the proxy. They also pin the caveat every one of those commands prints:
 //! the proxy already running is not the one that read the edit.
 
+use agent_iap::config::Config;
+use agent_iap::enroll::{self, AuthSpec};
+use agent_iap::state::AppState;
 use axum::extract::Request;
 use axum::routing::any;
 use axum::{Json, Router};
-use mcp_iap::config::Config;
-use mcp_iap::enroll::{self, AuthSpec};
-use mcp_iap::state::AppState;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -37,9 +37,9 @@ async fn spawn_upstream() -> SocketAddr {
 /// it — written entirely by the enrolment commands, with no fixture in between.
 fn policy(dir: &Path, upstream: SocketAddr) -> (PathBuf, String) {
     let path = dir.join("iap.toml");
-    mcp_iap::init::init(&mcp_iap::init::InitOptions {
+    agent_iap::init::init(&agent_iap::init::InitOptions {
         path: path.clone(),
-        template: mcp_iap::init::Template::Minimal,
+        template: agent_iap::init::Template::Minimal,
         force: true,
         ..Default::default()
     })
@@ -94,7 +94,7 @@ async fn serve(path: &Path, audit: PathBuf) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(
             listener,
-            mcp_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            agent_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
         .unwrap();

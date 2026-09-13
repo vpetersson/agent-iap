@@ -45,7 +45,7 @@ use crate::config::{
 };
 
 /// `iss`. Constant: `aud` is what actually pins a token to one process.
-const ISSUER: &str = "mcp-iap";
+const ISSUER: &str = "agent-iap";
 
 /// Tolerated clock skew when checking `nbf`/`iat`. Not applied to `exp`: this
 /// process both signs and verifies, so there is no other clock to disagree with,
@@ -639,7 +639,7 @@ impl WorkloadIssuer {
         true
     }
 
-    /// Revoke every live token belonging to an agent. What `mcp-iap` reaches for
+    /// Revoke every live token belonging to an agent. What `agent-iap` reaches for
     /// when an agent is decommissioned mid-flight.
     pub fn revoke_agent(&self, agent: &str) -> usize {
         let mut tokens = self.tokens.lock();
@@ -999,7 +999,7 @@ mod tests {
     fn alg_none_is_not_a_way_in() {
         let issuer = issuer(WorkloadMode::Required);
         let claims = serde_json::json!({
-            "iss": "mcp-iap", "sub": "claude", "aud": issuer.instance,
+            "iss": "agent-iap", "sub": "claude", "aud": issuer.instance,
             "iat": now(), "nbf": now(), "exp": now() + 3600,
             "jti": "forged", "lineage": "forged", "generation": 0,
             "scope": [{ "kind": "*", "target": "echo", "methods": ["*"], "paths": ["**"] }],

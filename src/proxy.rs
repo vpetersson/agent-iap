@@ -17,14 +17,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::acl::AccessRequest;
-use crate::approval::Verdict;
 use crate::audit::AuditRecord;
-use crate::config::{Action, UpstreamConfig};
-use crate::identity::agent_may_address;
+use crate::config::UpstreamConfig;
 use crate::state::AppState;
 
 /// Headers that belong to a single hop and must never be forwarded.
-const HOP_BY_HOP: &[&str] = &[
+pub(crate) const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -37,7 +35,7 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// Headers the agent uses to talk to the *proxy*; they stop here.
-const IAP_HEADERS: &[&str] = &["authorization", "x-iap-token", "x-iap-upstream", "host"];
+pub(crate) const IAP_HEADERS: &[&str] = &["authorization", "x-iap-token", "x-iap-upstream", "host"];
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -48,6 +46,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             crate::tokens::PROXY_PREFIX,
             Arc::clone(&state),
         ))
+        // agent-iap's own MCP server. Same reserved prefix, and mounted before the
+        // fallback so it is a route rather than an upstream called `_iap`.
+        .merge(crate::gateway::routes(Arc::clone(&state)))
         .fallback(handle)
         .with_state(state)
 }
@@ -103,7 +104,7 @@ impl Rejection {
         }
         let body = serde_json::json!({
             "error": { "type": self.code, "message": self.message },
-            "proxy": "mcp-iap",
+            "proxy": "agent-iap",
         });
         let mut response = (self.status, axum::Json(body)).into_response();
         response
@@ -207,88 +208,26 @@ async fn proxy(
         .with_record(record)
     })?;
 
-    if !agent_may_address(agent, &upstream.name) {
-        record.decision = Some("deny".into());
-        record.rule = Some("<agent-targets>".into());
-        return Err(Box::new(
-            Rejection::new(
-                StatusCode::FORBIDDEN,
-                "target_not_permitted",
-                format!("agent `{}` may not address `{}`", agent.id, upstream.name),
-            )
-            .with_record(record),
-        ));
-    }
-
-    // 3. Did this run ask for this? A workload token carries the scope its
-    // holder said it needed; anything outside that is refused before policy is
-    // consulted at all. A scope can only ever narrow — the ACL still runs next
-    // and can still say no — so this is least privilege the agent opted into,
-    // not a grant it gave itself.
+    // 3. May this agent address this target, does the credential presented
+    // cover the request, and what does the policy say — including stopping on a
+    // human when a rule says `ask`. The MCP gateway asks the same question of
+    // the same function, so the two surfaces cannot drift apart on the answer.
     let access = AccessRequest::http(&agent.id, &upstream.name, method.as_str(), &upstream_path);
-    if !caller.permits(&access) {
-        record.decision = Some("deny".into());
-        record.rule = Some("<workload-scope>".into());
-        return Err(Box::new(
-            Rejection::new(
-                StatusCode::FORBIDDEN,
-                "scope_exceeded",
-                format!(
-                    "the workload token does not cover {} {} on `{}` — renew it with a \
-                     scope that does",
-                    method, upstream_path, upstream.name
-                ),
-            )
-            .with_record(record),
-        ));
-    }
-
-    // 4. What does the policy say?
-    let decision = state.acl.evaluate(&access);
-    record.rule = Some(decision.rule_label().to_string());
-
-    match decision.action {
-        Action::Allow => record.decision = Some("allow".into()),
-        Action::Deny => {
+    match crate::gate::clear(&state, &caller, &access).await {
+        Ok(cleared) => {
+            record.decision = Some(cleared.decision);
+            record.rule = Some(cleared.rule);
+        }
+        Err(refusal) => {
             record.decision = Some("deny".into());
+            record.rule = Some(refusal.rule);
             return Err(Box::new(
-                Rejection::new(
-                    StatusCode::FORBIDDEN,
-                    "policy_denied",
-                    format!(
-                        "denied by policy `{}` — {} {} on `{}`",
-                        decision.rule_label(),
-                        method,
-                        upstream_path,
-                        upstream.name
-                    ),
-                )
-                .with_record(record),
+                Rejection::new(refusal.status, refusal.code, refusal.message).with_record(record),
             ));
         }
-        Action::Ask => {
-            // Park the request in front of a human. Anything but an explicit
-            // "allow" — timeout, no approver, an explicit no — denies.
-            let outcome = state.broker.ask(&access, agent.display_name()).await;
-            record.decision = Some(outcome.label().to_string());
-            if outcome.verdict() == Verdict::Deny {
-                return Err(Box::new(
-                    Rejection::new(
-                        StatusCode::FORBIDDEN,
-                        "approval_denied",
-                        format!(
-                            "held for approval by policy `{}` and not allowed ({})",
-                            decision.rule_label(),
-                            outcome.label()
-                        ),
-                    )
-                    .with_record(record),
-                ));
-            }
-        }
     }
 
-    // 5. Allowed. Buffer the request body, then swap in the real credential.
+    // 4. Allowed. Buffer the request body, then swap in the real credential.
     let body_bytes = axum::body::to_bytes(body, state.config.server.max_body_bytes)
         .await
         .map_err(|_| {
@@ -383,7 +322,7 @@ async fn proxy(
     Ok(build_response(response))
 }
 
-fn extract_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get("x-iap-token").and_then(|v| v.to_str().ok()) {
         return Some(value.trim().to_string());
     }
@@ -420,7 +359,7 @@ fn route(headers: &HeaderMap, path: &str) -> Option<(String, String)> {
 /// `%2e%2e` is `..` to a URL parser and to nobody else, so a guard looking only
 /// for a literal `..` is not a guard. Backslashes matter for the same reason:
 /// the URL standard folds `\` into `/` for http(s).
-fn check_path(path: &str) -> Result<(), &'static str> {
+pub(crate) fn check_path(path: &str) -> Result<(), &'static str> {
     let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
 
     for segment in decoded.split(['/', '\\']) {
@@ -439,7 +378,7 @@ fn check_path(path: &str) -> Result<(), &'static str> {
 ///
 /// `check_path` catches the encodings we know about; this catches the rest, by
 /// comparing what policy authorised against what will actually be requested.
-fn build_url(base: &str, path: &str, query: Option<&str>) -> anyhow::Result<url::Url> {
+pub(crate) fn build_url(base: &str, path: &str, query: Option<&str>) -> anyhow::Result<url::Url> {
     let base = base.trim_end_matches('/');
     let base_path = url::Url::parse(base)?
         .path()
@@ -465,7 +404,7 @@ fn build_url(base: &str, path: &str, query: Option<&str>) -> anyhow::Result<url:
 ///
 /// Never `error.to_string()`: reqwest's Display embeds the full outbound URL,
 /// which by this point carries the injected credential for `query` auth.
-fn describe_upstream_error(error: &reqwest::Error) -> String {
+pub(crate) fn describe_upstream_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "the upstream did not respond in time".to_string()
     } else if error.is_connect() {

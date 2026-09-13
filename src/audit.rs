@@ -2,7 +2,7 @@
 //!
 //! Every decision the proxy makes lands here as one JSON object per line. The
 //! records are hash-chained: each line commits to the one before it, so a later
-//! edit or deletion is detectable with `mcp-iap audit verify`. Bodies are off by
+//! edit or deletion is detectable with `agent-iap audit verify`. Bodies are off by
 //! default and credential-bearing headers are redacted before anything is written.
 
 use anyhow::{bail, Context, Result};

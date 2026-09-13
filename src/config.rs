@@ -331,7 +331,7 @@ pub struct AgentConfig {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// Hex sha256 of the agent's bearer token — produced by `mcp-iap gen-token`.
+    /// Hex sha256 of the agent's bearer token — produced by `agent-iap gen-token`.
     #[serde(default)]
     pub token_sha256: Option<String>,
     /// Alternative: a secret reference holding the plaintext token (hashed on load).
@@ -621,7 +621,7 @@ impl Config {
             // is one command rather than a hunt for the example file.
             if error.kind() == std::io::ErrorKind::NotFound {
                 anyhow::anyhow!(
-                    "no config at `{}` — run `mcp-iap init` to write one",
+                    "no config at `{}` — run `agent-iap init` to write one",
                     path.display()
                 )
             } else {
@@ -652,7 +652,7 @@ impl Config {
         let text = std::fs::read_to_string(config_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 anyhow::anyhow!(
-                    "no config at `{}` — run `mcp-iap init` to write one, or name the audit log to read",
+                    "no config at `{}` — run `agent-iap init` to write one, or name the audit log to read",
                     config_path.display()
                 )
             } else {
@@ -722,7 +722,7 @@ impl Config {
             }
             match (&agent.token_sha256, &agent.token_ref) {
                 (None, None) => bail!(
-                    "agent `{}` has neither `token_sha256` nor `token_ref` — run `mcp-iap gen-token`",
+                    "agent `{}` has neither `token_sha256` nor `token_ref` — run `agent-iap gen-token`",
                     agent.id
                 ),
                 (Some(_), Some(_)) => bail!(
@@ -1090,8 +1090,8 @@ action = "allow"
         let config: Config = toml::from_str(&format!(
             r#"{MINIMAL}
 [server.tls]
-cert = "file:/etc/mcp-iap/fullchain.pem"
-key = "op://Infra/mcp-iap tls/private key"
+cert = "file:/etc/agent-iap/fullchain.pem"
+key = "op://Infra/agent-iap tls/private key"
 "#
         ))
         .unwrap();
@@ -1100,8 +1100,8 @@ key = "op://Infra/mcp-iap tls/private key"
         // Startup resolves these alongside everything else, so a locked vault
         // fails the process instead of the first handshake.
         let refs = config.secret_refs();
-        assert!(refs.contains(&"file:/etc/mcp-iap/fullchain.pem".to_string()));
-        assert!(refs.contains(&"op://Infra/mcp-iap tls/private key".to_string()));
+        assert!(refs.contains(&"file:/etc/agent-iap/fullchain.pem".to_string()));
+        assert!(refs.contains(&"op://Infra/agent-iap tls/private key".to_string()));
     }
 
     #[test]
@@ -1109,7 +1109,7 @@ key = "op://Infra/mcp-iap tls/private key"
         let config: Config = toml::from_str(&format!(
             r#"{MINIMAL}
 [server.tls]
-cert = "file:/etc/mcp-iap/fullchain.pem"
+cert = "file:/etc/agent-iap/fullchain.pem"
 key = "-----BEGIN PRIVATE KEY-----"
 "#
         ))

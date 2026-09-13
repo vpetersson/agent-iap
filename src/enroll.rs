@@ -143,7 +143,7 @@ pub fn add_agent(
         if !reachable.iter().any(|name| *name == target) {
             bail!(
                 "no upstream or MCP server named `{target}` in `{}` — add it first with \
-                 `mcp-iap upstream add {target} --base-url <url>`, or drop the `--target`",
+                 `agent-iap upstream add {target} --base-url <url>`, or drop the `--target`",
                 path.display()
             );
         }
@@ -453,7 +453,7 @@ pub struct RuleRemoval {
     pub remaining: usize,
 }
 
-/// Remove the `[[acl]]` rule at `index` — the `#` column of `mcp-iap list acl`.
+/// Remove the `[[acl]]` rule at `index` — the `#` column of `agent-iap list acl`.
 ///
 /// By number rather than by name because a rule need not have one, and two may
 /// share it. Position is the ACL's semantics: first match wins, so the number
@@ -468,7 +468,7 @@ pub fn remove_rule(path: &Path, index: usize) -> Result<RuleRemoval> {
         .with_context(|| match existing.acl.len() {
             0 => format!("`{}` has no `[[acl]]` rules to remove", path.display()),
             count => format!(
-                "no rule {index} in `{}` — the rules are numbered 0 to {}, as `mcp-iap list acl` \
+                "no rule {index} in `{}` — the rules are numbered 0 to {}, as `agent-iap list acl` \
                  prints them",
                 path.display(),
                 count - 1
@@ -564,7 +564,7 @@ pub fn rule_count(path: &Path) -> Result<usize> {
     Ok(document_config(&read(path)?)?.acl.len())
 }
 
-/// A rule as `mcp-iap list acl` identifies it: the number `acl rm` takes, and
+/// A rule as `agent-iap list acl` identifies it: the number `acl rm` takes, and
 /// the name the audit log prints beside a decision.
 #[derive(Debug)]
 pub struct RuleRef {
@@ -687,7 +687,7 @@ fn remove_service(path: &Path, name: &str, prune: bool, kind: ServiceKind) -> Re
             bail!(
                 "`{name}` is the only target of {} — dropping it would leave `targets` empty, \
                  which means *any* target rather than none. Remove {} first with \
-                 `mcp-iap agent rm`.",
+                 `agent-iap agent rm`.",
                 list(&widened),
                 if widened.len() == 1 { "it" } else { "them" }
             );
@@ -835,7 +835,7 @@ fn list(names: &[&str]) -> String {
 fn read(path: &Path) -> Result<DocumentMut> {
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
-            "reading `{}` — `mcp-iap init` writes one if you have not yet",
+            "reading `{}` — `agent-iap init` writes one if you have not yet",
             path.display()
         )
     })?;
@@ -1914,7 +1914,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let text = text.replace(
             "[audit]",
-            "[server.tls]\ncert = \"file:/etc/mcp-iap/fullchain.pem\"\nkey = \"file:/etc/mcp-iap/key.pem\"\n\n[audit]",
+            "[server.tls]\ncert = \"file:/etc/agent-iap/fullchain.pem\"\nkey = \"file:/etc/agent-iap/key.pem\"\n\n[audit]",
         );
         std::fs::write(&path, &text).unwrap();
 
@@ -1944,7 +1944,7 @@ mod tests {
             .server
             .tls
             .expect("`[server.tls]` must survive enrolment");
-        assert_eq!(tls.cert, "file:/etc/mcp-iap/fullchain.pem");
-        assert_eq!(tls.key, "file:/etc/mcp-iap/key.pem");
+        assert_eq!(tls.cert, "file:/etc/agent-iap/fullchain.pem");
+        assert_eq!(tls.key, "file:/etc/agent-iap/key.pem");
     }
 }

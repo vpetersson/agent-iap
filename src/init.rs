@@ -1,4 +1,4 @@
-//! `mcp-iap init` — write a policy file that is ready to run.
+//! `agent-iap init` — write a policy file that is ready to run.
 //!
 //! The alternative was `cp iap.example.toml iap.toml && $EDITOR iap.toml`, which
 //! has two problems: it needs the repository checked out (a `cargo install`d
@@ -108,7 +108,7 @@ pub fn init(options: &InitOptions) -> Result<Initialized> {
         ),
         (Template::Minimal, Some(_)) => bail!(
             "`--secret` applies to the starter template; the minimal template writes no \
-             upstream to attach a credential to — add one with `mcp-iap upstream add`"
+             upstream to attach a credential to — add one with `agent-iap upstream add`"
         ),
         (Template::Full | Template::Minimal, None) => None,
         (Template::Starter, reference) => {
@@ -219,7 +219,7 @@ fn render(
 /// minted for an agent that may never exist. `upstream add` and `agent add`
 /// fill it in.
 fn minimal() -> String {
-    r##"# mcp-iap policy file, written by `mcp-iap init`.
+    r##"# agent-iap policy file, written by `agent-iap init`.
 #
 # Nothing here is a credential — only *references* to them, resolved inside the
 # proxy at startup. This file is safe to commit.
@@ -228,12 +228,12 @@ fn minimal() -> String {
 # everything, because `acl_default` is deny and there is nothing to reach.
 # Fill it in without editing TOML by hand:
 #
-#   mcp-iap upstream add anthropic --base-url https://api.anthropic.com \
+#   agent-iap upstream add anthropic --base-url https://api.anthropic.com \
 #       --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY
-#   mcp-iap acl add --target anthropic --methods POST --paths /v1/messages
-#   mcp-iap agent add claude-code --target anthropic
+#   agent-iap acl add --target anthropic --methods POST --paths /v1/messages
+#   agent-iap agent add claude-code --target anthropic
 #
-# `mcp-iap init --template starter` writes that Anthropic setup for you;
+# `agent-iap init --template starter` writes that Anthropic setup for you;
 # `--template full` writes the annotated example, GitHub and MCP and all.
 
 [server]
@@ -244,11 +244,11 @@ approval_timeout_secs = 120      # an unanswered `ask` denies after this
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
 # control plane follows onto HTTPS with the same certificate. Any provider
 # works; `tailscale cert` and `step ca certificate` are the two the README
-# walks through. Add `ca = "file:…"` for a private CA, so `mcp-iap mcp`
+# walks through. Add `ca = "file:…"` for a private CA, so `agent-iap mcp`
 # verifies the control plane against the root rather than the served chain.
 # [server.tls]
-# cert = "file:/etc/mcp-iap/fullchain.pem"
-# key = "op://Infra/mcp-iap tls/private key"
+# cert = "file:/etc/agent-iap/fullchain.pem"
+# key = "op://Infra/agent-iap tls/private key"
 
 [audit]
 path = "audit/iap-audit.jsonl"
@@ -266,13 +266,13 @@ action = "deny"
 
 fn starter(agent: &str, token_hash: &str, secret: &str) -> String {
     format!(
-        r##"# mcp-iap policy file, written by `mcp-iap init`.
+        r##"# agent-iap policy file, written by `agent-iap init`.
 #
 # Nothing here is a credential — only a *reference* to one, resolved inside the
 # proxy at startup, and the sha256 of a token that is not any upstream's. This
 # file is safe to commit.
 #
-# `mcp-iap init --template full` writes the annotated example instead, with
+# `agent-iap init --template full` writes the annotated example instead, with
 # GitHub, an MCP server and a Google service account already worked out.
 
 [server]
@@ -283,11 +283,11 @@ approval_timeout_secs = 120      # an unanswered `ask` denies after this
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
 # control plane follows onto HTTPS with the same certificate. Any provider
 # works; `tailscale cert` and `step ca certificate` are the two the README
-# walks through. Add `ca = "file:…"` for a private CA, so `mcp-iap mcp`
+# walks through. Add `ca = "file:…"` for a private CA, so `agent-iap mcp`
 # verifies the control plane against the root rather than the served chain.
 # [server.tls]
-# cert = "file:/etc/mcp-iap/fullchain.pem"
-# key = "op://Infra/mcp-iap tls/private key"
+# cert = "file:/etc/agent-iap/fullchain.pem"
+# key = "op://Infra/agent-iap tls/private key"
 
 [audit]
 path = "audit/iap-audit.jsonl"
@@ -296,7 +296,7 @@ log_bodies = false               # bodies carry prompts and customer data
 
 # --- who may connect -------------------------------------------------------
 # `init` minted the token this hashes and printed it once. Only the hash lives
-# here, so this line grants nothing on its own. `mcp-iap gen-token <id>` mints
+# here, so this line grants nothing on its own. `agent-iap gen-token <id>` mints
 # another agent the same way.
 
 [[agents]]

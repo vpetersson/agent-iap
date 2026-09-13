@@ -3,12 +3,12 @@
 //! These cover the property the whole project exists for — the agent gets a
 //! result, the upstream gets the real credential, and the agent never sees it.
 
+use agent_iap::audit;
+use agent_iap::config::Config;
+use agent_iap::state::AppState;
 use axum::extract::Request;
 use axum::routing::any;
 use axum::{Json, Router};
-use mcp_iap::audit;
-use mcp_iap::config::Config;
-use mcp_iap::state::AppState;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -112,7 +112,7 @@ action = "allow"
 {extra_acl}
 "#,
         audit = audit_path.display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
         upstream = upstream,
         auth = auth,
     );
@@ -129,7 +129,7 @@ action = "allow"
         tokio::spawn(async move {
             axum::serve(
                 proxy_listener,
-                mcp_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                agent_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             .unwrap();
@@ -141,7 +141,7 @@ action = "allow"
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            axum::serve(admin_listener, mcp_iap::admin::router(state))
+            axum::serve(admin_listener, agent_iap::admin::router(state))
                 .await
                 .unwrap();
         });
@@ -701,7 +701,7 @@ async fn the_admin_token_still_opens_the_control_plane() {
 /// Widening the proxy to a VLAN must not widen the operator surface with it.
 #[tokio::test]
 async fn overriding_the_proxy_listen_leaves_the_control_plane_where_it_was() {
-    let mut config: mcp_iap::config::Config = toml::from_str(
+    let mut config: agent_iap::config::Config = toml::from_str(
         r#"
 [server]
 listen = "127.0.0.1:8080"

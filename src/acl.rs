@@ -193,7 +193,7 @@ impl Acl {
     }
 
     /// Positions of the rules whose agent glob matches, in file order — which is
-    /// match order, and therefore the policy. Used by `mcp-iap list --agent` to
+    /// match order, and therefore the policy. Used by `agent-iap list --agent` to
     /// show one agent's slice of the rule list without renumbering it.
     pub fn rule_indices_for_agent(&self, agent: &str) -> Vec<usize> {
         self.rules

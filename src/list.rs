@@ -1,4 +1,4 @@
-//! `mcp-iap list` — what this proxy exposes.
+//! `agent-iap list` — what this proxy exposes.
 //!
 //! `check` prints a summary too, but as a side effect of validating, and in the
 //! wrong shape: it comma-joins every upstream onto one line. That reads fine at
@@ -130,7 +130,7 @@ impl Inventory {
             Some(id) => {
                 let agent = config.agent(id).with_context(|| {
                     format!(
-                        "no agent `{id}` in this policy file — `mcp-iap list agents` shows the ids"
+                        "no agent `{id}` in this policy file — `agent-iap list agents` shows the ids"
                     )
                 })?;
                 let acl = Acl::compile(config).context("compiling the ACL to resolve --agent")?;

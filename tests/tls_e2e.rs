@@ -5,12 +5,12 @@
 //! upstream receives the real credential and the agent never does — asserted
 //! this time across a connection an eavesdropper cannot read.
 
+use agent_iap::config::Config;
+use agent_iap::state::AppState;
+use agent_iap::tls::{self, ServerTls};
 use axum::extract::Request;
 use axum::routing::any;
 use axum::{Json, Router};
-use mcp_iap::config::Config;
-use mcp_iap::state::AppState;
-use mcp_iap::tls::{self, ServerTls};
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -68,7 +68,7 @@ struct Harness {
     _dir: tempfile::TempDir,
 }
 
-/// Start the proxy exactly as `mcp-iap run` does: certificates resolved from
+/// Start the proxy exactly as `agent-iap run` does: certificates resolved from
 /// the policy file through the secret resolver, parsed before anything binds,
 /// then handed to the same `tls::serve` the binary uses.
 async fn spawn_tls_proxy(admin_tls: bool) -> Harness {
@@ -134,7 +134,7 @@ action = "allow"
         cert = cert_path.display(),
         key = key_path.display(),
         audit = audit_path.display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
     );
 
     let config: Config = toml::from_str(&config_text).unwrap();
@@ -149,7 +149,7 @@ action = "allow"
     let proxy = proxy_listener.local_addr().unwrap();
     let serving = tls::serve(
         proxy_listener,
-        mcp_iap::proxy::router(Arc::clone(&state)),
+        agent_iap::proxy::router(Arc::clone(&state)),
         loaded.proxy,
     )
     .unwrap();
@@ -159,7 +159,7 @@ action = "allow"
     let admin = admin_listener.local_addr().unwrap();
     let serving = tls::serve(
         admin_listener,
-        mcp_iap::admin::router(Arc::clone(&state)),
+        agent_iap::admin::router(Arc::clone(&state)),
         loaded.admin,
     )
     .unwrap();
@@ -386,7 +386,7 @@ action = "deny"
         cert = cert_path.display(),
         key = key_path.display(),
         audit = dir.path().join("audit.jsonl").display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
     ))
     .unwrap();
     config.validate().unwrap();
@@ -419,7 +419,7 @@ fn ca_signed() -> (String, String, String) {
         rcgen::KeyUsagePurpose::KeyCertSign,
         rcgen::KeyUsagePurpose::CrlSign,
     ];
-    ca.distinguished_name = named("mcp-iap test CA");
+    ca.distinguished_name = named("agent-iap test CA");
     let root = ca.self_signed(&ca_key).unwrap().pem();
     let issuer = rcgen::Issuer::new(ca, ca_key);
 
@@ -452,11 +452,11 @@ fn spawn_https(certificate: &str, key: &str) -> SocketAddr {
 #[tokio::test]
 async fn the_bridge_verifies_the_control_plane_against_the_ca_the_policy_file_names() {
     let (root, leaf, key) = ca_signed();
-    let resolver = mcp_iap::secrets::SecretResolver::new("op");
+    let resolver = agent_iap::secrets::SecretResolver::new("op");
     let addr = spawn_https(&leaf, &key);
     let url = format!("https://localhost:{}/health", addr.port());
 
-    let material = |ca: Option<String>| mcp_iap::config::TlsConfig {
+    let material = |ca: Option<String>| agent_iap::config::TlsConfig {
         cert: format!("literal:{leaf}"),
         key: format!("literal:{key}"),
         ca,
@@ -505,12 +505,12 @@ async fn a_self_signed_control_plane_still_needs_no_ca_named() {
     let addr = spawn_https(&certificate, &key);
 
     let response = tls::control_plane_client(
-        Some(&mcp_iap::config::TlsConfig {
+        Some(&agent_iap::config::TlsConfig {
             cert: format!("literal:{certificate}"),
             key: format!("literal:{key}"),
             ca: None,
         }),
-        &mcp_iap::secrets::SecretResolver::new("op"),
+        &agent_iap::secrets::SecretResolver::new("op"),
     )
     .unwrap()
     .get(format!("https://localhost:{}/health", addr.port()))

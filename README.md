@@ -1,6 +1,11 @@
-# mcp-iap
+<p align="center">
+  <img src="assets/logo.png" alt="Agent IAP" width="420">
+</p>
 
-[![CI](https://github.com/vpetersson/mcp-iap/actions/workflows/ci.yml/badge.svg)](https://github.com/vpetersson/mcp-iap/actions/workflows/ci.yml)
+# agent-iap
+
+[![CI](https://github.com/vpetersson/agent-iap/actions/workflows/ci.yml/badge.svg)](https://github.com/vpetersson/agent-iap/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/vpetersson/agent-iap?label=release)](https://github.com/vpetersson/agent-iap/releases/latest)
 
 An identity-aware proxy for LLM agents.
 
@@ -16,7 +21,7 @@ flowchart LR
         A3["CI runner"]
     end
 
-    subgraph iap["mcp-iap — where the credentials live"]
+    subgraph iap["agent-iap — where the credentials live"]
         direction TB
         ID["who is this?<br/>agent token → identity"]
         WL["what is this run?<br/>workload token → scope, expiring"]
@@ -145,33 +150,90 @@ The credentials the proxy mints *upstream* expire too
 (`oauth2_client_credentials`, `service_account_jwt`), on the provider's clock
 rather than yours. The agent never sees those at all.
 
-## Quickstart
+## Install
+
+Every `v…` tag builds a binary for each platform, checksums it, and attaches it
+to a GitHub Release — plus a container image on ghcr.io from the same bytes.
+Pick whichever suits the box:
 
 ```bash
-cargo build --release
+# linux-x86_64 · linux-aarch64 · macos-arm64 · macos-x86_64
+v=2026.9.1 platform=linux-x86_64
+base=https://github.com/vpetersson/agent-iap/releases/download/v$v
 
+curl -sSfLO "$base/agent-iap-$v-$platform.tar.gz"
+curl -sSfLO "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS     # macOS: shasum -a 256 -c
+
+tar xzf "agent-iap-$v-$platform.tar.gz"
+sudo install -m0755 "agent-iap-$v-$platform/agent-iap" /usr/local/bin/agent-iap
+agent-iap --version
+```
+
+The Linux binaries are statically linked against musl: no glibc floor, so the
+same file runs on a current Ubuntu and on whatever the box in the rack is
+running, and there is no runtime to install beside it. The TLS roots are
+compiled in too, so it needs nothing from `/etc/ssl` either. The macOS builds
+are not signed or notarised — `curl` sets no quarantine attribute so this works,
+but a binary downloaded through a browser needs
+`xattr -d com.apple.quarantine agent-iap` first.
+
+Or the image, which is the same binary on a distroless base — no shell, no
+package manager, nothing to run but the proxy:
+
+```bash
+docker run --rm ghcr.io/vpetersson/agent-iap:2026.9.1 --version
+```
+
+Tags are `2026.9.1`, the floating `2026.9` within a month, and `latest` — which
+moves only when the tag being built really is the newest one, so a backport does
+not walk it backwards. There is no `2026` tag: the year is the major only
+because semver needs one (§ Versioning), and a year-wide alias would imply a
+promise nothing here makes.
+[§ Deployment](#deployment) has what to mount and what the image deliberately
+cannot do.
+
+With a Rust toolchain, from source:
+
+```bash
+cargo install --locked --git https://github.com/vpetersson/agent-iap
+```
+
+`cargo install agent-iap` — the crates.io form — does not work yet: nothing is
+published there. The crate packages cleanly and the release workflow already
+carries the job, dormant until a `CARGO_REGISTRY_TOKEN` secret exists, because
+publishing cannot be undone and is worth deciding on rather than defaulting
+into. Until then `--git` is the toolchain path.
+
+## Quickstart
+
+Everything below writes `./iap.toml` in the current directory, so it needs no
+root and nothing installed anywhere: this is the proxy on a laptop, in front of
+one upstream. [§ Deployment](#deployment) is the same thing as a daemon.
+
+```bash
 # 1. Write a policy file. No agents, no upstreams, default deny — it starts a
 #    proxy that grants nothing, and mints no credential you did not ask for.
-./target/release/mcp-iap init
+agent-iap init
 
 # 2. Say what it fronts, what is allowed, and who may ask. No editor.
-./target/release/mcp-iap upstream add anthropic \
+agent-iap upstream add anthropic \
     --base-url https://api.anthropic.com \
     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY
-./target/release/mcp-iap acl add --target anthropic \
+agent-iap acl add --target anthropic \
     --methods POST --paths /v1/messages
-./target/release/mcp-iap agent add claude-code --target anthropic
+agent-iap agent add claude-code --target anthropic
 #    ^ prints the agent's token once. Only its sha256 goes in the file.
 
 # 3. Check the policy and prove every credential reference resolves.
 export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
-./target/release/mcp-iap check --config iap.toml
+agent-iap check --config iap.toml
 
 # 4. See what the policy exposes, and to whom.
-./target/release/mcp-iap list --config iap.toml
+agent-iap list --config iap.toml
 
 # 5. Run it. On a terminal that is the approval console.
-./target/release/mcp-iap run --config iap.toml
+agent-iap run --config iap.toml
 ```
 
 Point the agent at the proxy:
@@ -179,6 +241,17 @@ Point the agent at the proxy:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic
 export ANTHROPIC_AUTH_TOKEN=iap_...        # the token from step 2, not your API key
+```
+
+Or, for an agent rather than an SDK, give it the proxy as an MCP server and let
+it discover the rest — what it can reach, and how to call it, come back from the
+policy itself. See § MCP:
+
+```json
+{ "mcpServers": { "iap": {
+    "type": "http",
+    "url": "http://127.0.0.1:8080/_iap/mcp",
+    "headers": { "Authorization": "Bearer iap_..." } } } }
 ```
 
 `init` writes the proxy and nothing else, on purpose: a starter file that
@@ -191,9 +264,9 @@ the proxy loads before it is saved — a rejected flag leaves the file untouched
 If you would rather start from something already filled in, two templates do:
 
 ```bash
-mcp-iap init --template starter                      # one agent, Anthropic, one rule
-mcp-iap init --template full --agent claude-code     # the annotated example, every pattern
-mcp-iap init --force                                 # replace an existing file
+agent-iap init --template starter                      # one agent, Anthropic, one rule
+agent-iap init --template full --agent claude-code     # the annotated example, every pattern
+agent-iap init --force                                 # replace an existing file
 ```
 
 `--template full` carries its own copy of `iap.example.toml`, so it works from an
@@ -203,17 +276,17 @@ For a service that already has a profile, step 2 is one command that writes the
 upstream *and* its rules — see [§ Profiles](#profiles):
 
 ```bash
-mcp-iap profile add cloudflare --secret op://Private/Cloudflare/token
+agent-iap profile add cloudflare --secret op://Private/Cloudflare/token
 ```
 
 The enrolment commands compose the same way for everything else:
 
 ```bash
-mcp-iap upstream add github --base-url https://api.github.com \
+agent-iap upstream add github --base-url https://api.github.com \
     --auth bearer --secret op://Private/GitHub/token
-mcp-iap acl add --agent 'ci-*' --target github --methods GET --paths '/repos/**'
-mcp-iap acl add --target github --methods DELETE --paths '/**' --action ask
-mcp-iap agent add ci-runner --name "CI" --target github
+agent-iap acl add --agent 'ci-*' --target github --methods GET --paths '/repos/**'
+agent-iap acl add --target github --methods DELETE --paths '/**' --action ask
+agent-iap agent add ci-runner --name "CI" --target github
 ```
 
 Rules are **appended**, never inserted, because first match wins — a new rule can
@@ -225,12 +298,12 @@ every one of its calls denied by a rule that never mentions it.
 Each of those has an `rm` — see [§ Revoking and removing](#revoking-and-removing),
 which is the command you want at 2am rather than an editor.
 
-`mcp-iap gen-token <id>` still prints an `[[agents]]` block to paste, for the
+`agent-iap gen-token <id>` still prints an `[[agents]]` block to paste, for the
 cases where the policy file is generated by something other than this CLI.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ mcp-iap   proxy 127.0.0.1:8080    1 waiting    1 agents · 1 upstreams · 0 mcp · 1 rules · default deny      │
+│ agent-iap   proxy 127.0.0.1:8080    1 waiting    1 agents · 1 upstreams · 0 mcp · 1 rules · default deny    │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ waiting for you ───────────────────────────────┐┌ request ─────────────────────────────────────────────────┐
 │▶    4s Claude Code github POST /repos/acme/api/││   agent  Claude Code (claude-code)                       │
@@ -258,9 +331,9 @@ thing — base URL, credential scheme, OAuth scopes and a set of rules narrow
 enough to be worth calling a policy:
 
 ```bash
-mcp-iap profile list
-mcp-iap profile show graylog
-mcp-iap profile add graylog --secret op://Private/Graylog/token \
+agent-iap profile list
+agent-iap profile show graylog
+agent-iap profile add graylog --secret op://Private/Graylog/token \
     --var host=graylog.example.com:9000
 ```
 
@@ -314,7 +387,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Graylog | `graylog` |
 | Others | `anthropic`, `openai`, `github`, `linear`, `sentry`, `slack`, `stripe` |
 
-`mcp-iap profile list --output json` for a machine, `--vendor google` to narrow
+`agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
 
 Two honest limits, both printed by `profile show`:
@@ -337,18 +410,18 @@ that mint a token rather than forwarding a secret:
 
 ```bash
 # A Google service account, no editor and no JSON key in the file.
-mcp-iap upstream add gsc --base-url https://searchconsole.googleapis.com \
+agent-iap upstream add gsc --base-url https://searchconsole.googleapis.com \
     --auth service-account-jwt --key-file op://Private/GCP/credential \
     --scope https://www.googleapis.com/auth/webmasters.readonly
 
 # An API whose *user* field is the credential.
-mcp-iap upstream add graylog --base-url https://graylog.example.com/api \
+agent-iap upstream add graylog --base-url https://graylog.example.com/api \
     --auth basic --username-secret op://Private/Graylog/token --secret literal:token
 
 # MCP servers, remote and local.
-mcp-iap mcp-server add posthog --url https://mcp.posthog.com/mcp \
+agent-iap mcp-server add posthog --url https://mcp.posthog.com/mcp \
     --auth bearer --secret op://Private/PostHog/key
-mcp-iap mcp-server add notes --command notes-mcp --arg --stdio \
+agent-iap mcp-server add notes --command notes-mcp --arg --stdio \
     --env NOTES_TOKEN=op://Private/Notes/token
 ```
 
@@ -367,14 +440,14 @@ Every enrolment has an inverse, and the one that matters is the one you run at
 
 ```bash
 # A token leaked. Mint the agent a new one, print it once, keep the id.
-mcp-iap agent rotate ci-runner
+agent-iap agent rotate ci-runner
 
 # Or retire the agent outright, taking the rules that named it.
-mcp-iap agent rm ci-runner --prune
+agent-iap agent rm ci-runner --prune
 
-mcp-iap upstream rm github --prune     # also drops it from agents' `targets`
-mcp-iap mcp-server rm notes --prune
-mcp-iap acl rm 3                       # the `#` column of `mcp-iap list acl`
+agent-iap upstream rm github --prune     # also drops it from agents' `targets`
+agent-iap mcp-server rm notes --prune
+agent-iap acl rm 3                       # the `#` column of `agent-iap list acl`
 ```
 
 `rotate` is the leaked-token path: a new token, the same agent id, and an audit
@@ -404,7 +477,7 @@ comes back.
 sequenceDiagram
     autonumber
     participant Agent
-    participant IAP as mcp-iap
+    participant IAP as agent-iap
     participant You as You, at the TUI
     participant API as api.cloudflare.com
 
@@ -442,15 +515,15 @@ sequenceDiagram
 
 ### The approval console
 
-`mcp-iap run` *is* the console. Step 5 parks a request until a human answers
+`agent-iap run` *is* the console. Step 5 parks a request until a human answers
 it, and the one thing that must never happen is parking it in a queue nobody is
 looking at — so the console is what `run` opens wherever there is a terminal to
 draw it on, and no flag asks for it:
 
 ```bash
-mcp-iap run                             # the console, on a terminal
-mcp-iap run --no-tui                    # the log stream on stderr instead
-mcp-iap run --tui                       # insist, for a terminal we did not recognise
+agent-iap run                             # the console, on a terminal
+agent-iap run --no-tui                    # the log stream on stderr instead
+agent-iap run --tui                       # insist, for a terminal we did not recognise
 ```
 
 Where there is no terminal — a unit file, a container, a pipe into `tee` —
@@ -459,7 +532,7 @@ learn a flag. What it gives up is the keyboard: unless something is polling the
 control plane, an `ask` denies immediately rather than parking, and the startup
 banner says which of the two you are getting.
 
-The console owns the terminal, so diagnostics go to `mcp-iap.log` beside the
+The console owns the terminal, so diagnostics go to `agent-iap.log` beside the
 audit log instead of to stdout, and the bottom pane is a live tail of the audit
 log — what the agent has been doing while you decide what to allow next.
 `↑`/`↓` moves, `a`/`d` answers, `A`/`D` answers and remembers it for this
@@ -468,14 +541,14 @@ the proxy with it.
 
 ## The policy file
 
-`mcp-iap init` writes one; `iap.example.toml` is the commented walk-through it
+`agent-iap init` writes one; `iap.example.toml` is the commented walk-through it
 embeds under `--template full`. The shape:
 
 ```toml
 [[agents]]
 id = "claude-code"
 name = "Claude Code"
-token_sha256 = "…"                  # from `mcp-iap gen-token`
+token_sha256 = "…"                  # from `agent-iap gen-token`
 targets = ["anthropic", "github"]   # optional hard scope, checked before the ACL
 
 [[upstreams]]
@@ -496,7 +569,7 @@ action = "allow"                    # allow | deny | ask
 action = "deny"
 ```
 
-An `[[mcp_servers]]` block has the same shape, and `mcp-iap mcp-server add`
+An `[[mcp_servers]]` block has the same shape, and `agent-iap mcp-server add`
 writes one. Both it and `upstream add` take every credential scheme below.
 
 `*` and `**` are globs. In `paths`, `*` stops at `/` and `**` crosses it, so
@@ -573,10 +646,10 @@ plane the TUI and the MCP bridge use. Both live in the policy file, and both can
 be overridden at run time by a deployment that does not own that file:
 
 ```bash
-mcp-iap run --listen 0.0.0.0:8080       # full address
-mcp-iap run --listen 9000               # bare port: keeps the configured interface
-mcp-iap run --admin-listen off          # no control plane, so no MCP bridge and no curl
-IAP_LISTEN=0.0.0.0:8080 mcp-iap run     # same, for a container or a unit file
+agent-iap run --listen 0.0.0.0:8080       # full address
+agent-iap run --listen 9000               # bare port: keeps the configured interface
+agent-iap run --admin-listen off          # no control plane, so no MCP bridge and no curl
+IAP_LISTEN=0.0.0.0:8080 agent-iap run     # same, for a container or a unit file
 ```
 
 A flag beats `IAP_LISTEN` / `IAP_ADMIN_LISTEN`, which beat the file. A bare port
@@ -601,18 +674,18 @@ before, so nothing existing changes by upgrading.
 
 ```toml
 [server.tls]
-cert = "file:/etc/mcp-iap/fullchain.pem"     # PEM chain, leaf first
-key  = "op://Infra/mcp-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
-ca   = "file:/etc/mcp-iap/root_ca.crt"       # optional: the CA that signed it
+cert = "file:/etc/agent-iap/fullchain.pem"     # PEM chain, leaf first
+key  = "op://Infra/agent-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
+ca   = "file:/etc/agent-iap/root_ca.crt"       # optional: the CA that signed it
 ```
 
 All three are *references*, resolved the same way every other credential is — a
 key is a credential, and this file stays safe to commit. All three are resolved
 **and parsed** at startup, before anything binds: a mismatched pair, a malformed
 PEM or a locked vault stops the process, rather than coming up healthy and
-failing the first handshake. `mcp-iap check` runs the same load.
+failing the first handshake. `agent-iap check` runs the same load.
 
-`ca` is for the one client this project runs itself — `mcp-iap mcp`, dialling
+`ca` is for the one client this project runs itself — `agent-iap mcp`, dialling
 the control plane. Public CAs need nothing here. A private CA wants its root
 named, so the trust anchor is the CA rather than whatever the served chain
 happens to contain. Leave it out and the bridge falls back to verifying against
@@ -627,16 +700,16 @@ own only if it needs one:
 
 ```toml
 [server.admin_tls]
-cert = "file:/etc/mcp-iap/admin-fullchain.pem"
-key  = "file:/etc/mcp-iap/admin-key.pem"
-ca   = "file:/etc/mcp-iap/root_ca.crt"
+cert = "file:/etc/agent-iap/admin-fullchain.pem"
+key  = "file:/etc/agent-iap/admin-key.pem"
+ca   = "file:/etc/agent-iap/root_ca.crt"
 ```
 
 The listener offers ALPN `h2` and `http/1.1`, so an agent that speaks HTTP/2
 keeps speaking it. Versions and cipher suites are rustls's defaults and there is
 no knob for them: a policy file that can select TLS 1.0 is a liability.
 
-The MCP bridge reads the same policy file, so `mcp-iap mcp` finds the control
+The MCP bridge reads the same policy file, so `agent-iap mcp` finds the control
 plane on `https://` by itself and verifies it against `ca`, or against `cert`
 when there is no `ca` — a self-signed loopback certificate needs no extra step,
 and verification is never turned off in either case. Which is why the
@@ -689,8 +762,8 @@ Certificates**, then on the host that runs the proxy:
 ```bash
 # The machine's own MagicDNS name; `tailscale status` prints it.
 sudo tailscale cert \
-  --cert-file /etc/mcp-iap/fullchain.pem \
-  --key-file  /etc/mcp-iap/key.pem \
+  --cert-file /etc/agent-iap/fullchain.pem \
+  --key-file  /etc/agent-iap/key.pem \
   iap.tailnet-name.ts.net
 ```
 
@@ -699,8 +772,8 @@ sudo tailscale cert \
 listen = "100.x.y.z:8080"     # the tailnet address — see below
 
 [server.tls]
-cert = "file:/etc/mcp-iap/fullchain.pem"
-key  = "file:/etc/mcp-iap/key.pem"
+cert = "file:/etc/agent-iap/fullchain.pem"
+key  = "file:/etc/agent-iap/key.pem"
 ```
 
 No `ca`: Let's Encrypt is already in every trust store there is.
@@ -721,10 +794,10 @@ renews it, and since the proxy reads both files once at startup, the renewal and
 the restart belong in one unit:
 
 ```bash
-tailscale cert --cert-file /etc/mcp-iap/fullchain.pem \
-               --key-file  /etc/mcp-iap/key.pem \
+tailscale cert --cert-file /etc/agent-iap/fullchain.pem \
+               --key-file  /etc/agent-iap/key.pem \
                iap.tailnet-name.ts.net \
-  && systemctl restart mcp-iap
+  && systemctl restart agent-iap
 ```
 
 #### Small Step
@@ -736,17 +809,17 @@ against it (`step ca bootstrap --ca-url … --fingerprint …`):
 ```bash
 # Writes the leaf first and then the intermediate, which is the order `cert` wants.
 step ca certificate iap.internal.example.com \
-  /etc/mcp-iap/fullchain.pem /etc/mcp-iap/key.pem
+  /etc/agent-iap/fullchain.pem /etc/agent-iap/key.pem
 
 # The root every agent will have to trust.
-step ca root /etc/mcp-iap/root_ca.crt
+step ca root /etc/agent-iap/root_ca.crt
 ```
 
 ```toml
 [server.tls]
-cert = "file:/etc/mcp-iap/fullchain.pem"
-key  = "file:/etc/mcp-iap/key.pem"
-ca   = "file:/etc/mcp-iap/root_ca.crt"
+cert = "file:/etc/agent-iap/fullchain.pem"
+key  = "file:/etc/agent-iap/key.pem"
+ca   = "file:/etc/agent-iap/root_ca.crt"
 ```
 
 `step ca certificate` writes the leaf *and* the issuing intermediate into the
@@ -755,7 +828,7 @@ the intermediate is what lets an agent build a path from the leaf to your root.
 Serving a bare leaf you extracted from that file is the mistake to avoid.
 
 `ca` is separate and is about verifying rather than serving: it names the root
-that `mcp-iap mcp` checks the control plane against. Without it the bridge falls
+that `agent-iap mcp` checks the control plane against. Without it the bridge falls
 back to treating the served chain as its own anchor, which works by coincidence
 — the intermediate happens to be in there — and stops working the moment
 someone splits the file or a provider hands over a leaf on its own. Naming the
@@ -768,14 +841,14 @@ Every host an agent runs on needs the root, by whichever of these the client
 reads:
 
 ```bash
-curl --cacert /etc/mcp-iap/root_ca.crt https://iap.internal.example.com:8080/…
+curl --cacert /etc/agent-iap/root_ca.crt https://iap.internal.example.com:8080/…
 
-export SSL_CERT_FILE=/etc/mcp-iap/root_ca.crt        # curl, and most of C
-export REQUESTS_CA_BUNDLE=/etc/mcp-iap/root_ca.crt   # python-requests
-export NODE_EXTRA_CA_CERTS=/etc/mcp-iap/root_ca.crt  # node
+export SSL_CERT_FILE=/etc/agent-iap/root_ca.crt        # curl, and most of C
+export REQUESTS_CA_BUNDLE=/etc/agent-iap/root_ca.crt   # python-requests
+export NODE_EXTRA_CA_CERTS=/etc/agent-iap/root_ca.crt  # node
 
 # Or install it once into the host's trust store and let every client find it:
-step certificate install /etc/mcp-iap/root_ca.crt
+step certificate install /etc/agent-iap/root_ca.crt
 ```
 
 The failure mode to plan for is an agent that cannot verify and is "fixed" with
@@ -790,8 +863,8 @@ where a renewal costs a restart. `step ca renew` can own both ends of it:
 
 ```bash
 step ca renew --daemon \
-  --exec "systemctl restart mcp-iap" \
-  /etc/mcp-iap/fullchain.pem /etc/mcp-iap/key.pem
+  --exec "systemctl restart agent-iap" \
+  /etc/agent-iap/fullchain.pem /etc/agent-iap/key.pem
 ```
 
 #### The control plane's certificate has to match the address
@@ -799,7 +872,7 @@ step ca renew --daemon \
 The control plane inherits `[server.tls]` when `[server.admin_tls]` is absent,
 and that is usually what you want — but it is *reached* at `admin_listen`, which
 is `127.0.0.1:8081`. A certificate issued for `iap.tailnet-name.ts.net` or
-`iap.internal.example.com` is not valid for `127.0.0.1`, and `mcp-iap mcp` dials
+`iap.internal.example.com` is not valid for `127.0.0.1`, and `agent-iap mcp` dials
 the address from the policy file. It trusts the certificate that file names and
 still checks the name against it — verification is never turned off — so the
 mismatch surfaces as a refused handshake, not a quiet downgrade.
@@ -809,14 +882,14 @@ reached at:
 
 ```bash
 step ca certificate localhost --san localhost --san 127.0.0.1 \
-  /etc/mcp-iap/admin-fullchain.pem /etc/mcp-iap/admin-key.pem
+  /etc/agent-iap/admin-fullchain.pem /etc/agent-iap/admin-key.pem
 ```
 
 ```toml
 [server.admin_tls]
-cert = "file:/etc/mcp-iap/admin-fullchain.pem"
-key  = "file:/etc/mcp-iap/admin-key.pem"
-ca   = "file:/etc/mcp-iap/root_ca.crt"
+cert = "file:/etc/agent-iap/admin-fullchain.pem"
+key  = "file:/etc/agent-iap/admin-key.pem"
+ca   = "file:/etc/agent-iap/root_ca.crt"
 ```
 
 Tailscale cannot issue that one — it signs `ts.net` names only — so a proxy
@@ -832,14 +905,14 @@ on one proxy, "what does this thing front, and with whose credential?" is its ow
 question, and the answer is one row per thing rather than a comma-joined line.
 
 ```console
-$ mcp-iap list upstreams
+$ agent-iap list upstreams
 NAME       BASE URL                        AUTH                 CREDENTIAL
 anthropic  https://api.anthropic.com       header x-api-key     op://Private/Anthropic API/credential
 gcs        https://storage.googleapis.com  service_account_jwt  op://Private/GCP Service Account/credential
 github     https://api.github.com          bearer               op://Private/GitHub/token
 ```
 
-`mcp-iap list` alone prints every section; `agents`, `upstreams`, `mcp` and `acl`
+`agent-iap list` alone prints every section; `agents`, `upstreams`, `mcp` and `acl`
 narrow it to one. ACL rules keep their position in the file, because first match
 wins and that order *is* the policy.
 
@@ -847,7 +920,7 @@ The question that actually matters once there is more than one agent is what a
 single one of them can reach — `targets` and the ACL intersected:
 
 ```console
-$ mcp-iap list --agent ci-bot
+$ agent-iap list --agent ci-bot
 Everything `ci-bot` can address. Rules are in match order — first match wins.
 
 UPSTREAMS
@@ -905,12 +978,12 @@ the agent that caused it, so one interleaved log still answers per-agent
 questions:
 
 ```bash
-mcp-iap audit tail --agent ci-runner
-mcp-iap audit tail --agent ci-runner --target github
+agent-iap audit tail --agent ci-runner
+agent-iap audit tail --agent ci-runner --target github
 
 # `-f` follows, and the filter applies to the live stream too — one terminal
 # per agent while a run is in flight.
-mcp-iap audit tail -f --agent ci-runner
+agent-iap audit tail -f --agent ci-runner
 ```
 
 Approvals are per agent too: a "remember for this session" answer is keyed by
@@ -1022,19 +1095,108 @@ for the next hour is worth an hour of one upstream's `/v1/messages` rather than
 everything that agent is allowed to do, forever.
 
 The MCP bridge does this on its own: when the daemon reports `workload_identity`
-on `/health`, `mcp-iap mcp --server github` exchanges its agent token for one
+on `/health`, `agent-iap mcp --server github` exchanges its agent token for one
 scoped to `github` alone, renews it two minutes before it lapses, and keeps the
 agent token for nothing but asking again.
 
 ## MCP
+
+Two things share the name here and point in opposite directions.
+
+- **The gateway** makes *agent-iap itself* an MCP server. An agent gets the REST
+  APIs this proxy fronts as tools, plus skills generated from the policy that is
+  actually running. This is the default way to hand an agent an API.
+- **The bridge** points the other way: it fronts somebody else's MCP server, the
+  way an upstream fronts somebody else's REST API.
+
+### The gateway
+
+The HTTP proxy is the right surface for a program: point an SDK at
+`http://127.0.0.1:8080/<upstream>` and it works unchanged. It is the wrong one
+for an agent, which has to be told out of band that the proxy exists, what it
+fronts and what it will refuse — none of which is discoverable from a base URL.
+MCP is the idiom agents already discover, so the same upstreams are offered over
+it:
+
+```json
+{ "mcpServers": { "iap": {
+    "type": "http",
+    "url": "http://127.0.0.1:8080/_iap/mcp",
+    "headers": { "Authorization": "Bearer iap_..." } } } }
+```
+
+For a client that only spawns commands, `agent-iap gateway` is the same server on
+stdio — a thin relay to the daemon, holding no credential but the agent's token:
+
+```json
+{ "mcpServers": { "iap": {
+    "command": "agent-iap",
+    "args": ["gateway", "--config", "/etc/agent-iap/iap.toml"],
+    "env": { "IAP_TOKEN": "iap_..." } } } }
+```
+
+Three tools, and no new policy to write — `iap_request` is decided by the same
+`kind = "http"` rules the proxy already uses, through the same function:
+
+| Tool | What it does |
+| --- | --- |
+| `iap_request` | One HTTP call against a configured upstream. The proxy attaches the credential. |
+| `iap_catalog` | The upstreams this agent may reach, with base URL and credential scheme. |
+| `iap_skill` | One generated skill document. |
+
+```jsonc
+// tools/call → iap_request
+{ "upstream": "anthropic", "method": "POST", "path": "/v1/messages",
+  "query": { "limit": 10 }, "body": { "model": "…" } }
+```
+
+`path` is the path the upstream sees, never a full URL. A credential header the
+agent sets is dropped rather than forwarded, so it cannot ride alongside the one
+the proxy attaches. A refusal comes back as an MCP tool error — `policy_denied`,
+`target_not_permitted`, `approval_denied`, `scope_exceeded` — rather than a
+JSON-RPC error, because the model is the one that has to read it and pick
+something else. The upstream's own `4xx` is a normal result, labelled with its
+status so it does not read as a refusal.
+
+#### Skills, and why they are generated
+
+An agent that finds a tool called `iap_request` learns nothing from the name
+about which upstreams exist or which paths are allowed, and a static README
+would go stale the first time a rule changed. So the gateway serves documents
+built from the running policy, for the agent that asked — two agents on one
+daemon are told two different things, each describing only what that one can
+actually reach:
+
+- The `initialize` response's `instructions` field: what this proxy is, that
+  credentials are never the agent's to hold, that refusals are final and
+  approvals are slow.
+- `using-this-gateway` — how to call, how to read each refusal code, and what
+  is recorded.
+- `upstream/<name>` — base URL, the credential *scheme* the proxy attaches, and
+  the rules that apply to this agent in match order.
+
+They are readable both as MCP resources (`skill://agent-iap/…`) and through
+`iap_skill`, for clients that only do tools. A skill names the scheme —
+`header x-api-key` — because that is how an agent stops trying to set the header
+itself. The secret behind it stays in the daemon.
+
+#### What the gateway does not do
+
+Responses are buffered, not streamed: a JSON-RPC result cannot be a stream, so a
+response is read up to `max_body_bytes` and truncation is reported in the
+result. Streaming output is what the HTTP proxy is for, and it is still there —
+the gateway is the default way in, not the only one. JSON-RPC batching is not
+accepted, having been dropped from the protocol revision this implements.
+
+### The bridge
 
 MCP over HTTP is just HTTP — front it as an upstream. For stdio servers, the
 agent runs the bridge as its MCP server:
 
 ```json
 { "mcpServers": { "github": {
-    "command": "mcp-iap",
-    "args": ["mcp", "--config", "/etc/mcp-iap/iap.toml", "--server", "github-mcp"],
+    "command": "agent-iap",
+    "args": ["mcp", "--config", "/etc/agent-iap/iap.toml", "--server", "github-mcp"],
     "env": { "IAP_TOKEN": "iap_..." } } } }
 ```
 
@@ -1064,7 +1226,7 @@ paths = ["get_*", "list_*", "search_*"]   # `paths` is the tool name here
 action = "allow"
 ```
 
-That first rule is the one everybody forgets, so `mcp-iap check` warns when an
+That first rule is the one everybody forgets, so `agent-iap check` warns when an
 MCP server has rules and none of them admits `initialize` — the failure it
 prevents is a `<default>` deny that names no rule to go and fix. Every
 `profile add` for an MCP server writes it for you.
@@ -1100,13 +1262,13 @@ revoked because of it, and it means either a workload racing its own renewal or
 a second holder of a token that should have had exactly one.
 
 ```bash
-mcp-iap audit tail -n 20
-mcp-iap audit verify
+agent-iap audit tail -n 20
+agent-iap audit verify
 # 9 entries verified — the hash chain is intact.
 
 # Both read `audit.path` from the policy file. Name a file to read another one —
 # a rotated log, or one copied off the host.
-mcp-iap audit verify audit/iap-audit.jsonl.1
+agent-iap audit verify audit/iap-audit.jsonl.1
 ```
 
 `tail -f` follows the log the way the name implies: the last `-n` entries, then
@@ -1115,8 +1277,8 @@ well as to the history, so `-f --agent ci-runner` is one terminal watching one
 agent work.
 
 ```bash
-mcp-iap audit tail -f
-mcp-iap audit tail -f -n 0 --target github
+agent-iap audit tail -f
+agent-iap audit tail -f -n 0 --target github
 ```
 
 A follower may be started before the proxy is — it waits for the log to appear
@@ -1157,6 +1319,113 @@ Polling `/pending` counts as watching the queue for 30 seconds, so `curl` alone
 can answer an `ask` without the TUI. With nobody watching, `ask` denies
 immediately rather than parking the request for the full timeout.
 
+## Deployment
+
+Everything so far has been the proxy in a terminal, reading `./iap.toml`. As a
+daemon it is the process on the box that holds every upstream credential the
+policy file names, so where its files live and who can read them *is* the
+security boundary.
+
+| Path | What | Mode |
+| --- | --- | --- |
+| `/usr/local/bin/agent-iap` | The binary. | `0755 root:root` |
+| `/etc/agent-iap/iap.toml` | Policy: the ACL, the agents' token hashes, the credential *references*. | `0600 agent-iap:agent-iap` |
+| `/etc/agent-iap/env` | Values for the `env:` references, and `OP_SERVICE_ACCOUNT_TOKEN` if you use `op://`. | `0600 agent-iap:agent-iap` |
+| `/var/lib/agent-iap/audit/iap-audit.jsonl` | The hash-chained audit log. | `0600 agent-iap:agent-iap` |
+| `/var/lib/agent-iap/audit/admin-token` | Control-plane bearer token, written at every start. | `0600 agent-iap:agent-iap` |
+
+The policy file holds no credential — agent tokens are stored as sha256, and an
+upstream's key is a reference to somewhere else. It still wants `0600`: readable
+it is a map of every credential worth going after and every agent entitled to
+one, and writable it *is* the ACL. The audit log's own claim is weaker than the
+mode suggests — chaining detects tampering, it does not prevent it (§ Security
+model), and a log an attacker can delete outright proves nothing. Ship the lines
+somewhere append-only if that matters.
+
+### systemd
+
+[`packaging/agent-iap.service`](packaging/agent-iap.service) runs it as its own user
+under a tight sandbox — `ProtectSystem=strict`, `ReadWritePaths` limited to the
+state directory, `UMask=0077` so everything it writes is owner-only without
+anyone remembering to say so:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin agent-iap
+sudo install -d -m0755 /etc/agent-iap
+
+# Build the policy with the same commands as § Quickstart, then hand it over.
+sudo agent-iap init --config /etc/agent-iap/iap.toml
+# `init` writes whatever the umask allows — usually group- and world-readable.
+# The mode is the step, not a flourish.
+sudo chown agent-iap:agent-iap /etc/agent-iap/iap.toml
+sudo chmod 0600 /etc/agent-iap/iap.toml
+
+sudo install -m0644 packaging/agent-iap.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-iap
+```
+
+`/var/lib/agent-iap` is created `0700` by `StateDirectory=` on first start — the
+audit log and the `admin-token` beside it land there, and it is the only path
+the service can write to. The unit sets `IAP_CONFIG`, so `agent-iap list`,
+`agent-iap audit verify` and the rest read the daemon's policy file with no
+`--config`.
+
+Two things worth knowing before the first restart:
+
+- **`ExecStartPre=agent-iap check` resolves every credential reference.** A
+  reference that no longer resolves fails startup with the name of the one that
+  broke, rather than at some later call. It also means a 1Password outage stops
+  a restart — which is the honest behaviour, since the proxy could not inject
+  anything anyway.
+- **`admin-token` is regenerated at every start.** Anything holding the old one
+  — a script polling `/status`, a detached MCP bridge — re-reads the file after
+  a restart. The audit log is not regenerated: the hash chain continues across
+  restarts, and `agent-iap audit verify` spans them.
+
+There is no console: `--no-tui` logs to the journal and an `ask` is answered
+over the control plane (§ Control plane) or denied. A rule set that is entirely
+`allow`/`deny` needs no answerer; one that uses `ask` needs something watching,
+or those calls fail closed.
+
+### Container
+
+The image is the same binary on `distroless/static` — no shell, no package
+manager, running as uid `65532`. Two mounts and one override:
+
+```bash
+# The uid inside the image owns neither mount by default, and a 0600 policy
+# file it cannot read is a `Permission denied` at startup, not a warning.
+sudo chown 65532:65532 /etc/agent-iap/iap.toml /var/lib/agent-iap
+
+docker run -d --name agent-iap \
+    -e IAP_LISTEN=0.0.0.0:8080 \
+    --env-file /etc/agent-iap/env \
+    -v /etc/agent-iap:/etc/agent-iap:ro \
+    -v /var/lib/agent-iap:/var/lib/agent-iap \
+    -p 8080:8080 \
+    ghcr.io/vpetersson/agent-iap:2026.9.1
+```
+
+`IAP_LISTEN` is the override that matters: the policy file's `127.0.0.1:8080` is
+loopback *inside* the container, which nothing can reach. Leave `admin_listen`
+on loopback — it is the control plane, and publishing it puts a bearer token's
+worth of authority on the network.
+
+If the host already runs it under systemd and you would rather keep one owner
+for those files, `--user "$(id -u agent-iap):$(id -g agent-iap)"` runs the image as
+that user instead; the binary needs no uid in particular.
+
+What the image deliberately cannot do, both following from the distroless base:
+
+- **`op://` references.** They shell out to the 1Password CLI, which is not in
+  here and has no shell to run in. Use `env:` or `file:` references, or build a
+  layer on a base that carries `op`.
+- **stdio MCP servers.** A `command = [...]` server is a child process, and
+  there is no `npx` or `uvx` to be one. Front those over HTTP instead — which
+  § Security model already recommends, since the stdio bridge is not a process
+  boundary anyway.
+
 ## Security model
 
 What this gives you:
@@ -1164,7 +1433,7 @@ What this gives you:
 - The agent never holds the upstream credential, so a leaked agent context, a
   prompt injection, or an exfiltrated config leaks a token that only works
   against this proxy, only for the paths the ACL allows, and that you can revoke
-  with `mcp-iap agent rm` — or replace with `mcp-iap agent rotate` — without
+  with `agent-iap agent rm` — or replace with `agent-iap agent rotate` — without
   rotating anything real.
 - With `workload_identity` on, what leaks is narrower still: a token scoped to
   one run's requests, expiring within the hour, revocable on its own, and
@@ -1198,6 +1467,13 @@ What it does not give you, and you should know before relying on it:
 - Audit hash-chaining detects tampering by anyone who cannot rewrite the whole
   file; it is not an append-only store. Ship the lines somewhere else for that.
 
+Found something that breaks one of the properties in the first list, rather than
+one of the limitations in the second? [`SECURITY.md`](SECURITY.md) has the
+private reporting channel, what counts as in scope, and what to expect after a
+report. Please don't open a public issue for it — the tracker is world-readable,
+and a working description of how to get past the ACL is a usable exploit against
+every deployment that has not upgraded yet.
+
 ## Not built yet
 
 Rate limits and spend caps per agent; hot config reload, which is also what a
@@ -1217,7 +1493,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 262 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 298 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -1227,10 +1503,15 @@ properties that matter: the upstream receives the real key, the agent's token
 stops at the proxy, denied calls never reach the network, an `ask` releases only
 when a human answers, and the resulting log verifies.
 
-`tests/revoke_e2e.rs` covers the other direction: it revokes and rotates
-through the enrolment API, restarts the proxy from the edited file, and asserts
-that the token stopped working — and that the process still running has not
-noticed, which is the caveat those commands print.
+`tests/gateway_e2e.rs` holds the MCP gateway to the same properties over its own
+surface, and asserts the one that spans both: the same call, refused through the
+proxy, is refused through the gateway with the same sentence. A second way in is
+a second way out if it does not enforce the same things.
+
+`tests/revoke_e2e.rs` covers the other direction: it revokes and rotates through
+the enrolment API, restarts the proxy from the edited file, and asserts that the
+token stopped working — and that the process still running has not noticed,
+which is the caveat those commands print.
 
 `tests/profiles_e2e.rs` does the same for the profiles, and builds its policy
 with `profile add` rather than a fixture — so a profile whose base URL, scheme
@@ -1244,6 +1525,11 @@ and `scripts/check-version.sh`, described below. Dependabot opens weekly grouped
 PRs for Cargo and for the actions themselves. Windows is not covered: the
 credential file permissions and the MCP stdio bridge are Unix-shaped today.
 
+`.github/workflows/release.yml` is the other half, and it runs the suite again
+per target rather than trusting CI's: the Linux artifacts link musl, which is
+not the libc CI's Linux job builds against, so passing there is not the same
+claim as passing in what ships.
+
 ## Versioning
 
 CalVer, `YYYY.MM.PATCH`: `2026.9.0`, then `2026.9.1` for the next release that
@@ -1256,8 +1542,11 @@ A consequence worth knowing: Cargo reads the year as the major, so every new
 month looks like a breaking change to a `^` constraint. That is the honest
 default here — this is a daemon you deploy, not a library you link, and the
 compatibility surface that matters is the policy file, not a Rust API. Changes
-that make an existing `iap.toml` stop loading are called out in the release
-notes for that version.
+that make an existing `iap.toml` stop loading are called out in the
+[release notes](https://github.com/vpetersson/agent-iap/releases) for that
+version. Those are generated from the titles of the pull requests in the tag, so
+a change that stops a policy file loading has to say so in its title — or be
+written into the release body before the release is announced.
 
 Cutting a release:
 
@@ -1270,9 +1559,17 @@ git tag v2026.9.1 && git push && git push --tags
 `scripts/bump-version.sh` works out the next version itself — the patch
 continues within a month and resets when the month rolls over — and refuses to
 leave the tree edited if what it produced is not valid. Pass a version to
-override it. `scripts/check-version.sh` runs in CI on every push and pull
-request, and on a `v…` tag it additionally requires the tag and `Cargo.toml` to
-agree, so a release cannot report a version that is nowhere in the history.
+override it.
+
+The tag is the whole trigger: pushing it runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which builds
+the four platforms in [§ Install](#install), runs the test suite on each target
+the runner can execute, attaches the tarballs and a `SHA256SUMS` to a GitHub
+Release, and pushes the container image built from those same binaries. Nothing
+in it starts until `scripts/check-version.sh` has passed: it runs in CI on every
+push and pull request, and on a `v…` tag it additionally requires the tag and
+`Cargo.toml` to agree — so a release cannot report a version that is nowhere in
+the history, and a mismatched tag fails before anything is published.
 
 ## License
 

@@ -1,0 +1,256 @@
+name: Release
+
+# A tag is the whole trigger. `scripts/bump-version.sh` writes the version,
+# `git tag v…` cuts it, and everything below hangs off the `version` gate that
+# proves the tag and Cargo.toml agree — so a release can never report a version
+# that is nowhere in the history.
+on:
+  push:
+    tags: ["v*"]
+
+# A release is never worth cancelling: a half-published tag leaves assets that
+# do not match their checksums.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing builds until the tag is proven to be the version in the manifest.
+  # CI runs this too, but a release must not depend on another workflow's run
+  # having finished first.
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/check-version.sh
+      # check-version.sh has already refused to continue unless this equals
+      # Cargo.toml's version, so the tag is safe to name artifacts with.
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux ships static musl builds. A daemon you drop on whichever box
+          # holds the credentials should not also impose a glibc floor, and a
+          # static binary has no runtime to install alongside it.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            test: true
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            test: true
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            test: true
+          # The Intel Mac artifact is cross-compiled from the arm64 runner:
+          # Apple's clang targets both, and it outlives the Intel runner image.
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            test: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `ring` compiles C, and against musl headers it wants musl's own cc
+      # rather than the host gcc that happens to be on PATH.
+      - name: musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          echo "CC_$(echo ${{ matrix.target }} | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+
+      # Only where the runner can execute what it built. This is the same suite
+      # CI runs, against the exact target configuration being shipped — musl is
+      # not the libc CI's Linux job links, so passing there is not the same
+      # claim as passing here.
+      - name: test
+        if: matrix.test
+        run: cargo test --all-features --locked --target ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # One tarball per platform: the binary and the licence it ships under,
+      # with the exec bit that a bare asset download would lose.
+      - name: package
+        env:
+          # BSD tar otherwise slips `._` AppleDouble members into the macOS
+          # tarballs, which everyone downstream then has to ignore.
+          COPYFILE_DISABLE: "1"
+        run: |
+          staging="agent-iap-${{ needs.version.outputs.version }}-${{ matrix.name }}"
+          mkdir -p "$staging"
+          cp target/${{ matrix.target }}/release/agent-iap "$staging/"
+          cp LICENSE README.md "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: agent-iap-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: github release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Computed here, over the assets actually about to be uploaded, so the
+      # checksum file cannot describe a build that did not ship.
+      - name: checksums
+        working-directory: dist
+        run: |
+          sha256sum agent-iap-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dist/agent-iap-*.tar.gz dist/SHA256SUMS
+
+  image:
+    name: ghcr image
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Full history, because the `latest` decision below reads every tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The image is assembled from the artifacts the release job publishes —
+      # the same bytes, not a second build of the same source. Laid out under
+      # the names Docker calls the architectures so the Dockerfile can pick by
+      # $TARGETARCH.
+      - name: lay out binaries
+        run: |
+          v=${{ needs.version.outputs.version }}
+          for pair in amd64:linux-x86_64 arm64:linux-aarch64; do
+            arch=${pair%%:*}
+            name=${pair#*:}
+            mkdir -p "dist/$arch"
+            tar xzf "artifacts/agent-iap-$v-$name.tar.gz" \
+                -C "dist/$arch" --strip-components=1 "agent-iap-$v-$name/agent-iap"
+          done
+          ls -l dist/*/agent-iap
+
+      # `latest` has to mean the newest release, not the most recently pushed
+      # tag: a backport cut after a newer version would otherwise walk it
+      # backwards, and the people who pinned nothing are exactly the ones who
+      # would not notice.
+      - name: is this the newest tag
+        id: newest
+        run: |
+          newest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          echo "newest tag is $newest, this is $GITHUB_REF_NAME"
+          if [ "$newest" = "$GITHUB_REF_NAME" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          # Named for the binary it contains, not for `github.repository`: an
+          # image name that follows a repo rename silently orphans everyone's
+          # `docker pull`, and this repo has been renamed once already.
+          images: ghcr.io/vpetersson/agent-iap
+          # CalVer, so `2026.9` floats within a month. There is no `2026`
+          # tag: the year is the major only because semver needs one, and a
+          # year-wide alias would imply a compatibility promise nothing here
+          # makes.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.newest.outputs.latest == 'true' }}
+
+      # Nothing is compiled here and nothing is executed for the foreign
+      # architecture — the static binaries are copied in — so both platforms
+      # build natively on this runner with no emulation.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+  # Dormant until someone decides crates.io is wanted and adds the token: the
+  # crate packages cleanly today, but `cargo install agent-iap` cannot work until
+  # a version is actually published, and publishing is irreversible. Skipping
+  # rather than failing keeps that decision off the critical path of a release.
+  crates-io:
+    name: crates.io
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: publish
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "No \`CARGO_REGISTRY_TOKEN\` secret — crates.io skipped." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "Add one to publish \`cargo install agent-iap\` from the next tag." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cargo publish --locked

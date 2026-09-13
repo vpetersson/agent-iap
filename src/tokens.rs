@@ -141,7 +141,7 @@ fn error(status: StatusCode, code: &str, message: String) -> Response {
         status,
         Json(serde_json::json!({
             "error": { "type": code, "message": message },
-            "proxy": "mcp-iap",
+            "proxy": "agent-iap",
         })),
     )
         .into_response()
