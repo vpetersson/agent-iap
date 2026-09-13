@@ -562,13 +562,23 @@ before, so nothing existing changes by upgrading.
 [server.tls]
 cert = "file:/etc/mcp-iap/fullchain.pem"     # PEM chain, leaf first
 key  = "op://Infra/mcp-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
+ca   = "file:/etc/mcp-iap/root_ca.crt"       # optional: the CA that signed it
 ```
 
-Both are *references*, resolved the same way every other credential is — a key
-is a credential, and this file stays safe to commit. Both are resolved **and
-parsed** at startup, before anything binds: a mismatched pair, a malformed PEM
-or a locked vault stops the process, rather than coming up healthy and failing
-the first handshake. `mcp-iap check` runs the same load.
+All three are *references*, resolved the same way every other credential is — a
+key is a credential, and this file stays safe to commit. All three are resolved
+**and parsed** at startup, before anything binds: a mismatched pair, a malformed
+PEM or a locked vault stops the process, rather than coming up healthy and
+failing the first handshake. `mcp-iap check` runs the same load.
+
+`ca` is for the one client this project runs itself — `mcp-iap mcp`, dialling
+the control plane. Public CAs need nothing here. A private CA wants its root
+named, so the trust anchor is the CA rather than whatever the served chain
+happens to contain. Leave it out and the bridge falls back to verifying against
+`cert` itself, which is exactly right for a self-signed certificate and is what
+every existing config does today. It buys agents nothing: they are other
+processes on other hosts, and they get the root the way they get everything
+else — see § Small Step below.
 
 The control plane follows the proxy onto TLS without being named twice — it
 carries the admin token and is no less sensitive. Give it a certificate of its
@@ -578,6 +588,7 @@ own only if it needs one:
 [server.admin_tls]
 cert = "file:/etc/mcp-iap/admin-fullchain.pem"
 key  = "file:/etc/mcp-iap/admin-key.pem"
+ca   = "file:/etc/mcp-iap/root_ca.crt"
 ```
 
 The listener offers ALPN `h2` and `http/1.1`, so an agent that speaks HTTP/2
@@ -585,11 +596,193 @@ keeps speaking it. Versions and cipher suites are rustls's defaults and there is
 no knob for them: a policy file that can select TLS 1.0 is a liability.
 
 The MCP bridge reads the same policy file, so `mcp-iap mcp` finds the control
-plane on `https://` by itself and trusts that certificate — a self-signed
-loopback certificate needs no extra step, and verification is never turned off.
+plane on `https://` by itself and verifies it against `ca`, or against `cert`
+when there is no `ca` — a self-signed loopback certificate needs no extra step,
+and verification is never turned off in either case. Which is why the
+certificate the control plane serves has to name the address it is reached at;
+see below.
 
 Renewal still means a restart; there is no reload yet. Client certificates are
 not an identity here either — agents are still the bearer token.
+
+#### Where the certificate comes from
+
+Nothing above is provider-specific. `cert` and `key` are a PEM chain and a PEM
+key, and `ca` is a PEM bundle, so ACME, an internal CA, a corporate PKI or a
+certificate someone handed you on a USB stick all work identically — the proxy
+never asks who signed it. If your company already runs a CA, that is the
+provider, and this section is only what someone else's commands look like.
+
+Two are worth writing down, because between them they are the two shortest paths
+from "loopback only" to "an agent on another host", and they differ on the one
+thing that actually costs you anything: who has to be told to trust the result.
+
+| | Tailscale | Small Step (`step-ca`) |
+| --- | --- | --- |
+| Signed by | Let's Encrypt, via Tailscale — a public root | a CA you run |
+| Clients need a CA certificate | no, the system trust store already has it | yes, your root, on every host an agent runs on |
+| `ca` in the policy file | leave it out | name your root |
+| The name it is valid for | `host.tailnet-name.ts.net`, not yours to choose | whatever you issue for |
+| Lifetime | 90 days | 24 hours by default, and yours to set |
+| Also answers | how the agent reaches the host at all | nothing — bring your own network |
+
+Tailscale is the one to reach for when you want an agent off this host talking
+to the proxy this afternoon: the certificate is trusted everywhere with no
+client-side step at all, and the tailnet disposes of the separate question of
+how an agent on a laptop reaches a proxy in a rack. Small Step is the one that
+looks like the rest of a company's internal x509 — you run the CA, you set the
+lifetimes and the naming, and every client is pointed at your root. That extra
+step is the whole difference, and it is also the reason the second one scales to
+things other than this proxy.
+
+A self-signed certificate is a third path and a legitimate one for a single
+host. It costs the same client-side work as a private CA — every agent must be
+given the certificate — while buying none of the CA's reach, so it is worth it
+for one machine and stops being worth it at two.
+
+#### Tailscale
+
+Enable HTTPS for the tailnet once, in the admin console under **DNS → HTTPS
+Certificates**, then on the host that runs the proxy:
+
+```bash
+# The machine's own MagicDNS name; `tailscale status` prints it.
+sudo tailscale cert \
+  --cert-file /etc/mcp-iap/fullchain.pem \
+  --key-file  /etc/mcp-iap/key.pem \
+  iap.tailnet-name.ts.net
+```
+
+```toml
+[server]
+listen = "100.x.y.z:8080"     # the tailnet address — see below
+
+[server.tls]
+cert = "file:/etc/mcp-iap/fullchain.pem"
+key  = "file:/etc/mcp-iap/key.pem"
+```
+
+No `ca`: Let's Encrypt is already in every trust store there is.
+
+Agents use `https://iap.tailnet-name.ts.net:8080` and need nothing else: the
+chain ends at a public root, so `curl`, `requests` and `node` verify it with no
+configuration, no `--cacert` and no bundle to distribute. That is the entire
+argument for this option.
+
+Bind `listen` to the tailnet address rather than `0.0.0.0`. The certificate is
+valid for the `ts.net` name only, so a LAN client gets a name mismatch rather
+than a connection — and the process holding every upstream credential has no
+reason to be accepting connections on an interface whose callers it cannot even
+serve.
+
+The certificate lasts 90 days. Re-running the same `tailscale cert` command
+renews it, and since the proxy reads both files once at startup, the renewal and
+the restart belong in one unit:
+
+```bash
+tailscale cert --cert-file /etc/mcp-iap/fullchain.pem \
+               --key-file  /etc/mcp-iap/key.pem \
+               iap.tailnet-name.ts.net \
+  && systemctl restart mcp-iap
+```
+
+#### Small Step
+
+`step-ca` issues from a CA you run, which is the arrangement most companies
+already have for internal services. With a CA up and this host bootstrapped
+against it (`step ca bootstrap --ca-url … --fingerprint …`):
+
+```bash
+# Writes the leaf first and then the intermediate, which is the order `cert` wants.
+step ca certificate iap.internal.example.com \
+  /etc/mcp-iap/fullchain.pem /etc/mcp-iap/key.pem
+
+# The root every agent will have to trust.
+step ca root /etc/mcp-iap/root_ca.crt
+```
+
+```toml
+[server.tls]
+cert = "file:/etc/mcp-iap/fullchain.pem"
+key  = "file:/etc/mcp-iap/key.pem"
+ca   = "file:/etc/mcp-iap/root_ca.crt"
+```
+
+`step ca certificate` writes the leaf *and* the issuing intermediate into the
+crt file — that is what step-ca returns, and `cert` wants exactly it, because
+the intermediate is what lets an agent build a path from the leaf to your root.
+Serving a bare leaf you extracted from that file is the mistake to avoid.
+
+`ca` is separate and is about verifying rather than serving: it names the root
+that `mcp-iap mcp` checks the control plane against. Without it the bridge falls
+back to treating the served chain as its own anchor, which works by coincidence
+— the intermediate happens to be in there — and stops working the moment
+someone splits the file or a provider hands over a leaf on its own. Naming the
+root says which certificate is the trust anchor instead of inferring it from
+whatever was bundled.
+
+Then the half Tailscale does not have, and the one `ca` does not help with:
+`ca` is read by this process, and agents are other processes on other hosts.
+Every host an agent runs on needs the root, by whichever of these the client
+reads:
+
+```bash
+curl --cacert /etc/mcp-iap/root_ca.crt https://iap.internal.example.com:8080/…
+
+export SSL_CERT_FILE=/etc/mcp-iap/root_ca.crt        # curl, and most of C
+export REQUESTS_CA_BUNDLE=/etc/mcp-iap/root_ca.crt   # python-requests
+export NODE_EXTRA_CA_CERTS=/etc/mcp-iap/root_ca.crt  # node
+
+# Or install it once into the host's trust store and let every client find it:
+step certificate install /etc/mcp-iap/root_ca.crt
+```
+
+The failure mode to plan for is an agent that cannot verify and is "fixed" with
+`curl -k` or `verify=False`. That agent is now handing its bearer token to
+whatever answers the address, which is the attack TLS was added here to stop —
+so ship the root with the agent's image or its config, and treat a verification
+failure as a deployment bug rather than a flag to add.
+
+`step-ca` issues short certificates on purpose — 24 hours by default, and the
+provisioner caps what you may ask for. That is a virtue everywhere except here,
+where a renewal costs a restart. `step ca renew` can own both ends of it:
+
+```bash
+step ca renew --daemon \
+  --exec "systemctl restart mcp-iap" \
+  /etc/mcp-iap/fullchain.pem /etc/mcp-iap/key.pem
+```
+
+#### The control plane's certificate has to match the address
+
+The control plane inherits `[server.tls]` when `[server.admin_tls]` is absent,
+and that is usually what you want — but it is *reached* at `admin_listen`, which
+is `127.0.0.1:8081`. A certificate issued for `iap.tailnet-name.ts.net` or
+`iap.internal.example.com` is not valid for `127.0.0.1`, and `mcp-iap mcp` dials
+the address from the policy file. It trusts the certificate that file names and
+still checks the name against it — verification is never turned off — so the
+mismatch surfaces as a refused handshake, not a quiet downgrade.
+
+Give the control plane a certificate that names the address it is actually
+reached at:
+
+```bash
+step ca certificate localhost --san localhost --san 127.0.0.1 \
+  /etc/mcp-iap/admin-fullchain.pem /etc/mcp-iap/admin-key.pem
+```
+
+```toml
+[server.admin_tls]
+cert = "file:/etc/mcp-iap/admin-fullchain.pem"
+key  = "file:/etc/mcp-iap/admin-key.pem"
+ca   = "file:/etc/mcp-iap/root_ca.crt"
+```
+
+Tailscale cannot issue that one — it signs `ts.net` names only — so a proxy
+fronted by Tailscale wants a separate `step-ca` or self-signed certificate for
+its control plane. The alternative is `--admin-url https://…ts.net:8081` against
+an `admin_listen` on the tailnet address, which moves the admin token onto the
+tailnet to save a certificate. Prefer the certificate.
 
 ## What is exposed
 
@@ -980,7 +1173,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 224 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 233 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

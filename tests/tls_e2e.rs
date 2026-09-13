@@ -399,3 +399,123 @@ action = "deny"
     assert!(error.contains("do not go together"), "{error}");
     assert!(error.contains("server.tls"), "{error}");
 }
+
+/// A CA, and a leaf it signed for `localhost` and `127.0.0.1`.
+///
+/// The private-CA arrangement, and the one the self-signed helper above cannot
+/// stand in for: the certificate to verify *against* is not the certificate
+/// being served, so the leaf alone is not enough to build a path from.
+fn ca_signed() -> (String, String, String) {
+    fn named(common_name: &str) -> rcgen::DistinguishedName {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, common_name);
+        dn
+    }
+
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    ca.distinguished_name = named("mcp-iap test CA");
+    let root = ca.self_signed(&ca_key).unwrap().pem();
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let mut leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    leaf.subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::from([
+            127, 0, 0, 1,
+        ])));
+    leaf.distinguished_name = named("control plane");
+    let leaf_pem = leaf.signed_by(&leaf_key, &issuer).unwrap().pem();
+
+    (root, leaf_pem, leaf_key.serialize_pem())
+}
+
+/// Serve `/health` over TLS on a fresh loopback port, the way `run` does.
+fn spawn_https(certificate: &str, key: &str) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = tls::serve(
+        listener,
+        Router::new().route("/health", axum::routing::get(|| async { "ok" })),
+        Some(tls::build(certificate, key).unwrap()),
+    )
+    .unwrap();
+    tokio::spawn(serving);
+    addr
+}
+
+#[tokio::test]
+async fn the_bridge_verifies_the_control_plane_against_the_ca_the_policy_file_names() {
+    let (root, leaf, key) = ca_signed();
+    let resolver = mcp_iap::secrets::SecretResolver::new("op");
+    let addr = spawn_https(&leaf, &key);
+    let url = format!("https://localhost:{}/health", addr.port());
+
+    let material = |ca: Option<String>| mcp_iap::config::TlsConfig {
+        cert: format!("literal:{leaf}"),
+        key: format!("literal:{key}"),
+        ca,
+    };
+
+    // Without `ca` the only anchor available is the served certificate itself,
+    // and a leaf its CA signed is not its own issuer. This is the case that
+    // used to require bundling the intermediate into `cert` to work at all.
+    let error = tls::control_plane_client(Some(&material(None)), &resolver)
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(error.is_connect() || error.is_request(), "{error}");
+
+    // Naming the CA makes the CA the anchor, and the leaf verifies against it.
+    let response =
+        tls::control_plane_client(Some(&material(Some(format!("literal:{root}")))), &resolver)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // And it is still verification, not a way to switch it off: the same client
+    // refuses a certificate that CA did not sign.
+    let (_, other_leaf, other_key) = ca_signed();
+    let other = spawn_https(&other_leaf, &other_key);
+    let error =
+        tls::control_plane_client(Some(&material(Some(format!("literal:{root}")))), &resolver)
+            .unwrap()
+            .get(format!("https://localhost:{}/health", other.port()))
+            .send()
+            .await
+            .unwrap_err();
+    assert!(error.is_connect() || error.is_request(), "{error}");
+}
+
+#[tokio::test]
+async fn a_self_signed_control_plane_still_needs_no_ca_named() {
+    // The documented loopback case: `cert` is its own CA, and the fallback that
+    // was the only behaviour before `ca` existed keeps working untouched.
+    let (certificate, key) = self_signed();
+    let addr = spawn_https(&certificate, &key);
+
+    let response = tls::control_plane_client(
+        Some(&mcp_iap::config::TlsConfig {
+            cert: format!("literal:{certificate}"),
+            key: format!("literal:{key}"),
+            ca: None,
+        }),
+        &mcp_iap::secrets::SecretResolver::new("op"),
+    )
+    .unwrap()
+    .get(format!("https://localhost:{}/health", addr.port()))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+}

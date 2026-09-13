@@ -1071,7 +1071,17 @@ fn check(path: &Path) -> Result<()> {
     // rather than by the first agent to connect.
     if config.server.tls.is_some() || config.server.admin_tls.is_some() {
         ServerTls::load(&config.server, &resolver)?;
-        println!("tls         ok      certificate and key parse and match");
+        let named_a_ca = [&config.server.tls, &config.server.admin_tls]
+            .iter()
+            .any(|tls| tls.as_ref().is_some_and(|tls| tls.ca.is_some()));
+        println!(
+            "tls         ok      certificate and key parse and match{}",
+            if named_a_ca {
+                ", and the CA parses"
+            } else {
+                ""
+            }
+        );
     }
 
     println!("\nconfig is valid.");
