@@ -513,15 +513,23 @@ enum AuditCommand {
         #[command(flatten)]
         config: ConfigArg,
     },
-    /// Print the last N entries, one line each.
+    /// Print the last N entries, one line each — with `-f`, keep printing as
+    /// the proxy writes them.
     Tail {
         /// Log to read. Defaults to `audit.path` from the policy file, which is
         /// the one the proxy is writing.
         path: Option<PathBuf>,
         #[command(flatten)]
         config: ConfigArg,
+        /// How many entries to show. With `-f`, how much history comes before
+        /// the stream.
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+        /// Stay open and print entries as they are written, like `tail -f`.
+        /// Survives the log being rotated, waits for one that does not exist
+        /// yet, and ends on Ctrl-C.
+        #[arg(short = 'f', long)]
+        follow: bool,
         /// Only this agent. One proxy fronts many agents, so the log is
         /// interleaved and "what has bravo been doing" is the usual question.
         #[arg(long, value_name = "ID")]
@@ -724,19 +732,25 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Audit(AuditCommand::Verify { path, config }) => {
-            verify_audit(&audit_log_path(path, &config.config)?)
+            verify_audit(&audit_log_path(path, &config.config, true)?)
         }
         Command::Audit(AuditCommand::Tail {
             path,
             config,
             lines,
+            follow,
             agent,
             target,
         }) => tail_audit(
-            &audit_log_path(path, &config.config)?,
-            lines,
-            agent.as_deref(),
-            target.as_deref(),
+            // A follower may legitimately start before the log exists; a
+            // one-shot dump of a log that does not is a mistake worth naming.
+            &audit_log_path(path, &config.config, !follow)?,
+            &TailOptions {
+                lines,
+                follow,
+                agent: agent.as_deref(),
+                target: target.as_deref(),
+            },
         ),
     }
 }
@@ -1337,7 +1351,7 @@ fn gen_token(id: &str) -> Result<()> {
 /// line, or — since the policy file already says where the proxy writes — the
 /// one it points at. Naming it is for the exceptions: a rotated file, or a log
 /// copied off the host it was written on.
-fn audit_log_path(path: Option<PathBuf>, config: &Path) -> Result<PathBuf> {
+fn audit_log_path(path: Option<PathBuf>, config: &Path, must_exist: bool) -> Result<PathBuf> {
     match path {
         Some(path) => Ok(path),
         None => {
@@ -1345,7 +1359,7 @@ fn audit_log_path(path: Option<PathBuf>, config: &Path) -> Result<PathBuf> {
             // A relative `audit.path` resolves against the working directory —
             // the proxy's when it wrote, ours when we read. Say where the name
             // came from, so a mismatch reads as that rather than a lost log.
-            if !path.exists() {
+            if must_exist && !path.exists() {
                 bail!(
                     "no audit log at `{}` — that is `audit.path` from `{}`, and a relative path \
                      resolves against the current directory",
@@ -1370,44 +1384,125 @@ fn verify_audit(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tail_audit(path: &Path, lines: usize, agent: Option<&str>, target: Option<&str>) -> Result<()> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading `{}`", path.display()))?;
+/// How often a follower looks for new lines. `tail -f` polls too; the log is
+/// appended a line at a time and flushed, so this is the whole of the machinery.
+const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
-    let filtered = agent.is_some() || target.is_some();
-    let mut rendered: Vec<String> = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        match serde_json::from_str::<audit::AuditEvent>(line) {
-            Ok(event) => {
-                if !event.matches(agent, target) {
-                    continue;
-                }
-                rendered.push(format!("{} {}", event.ts, event.oneline()));
-            }
-            // A line this build cannot parse is still evidence, so it is shown
-            // verbatim — but it cannot be matched against a filter, and passing
-            // it through a filtered view would misreport it as a hit.
-            Err(_) if !filtered => rendered.push(line.to_string()),
-            Err(_) => {}
+struct TailOptions<'a> {
+    lines: usize,
+    follow: bool,
+    agent: Option<&'a str>,
+    target: Option<&'a str>,
+}
+
+impl TailOptions<'_> {
+    fn filtered(&self) -> bool {
+        self.agent.is_some() || self.target.is_some()
+    }
+
+    /// What a filtered view was narrowed to, for the "nothing here" note.
+    fn scope(&self) -> Option<String> {
+        match (self.agent, self.target) {
+            (Some(agent), Some(target)) => Some(format!("agent `{agent}` and target `{target}`")),
+            (Some(agent), None) => Some(format!("agent `{agent}`")),
+            (None, Some(target)) => Some(format!("target `{target}`")),
+            (None, None) => None,
         }
     }
 
-    // Filter first, then take the last N: `-n 20 --agent bravo` means bravo's
-    // last twenty, not whatever bravo did inside the log's last twenty.
-    for line in rendered.iter().skip(rendered.len().saturating_sub(lines)) {
-        println!("{line}");
+    /// One log line as it should be shown, or `None` if it is out of scope.
+    fn render(&self, line: &str) -> Option<String> {
+        if line.trim().is_empty() {
+            return None;
+        }
+        match serde_json::from_str::<audit::AuditEvent>(line) {
+            Ok(event) => event
+                .matches(self.agent, self.target)
+                .then(|| format!("{} {}", event.ts, event.oneline())),
+            // A line this build cannot parse is still evidence, so it is shown
+            // verbatim — but it cannot be matched against a filter, and passing
+            // it through a filtered view would misreport it as a hit.
+            Err(_) if !self.filtered() => Some(line.to_string()),
+            Err(_) => None,
+        }
+    }
+}
+
+fn tail_audit(path: &Path, options: &TailOptions) -> Result<()> {
+    let mut tail = audit::Tail::open(path)?;
+    let mut out = std::io::stdout().lock();
+
+    if options.follow && !tail.is_open() {
+        eprintln!("waiting for `{}` to appear", path.display());
     }
 
-    if rendered.is_empty() && filtered {
-        let what = match (agent, target) {
-            (Some(agent), Some(target)) => format!("agent `{agent}` and target `{target}`"),
-            (Some(agent), None) => format!("agent `{agent}`"),
-            (None, Some(target)) => format!("target `{target}`"),
-            (None, None) => unreachable!("filtered implies one of the two is set"),
+    // The first file read is the dump — the last N *matching* entries, because
+    // `-n 20 --agent bravo` means bravo's last twenty, not whatever bravo did
+    // inside the log's last twenty. Everything after it streams in full.
+    let mut dumping = true;
+    let mut matched = 0usize;
+
+    loop {
+        let batch = tail.read()?;
+        if batch.rotated {
+            eprintln!("`{}` was replaced — following the new file", path.display());
+        }
+
+        let rendered: Vec<String> = batch
+            .lines
+            .iter()
+            .filter_map(|line| options.render(line))
+            .collect();
+        matched += rendered.len();
+
+        let skip = if dumping {
+            rendered.len().saturating_sub(options.lines)
+        } else {
+            0
         };
-        eprintln!("no entries for {what}");
+        for line in rendered.iter().skip(skip) {
+            if !write_line(&mut out, line)? {
+                return Ok(());
+            }
+        }
+
+        if !options.follow {
+            // A path handed in by name is read directly, so a typo lands here
+            // rather than in the policy-file check that fronts the other route.
+            if !tail.is_open() {
+                bail!("no audit log at `{}`", path.display());
+            }
+            break;
+        }
+
+        if dumping && tail.is_open() {
+            dumping = false;
+            if matched == 0 {
+                if let Some(scope) = options.scope() {
+                    eprintln!("no entries for {scope} yet — waiting");
+                }
+            }
+        }
+
+        std::thread::sleep(FOLLOW_POLL);
+    }
+
+    if matched == 0 {
+        if let Some(scope) = options.scope() {
+            eprintln!("no entries for {scope}");
+        }
     }
     Ok(())
+}
+
+/// `false` once the reader has gone away. `audit tail -f | head -5` is an
+/// ordinary way to end a stream, not a failure to report as one.
+fn write_line(out: &mut impl std::io::Write, line: &str) -> Result<bool> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error).context("writing to stdout"),
+    }
 }
 
 fn list_profiles(vendor: Option<&str>, output: OutputArg) -> Result<()> {

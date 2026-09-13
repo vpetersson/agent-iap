@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use tokio::sync::broadcast;
 
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -306,6 +306,134 @@ fn read_tail(path: &Path) -> Result<Option<AuditEvent>> {
     Ok(last)
 }
 
+/// Identity of the file behind a path, so a rotation is noticed even when the
+/// replacement has already grown past where the follower was reading.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn file_id(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// What one read off the end of the log produced.
+pub struct Batch {
+    /// Complete lines, in order. A half-written line is held back until its
+    /// newline arrives, so a follower never shows a truncated record as if the
+    /// proxy had written one.
+    pub lines: Vec<String>,
+    /// The file was truncated or replaced and reading restarted at its
+    /// beginning — the lines above come from the new file, not the old one.
+    pub rotated: bool,
+}
+
+/// An incremental reader over an audit log.
+///
+/// The proxy appends one flushed line at a time, so following the log is a
+/// matter of re-reading whatever landed after the last complete line. Rotation
+/// is the case worth care: the file behind the path can be replaced or
+/// truncated underneath a reader, and a follower still holding the old handle
+/// would go quiet for the rest of its life rather than say so.
+pub struct Tail {
+    path: PathBuf,
+    file: Option<File>,
+    id: Option<u64>,
+    /// Bytes consumed from the file currently open, for spotting a truncation.
+    offset: u64,
+    /// A trailing line that has not had its newline yet.
+    partial: Vec<u8>,
+}
+
+impl Tail {
+    /// Start reading `path` from its beginning.
+    ///
+    /// A log that does not exist yet is not an error: a follower is often
+    /// started before the proxy that writes to it, and `read` picks the file up
+    /// when it appears.
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut tail = Tail {
+            path: path.to_path_buf(),
+            file: None,
+            id: None,
+            offset: 0,
+            partial: Vec::new(),
+        };
+        tail.reopen()?;
+        Ok(tail)
+    }
+
+    /// Whether a file is currently open — false while waiting for one to appear.
+    pub fn is_open(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// `true` if a file was opened, `false` if the path is still empty of one.
+    fn reopen(&mut self) -> Result<bool> {
+        self.file = None;
+        self.id = None;
+        self.offset = 0;
+        self.partial.clear();
+
+        match File::open(&self.path) {
+            Ok(file) => {
+                self.id = file.metadata().ok().as_ref().and_then(file_id);
+                self.file = Some(file);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => {
+                Err(error).with_context(|| format!("opening audit log `{}`", self.path.display()))
+            }
+        }
+    }
+
+    /// Every complete line appended since the last call.
+    pub fn read(&mut self) -> Result<Batch> {
+        let mut rotated = false;
+
+        match std::fs::metadata(&self.path) {
+            Ok(meta) => {
+                // A handle survives the rename that logrotate does, so the
+                // check has to be against the path, not against what is open.
+                let replaced = file_id(&meta) != self.id || meta.len() < self.offset;
+                if self.file.is_none() || replaced {
+                    let had_file = self.file.is_some();
+                    rotated = self.reopen()? && had_file;
+                }
+            }
+            // Renamed away and not yet replaced. Keep the old handle: whatever
+            // is still being appended to it is still the log, and the new file
+            // is picked up on a later read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading `{}`", self.path.display()))
+            }
+        }
+
+        let mut lines = Vec::new();
+        if let Some(file) = self.file.as_mut() {
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .with_context(|| format!("reading `{}`", self.path.display()))?;
+            self.offset += buffer.len() as u64;
+            self.partial.extend_from_slice(&buffer);
+
+            while let Some(index) = self.partial.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.partial.drain(..=index).collect();
+                let line = String::from_utf8_lossy(&line[..index]);
+                lines.push(line.trim_end_matches('\r').to_string());
+            }
+        }
+
+        Ok(Batch { lines, rotated })
+    }
+}
+
 #[derive(Debug)]
 pub struct VerifyReport {
     pub entries: u64,
@@ -540,5 +668,97 @@ mod tests {
         .unwrap();
         let clipped = log.clip_body("aaaaübbbb".as_bytes()).to_string();
         assert!(clipped.contains("truncated"), "{clipped}");
+    }
+
+    #[test]
+    fn a_follower_sees_what_is_appended_after_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, path) = log_in(dir.path());
+        log.write(AuditRecord::new("http", "request")).unwrap();
+
+        let mut tail = Tail::open(&path).unwrap();
+        assert_eq!(tail.read().unwrap().lines.len(), 1);
+        // Nothing new is not an error and not a repeat of what was already read.
+        assert!(tail.read().unwrap().lines.is_empty());
+
+        log.write(AuditRecord::new("http", "denied")).unwrap();
+        let batch = tail.read().unwrap();
+        assert_eq!(batch.lines.len(), 1, "the new entry, and only it");
+        assert!(batch.lines[0].contains("denied"), "{:?}", batch.lines);
+        assert!(!batch.rotated);
+    }
+
+    #[test]
+    fn a_half_written_line_is_held_back_until_its_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, b"{\"seq\":0,").unwrap();
+
+        let mut tail = Tail::open(&path).unwrap();
+        assert!(
+            tail.read().unwrap().lines.is_empty(),
+            "half a record must not be shown as if the proxy had written it"
+        );
+
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\"rest\":1}\n").unwrap();
+        assert_eq!(tail.read().unwrap().lines, vec!["{\"seq\":0,\"rest\":1}"]);
+    }
+
+    #[test]
+    fn a_rotated_log_is_followed_to_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "first\n").unwrap();
+
+        let mut tail = Tail::open(&path).unwrap();
+        assert_eq!(tail.read().unwrap().lines, vec!["first"]);
+
+        // What logrotate does: rename the file away, then create a new one. The
+        // follower's handle survives the rename, so without noticing the swap it
+        // would sit on the old inode and never print another line.
+        std::fs::rename(&path, dir.path().join("audit.jsonl.1")).unwrap();
+        std::fs::write(&path, "second\n").unwrap();
+
+        let batch = tail.read().unwrap();
+        assert_eq!(batch.lines, vec!["second"]);
+        assert!(
+            batch.rotated,
+            "the reader is owed the fact that it restarted"
+        );
+    }
+
+    #[test]
+    fn a_truncated_log_is_re_read_from_its_beginning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let mut tail = Tail::open(&path).unwrap();
+        assert_eq!(tail.read().unwrap().lines.len(), 3);
+
+        // Truncated in place, which leaves the offset past the end of the file.
+        std::fs::write(&path, "fresh\n").unwrap();
+        let batch = tail.read().unwrap();
+        assert_eq!(batch.lines, vec!["fresh"]);
+        assert!(batch.rotated);
+    }
+
+    #[test]
+    fn a_log_that_does_not_exist_yet_is_waited_for_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        // A follower is routinely started before the proxy it is watching.
+        let mut tail = Tail::open(&path).unwrap();
+        assert!(!tail.is_open());
+        assert!(tail.read().unwrap().lines.is_empty());
+
+        let (log, _) = log_in(dir.path());
+        log.write(AuditRecord::new("http", "request")).unwrap();
+
+        let batch = tail.read().unwrap();
+        assert!(tail.is_open());
+        assert_eq!(batch.lines.len(), 1);
     }
 }
