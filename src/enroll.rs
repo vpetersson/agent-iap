@@ -1,4 +1,5 @@
-//! Enrolling agents, upstreams and rules into a policy file from the CLI.
+//! Enrolling and retiring agents, upstreams and rules in a policy file from
+//! the CLI.
 //!
 //! `init` used to be the only way to get a usable file, which forced it to
 //! guess: it minted a token nobody asked for and wrote an Anthropic upstream
@@ -17,12 +18,25 @@
 //!   same `validate()` the proxy uses at startup. A rejected edit leaves the
 //!   file untouched, so a bad flag can never be the reason the proxy stops
 //!   coming up.
+//!
+//! Removal earns the same treatment, and for a sharper reason. The pitch for
+//! this proxy is that a leaked agent token is revoked by deleting one line and
+//! nothing real rotates — but "delete one line" was a hand-edit of the file,
+//! performed under time pressure, on the one operation nobody rehearses. So
+//! `rm` and `rotate` are commands too, with two properties of their own:
+//!
+//! * **A removal cannot leave a file the proxy would refuse.** Removing a
+//!   service an agent still lists in `targets`, or an agent id a rule still
+//!   names, is caught here rather than at the next restart.
+//! * **A removal says what it orphaned.** A rule that matches nothing is how a
+//!   policy file rots, so the rules naming the thing that just left are either
+//!   pruned with it or reported by number.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-use crate::config::Config;
+use crate::config::{AclRuleConfig, Config};
 use crate::identity;
 use crate::secrets::SecretRef;
 
@@ -156,6 +170,59 @@ pub fn add_agent(
     })
 }
 
+/// Remove `[[agents]]`, and with `prune` the rules that name it outright.
+///
+/// This is the revocation path: after it, the agent's token hashes to nothing
+/// in the file and the next start of the proxy will not know it. Rules are
+/// pruned only on an exact `agent = "<id>"`; a glob like `ci-*` covers a fleet,
+/// and one member leaving is not that rule ending.
+pub fn remove_agent(path: &Path, id: &str, prune: bool) -> Result<Removal> {
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let index = agent_index(&existing, id, path)?;
+
+    let named = rules_matching(&existing, |rule| rule.agent == id);
+
+    remove_table(&mut document, "agents", index, path)?;
+    let removal = take_rules(&mut document, named, prune, path)?;
+    save(path, document)?;
+    Ok(removal)
+}
+
+/// Mint the agent a new token and replace the hash in place.
+///
+/// The other half of revocation, and the one with a deadline: a token that
+/// leaked belongs to an agent that still has work to do, so the answer is a new
+/// token rather than an entry deleted and re-added under a name the audit log
+/// would have to be told about.
+pub fn rotate_agent(path: &Path, id: &str) -> Result<EnrolledAgent> {
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let index = agent_index(&existing, id, path)?;
+
+    // `token_ref` means the token lives in 1Password, a file or the
+    // environment, and the file only points at it. Writing a hash here would
+    // rotate the token *and* silently move where the agent's credential comes
+    // from — two changes, one of them unasked for.
+    if let Some(reference) = &existing.agents[index].token_ref {
+        bail!(
+            "agent `{id}` authenticates with `token_ref = \"{reference}\"`, so its token lives \
+             in that store and not in this file — rotate it there and restart the proxy. \
+             Writing a hash here would also change where the agent's credential comes from."
+        );
+    }
+
+    let token = identity::generate_token()?;
+    entry_mut(&mut document, "agents", index, path)?["token_sha256"] =
+        toml_edit::value(identity::token_hash(&token));
+    save(path, document)?;
+
+    Ok(EnrolledAgent {
+        id: id.to_string(),
+        token,
+    })
+}
+
 /// Add `[[upstreams]]`: a base URL and the credential to attach on the way out.
 pub fn add_upstream(
     path: &Path,
@@ -213,6 +280,11 @@ fn upstream_entry(
         entry["headers"] = toml_edit::value(table);
     }
     entry
+}
+
+/// Remove `[[upstreams]]`, and with `prune` everything that pointed at it.
+pub fn remove_upstream(path: &Path, name: &str, prune: bool) -> Result<Removal> {
+    remove_service(path, name, prune, ServiceKind::Upstream)
 }
 
 /// An MCP server as the CLI accepts it: a child process to spawn, or a remote
@@ -322,6 +394,11 @@ fn mcp_entry(name: &str, transport: &McpTransportSpec, auth: &AuthSpec) -> Table
     entry
 }
 
+/// Remove `[[mcp_servers]]`, and with `prune` everything that pointed at it.
+pub fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<Removal> {
+    remove_service(path, name, prune, ServiceKind::McpServer)
+}
+
 /// Add `[[acl]]`. Appended last, because first match wins and an earlier rule
 /// would silently take precedence over everything already in the file.
 #[allow(clippy::too_many_arguments)]
@@ -362,6 +439,49 @@ fn rule_entry(
     entry["paths"] = toml_edit::value(string_array(paths));
     entry["action"] = toml_edit::value(action);
     entry
+}
+
+/// What `remove_rule` took out, and what the list looks like afterwards.
+#[derive(Debug)]
+pub struct RuleRemoval {
+    /// The rule as it was, so the command can print what it just deleted
+    /// rather than the number the operator typed.
+    pub rule: AclRuleConfig,
+    pub index: usize,
+    /// Rules left. Everything after `index` has shifted down by one, which is
+    /// the whole reason this is worth saying out loud.
+    pub remaining: usize,
+}
+
+/// Remove the `[[acl]]` rule at `index` — the `#` column of `agent-iap list acl`.
+///
+/// By number rather than by name because a rule need not have one, and two may
+/// share it. Position is the ACL's semantics: first match wins, so the number
+/// is the only thing that identifies a rule unambiguously.
+pub fn remove_rule(path: &Path, index: usize) -> Result<RuleRemoval> {
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let rule = existing
+        .acl
+        .get(index)
+        .cloned()
+        .with_context(|| match existing.acl.len() {
+            0 => format!("`{}` has no `[[acl]]` rules to remove", path.display()),
+            count => format!(
+                "no rule {index} in `{}` — the rules are numbered 0 to {}, as `agent-iap list acl` \
+                 prints them",
+                path.display(),
+                count - 1
+            ),
+        })?;
+
+    remove_table(&mut document, "acl", index, path)?;
+    save(path, document)?;
+    Ok(RuleRemoval {
+        rule,
+        index,
+        remaining: existing.acl.len() - 1,
+    })
 }
 
 /// A service to render without writing it, for `profile add --dry-run`.
@@ -442,6 +562,274 @@ fn render(key: &str, entry: Table) -> String {
 /// earlier `deny` already shadowed.
 pub fn rule_count(path: &Path) -> Result<usize> {
     Ok(document_config(&read(path)?)?.acl.len())
+}
+
+/// A rule as `agent-iap list acl` identifies it: the number `acl rm` takes, and
+/// the name the audit log prints beside a decision.
+#[derive(Debug)]
+pub struct RuleRef {
+    pub index: usize,
+    pub name: Option<String>,
+}
+
+impl std::fmt::Display for RuleRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "acl[{}] `{name}`", self.index),
+            None => write!(f, "acl[{}]", self.index),
+        }
+    }
+}
+
+/// What a removal took out, and what it deliberately left behind.
+///
+/// Both halves are the answer to the same question. An operator revoking a
+/// leaked token needs to know which rules still name the agent; an operator
+/// retiring a service needs to know which agents stopped being scoped to it.
+#[derive(Debug, Default)]
+pub struct Removal {
+    /// Rules deleted alongside the subject, because `prune` was set.
+    pub pruned_rules: Vec<RuleRef>,
+    /// Rules that name the subject and are still in the file, matching nothing.
+    pub orphaned_rules: Vec<RuleRef>,
+    /// Agents whose `targets` no longer name the removed service.
+    pub detached_agents: Vec<String>,
+}
+
+/// Upstreams and MCP servers are removed the same way — one namespace, one set
+/// of things that can point at a name — and differ only in which array the
+/// entry lives in and what to call it in an error.
+#[derive(Copy, Clone)]
+enum ServiceKind {
+    Upstream,
+    McpServer,
+}
+
+impl ServiceKind {
+    fn key(self) -> &'static str {
+        match self {
+            ServiceKind::Upstream => "upstreams",
+            ServiceKind::McpServer => "mcp_servers",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            ServiceKind::Upstream => "upstream",
+            ServiceKind::McpServer => "MCP server",
+        }
+    }
+}
+
+fn remove_service(path: &Path, name: &str, prune: bool, kind: ServiceKind) -> Result<Removal> {
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let index = match kind {
+        ServiceKind::Upstream => existing.upstreams.iter().position(|up| up.name == name),
+        ServiceKind::McpServer => existing
+            .mcp_servers
+            .iter()
+            .position(|server| server.name == name),
+    }
+    .with_context(|| {
+        let noun = kind.noun();
+        format!(
+            "no {noun} `{name}` in `{}`{}",
+            path.display(),
+            match kind {
+                ServiceKind::Upstream =>
+                    known(existing.upstreams.iter().map(|up| up.name.as_str())),
+                ServiceKind::McpServer => known(
+                    existing
+                        .mcp_servers
+                        .iter()
+                        .map(|server| server.name.as_str())
+                ),
+            }
+        )
+    })?;
+
+    // Agents hard-scoped to this service. `validate()` rejects a `targets`
+    // entry naming nothing, so leaving one behind is not an untidy file — it is
+    // a proxy that will not come back up, discovered at the restart.
+    let scoped: Vec<(usize, &str)> = existing
+        .agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.targets.iter().any(|target| target == name))
+        .map(|(index, agent)| (index, agent.id.as_str()))
+        .collect();
+    if !scoped.is_empty() {
+        let ids: Vec<&str> = scoped.iter().map(|(_, id)| *id).collect();
+        if !prune {
+            bail!(
+                "{} `{name}` is still in the `targets` of {} — removing it would leave a policy \
+                 file the proxy refuses to load. Re-run with `--prune` to drop it from them too.",
+                kind.noun(),
+                list(&ids)
+            );
+        }
+        // Emptying `targets` does not narrow an agent, it widens it: no
+        // `targets` at all means *any* target, subject only to the ACL. A
+        // removal must not hand out a grant on its way past. Asked of every
+        // entry rather than of the length, so `["github", "github"]` counts.
+        let widened: Vec<&str> = scoped
+            .iter()
+            .filter(|(index, _)| {
+                existing.agents[*index]
+                    .targets
+                    .iter()
+                    .all(|target| target == name)
+            })
+            .map(|(_, id)| *id)
+            .collect();
+        if !widened.is_empty() {
+            bail!(
+                "`{name}` is the only target of {} — dropping it would leave `targets` empty, \
+                 which means *any* target rather than none. Remove {} first with \
+                 `agent-iap agent rm`.",
+                list(&widened),
+                if widened.len() == 1 { "it" } else { "them" }
+            );
+        }
+    }
+    let detached: Vec<String> = scoped.iter().map(|(_, id)| id.to_string()).collect();
+    let scoped_indices: Vec<usize> = scoped.iter().map(|(index, _)| *index).collect();
+
+    // Rules aimed at this service by name. A `target = "*"` rule is left alone:
+    // it covers whatever is configured, and one service leaving does not orphan
+    // it.
+    let named = rules_matching(&existing, |rule| rule.target == name);
+
+    remove_table(&mut document, kind.key(), index, path)?;
+    for agent_index in scoped_indices {
+        if let Some(Item::Value(Value::Array(targets))) =
+            entry_mut(&mut document, "agents", agent_index, path)?.get_mut("targets")
+        {
+            targets.retain(|target| target.as_str() != Some(name));
+        }
+    }
+    let mut removal = take_rules(&mut document, named, prune, path)?;
+    removal.detached_agents = detached;
+    save(path, document)?;
+    Ok(removal)
+}
+
+/// Where an agent sits in the file, or an error naming the ones that are in it.
+fn agent_index(existing: &Config, id: &str, path: &Path) -> Result<usize> {
+    existing
+        .agents
+        .iter()
+        .position(|agent| agent.id == id)
+        .with_context(|| {
+            format!(
+                "no agent `{id}` in `{}`{}",
+                path.display(),
+                known(existing.agents.iter().map(|agent| agent.id.as_str()))
+            )
+        })
+}
+
+/// Every rule the predicate picks out, by position in the file.
+fn rules_matching(config: &Config, predicate: impl Fn(&AclRuleConfig) -> bool) -> Vec<RuleRef> {
+    config
+        .acl
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| predicate(rule))
+        .map(|(index, rule)| RuleRef {
+            index,
+            name: rule.name.clone(),
+        })
+        .collect()
+}
+
+/// Delete the rules the caller identified, or report them as orphans.
+fn take_rules(
+    document: &mut DocumentMut,
+    named: Vec<RuleRef>,
+    prune: bool,
+    path: &Path,
+) -> Result<Removal> {
+    if !prune {
+        return Ok(Removal {
+            orphaned_rules: named,
+            ..Default::default()
+        });
+    }
+    // Back to front: removing rule 2 renumbers rule 5, and taking the indices
+    // in the order they were collected would delete the wrong ones.
+    for rule in named.iter().rev() {
+        remove_table(document, "acl", rule.index, path)?;
+    }
+    Ok(Removal {
+        pruned_rules: named,
+        ..Default::default()
+    })
+}
+
+/// The nth `[[key]]` block, to edit in place.
+fn entry_mut<'a>(
+    document: &'a mut DocumentMut,
+    key: &str,
+    index: usize,
+    path: &Path,
+) -> Result<&'a mut Table> {
+    array_of_tables(document, key, path)?
+        .get_mut(index)
+        .with_context(|| format!("`[[{key}]]` block {index} is not in `{}`", path.display()))
+}
+
+/// Delete the nth `[[key]]` block.
+fn remove_table(document: &mut DocumentMut, key: &str, index: usize, path: &Path) -> Result<()> {
+    let tables = array_of_tables(document, key, path)?;
+    if index >= tables.len() {
+        bail!("`[[{key}]]` block {index} is not in `{}`", path.display());
+    }
+    tables.remove(index);
+    Ok(())
+}
+
+/// TOML lets the same data be written as `[[key]]` blocks or as one inline
+/// array, and these commands edit the first. Refusing the second is the point:
+/// a removal that quietly matched nothing would report success and leave the
+/// credential live.
+fn array_of_tables<'a>(
+    document: &'a mut DocumentMut,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut toml_edit::ArrayOfTables> {
+    match document.get_mut(key) {
+        Some(Item::ArrayOfTables(tables)) => Ok(tables),
+        Some(_) => bail!(
+            "`{key}` in `{}` is written as an inline array rather than as `[[{key}]]` blocks, \
+             which is what these commands edit — this one needs an editor",
+            path.display()
+        ),
+        None => bail!("`{}` has no `[[{key}]]` blocks", path.display()),
+    }
+}
+
+/// The names that *are* in the file. A typo is the common reason a removal
+/// finds nothing, and the answer is nearly always in this list.
+fn known<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort_unstable();
+    format!(" — the file has: {}", names.join(", "))
+}
+
+/// `a`, `a and b`, `a, b and c` — an error naming three agents should read
+/// like a sentence.
+fn list(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 fn read(path: &Path) -> Result<DocumentMut> {
@@ -1176,6 +1564,345 @@ mod tests {
                 "`--dry-run` printed a line the write did not produce: {line}"
             );
         }
+    }
+
+    /// A file with something in every array — the state a removal has anything
+    /// to say about.
+    fn populated_policy() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = empty_policy();
+        add_upstream(
+            &path,
+            "github",
+            "https://api.github.com",
+            &AuthSpec::Bearer {
+                secret: "env:GITHUB_TOKEN".into(),
+            },
+            &[],
+        )
+        .unwrap();
+        add_upstream(
+            &path,
+            "anthropic",
+            "https://api.anthropic.com",
+            &AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+        // acl[0] names the agent outright, acl[1] is every agent, acl[2] is a
+        // glob over a fleet. Only the first is orphaned by removing `ci`.
+        add_rule(
+            &path,
+            Some("gh-read"),
+            "ci",
+            "http",
+            "github",
+            &["GET".into()],
+            &["/repos/**".into()],
+            "allow",
+        )
+        .unwrap();
+        add_rule(
+            &path,
+            None,
+            "*",
+            "http",
+            "anthropic",
+            &["POST".into()],
+            &["/v1/messages".into()],
+            "allow",
+        )
+        .unwrap();
+        add_rule(
+            &path,
+            Some("gh-write"),
+            "ci-*",
+            "http",
+            "github",
+            &["POST".into()],
+            &["/repos/**".into()],
+            "ask",
+        )
+        .unwrap();
+        add_agent(&path, "ci", None, &["github".into(), "anthropic".into()]).unwrap();
+        (dir, path)
+    }
+
+    /// The revocation the README promises, as a command rather than an editor.
+    #[test]
+    fn removing_an_agent_takes_its_token_hash_with_it() {
+        let (_dir, path) = populated_policy();
+        let hash = load(&path).agents[0].token_sha256.clone().unwrap();
+
+        remove_agent(&path, "ci", false).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains(&hash),
+            "the hash that authenticated it is still in the file"
+        );
+        let config = load(&path);
+        assert!(config.agents.is_empty());
+        config
+            .validate()
+            .expect("what is left must still start a proxy");
+    }
+
+    /// A rule that matches nothing is how a policy file rots, so the ones left
+    /// behind are named rather than left for the operator to notice.
+    #[test]
+    fn removing_an_agent_reports_the_rules_that_still_name_it() {
+        let (_dir, path) = populated_policy();
+
+        let removal = remove_agent(&path, "ci", false).unwrap();
+
+        assert_eq!(
+            load(&path).acl.len(),
+            3,
+            "nothing is pruned without the flag"
+        );
+        assert_eq!(removal.orphaned_rules.len(), 1);
+        assert_eq!(removal.orphaned_rules[0].index, 0);
+        assert_eq!(removal.orphaned_rules[0].to_string(), "acl[0] `gh-read`");
+    }
+
+    /// `--prune` takes the rules that name the agent outright. A glob covers a
+    /// fleet, so one member leaving must not delete it.
+    #[test]
+    fn pruning_spares_the_glob_that_covers_a_fleet() {
+        let (_dir, path) = populated_policy();
+
+        let removal = remove_agent(&path, "ci", true).unwrap();
+
+        assert_eq!(removal.pruned_rules.len(), 1);
+        let acl = load(&path).acl;
+        assert_eq!(acl.len(), 2);
+        assert_eq!(acl[0].agent, "*");
+        assert_eq!(acl[1].agent, "ci-*");
+    }
+
+    #[test]
+    fn removing_an_agent_that_is_not_there_changes_nothing() {
+        let (_dir, path) = populated_policy();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = remove_agent(&path, "cl", true).unwrap_err().to_string();
+
+        assert!(error.contains("no agent `cl`"), "{error}");
+        assert!(error.contains("the file has: ci"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// The leaked-token path: a new token, the same agent, and nothing
+    /// upstream touched.
+    #[test]
+    fn rotating_replaces_the_hash_and_leaves_everything_else() {
+        let (_dir, path) = populated_policy();
+        let before = load(&path);
+        let old_hash = before.agents[0].token_sha256.clone().unwrap();
+
+        let rotated = rotate_agent(&path, "ci").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains(&old_hash),
+            "the leaked token still authenticates"
+        );
+        assert!(
+            !text.contains(&rotated.token),
+            "plaintext must never reach the file"
+        );
+        assert!(text.contains(&identity::token_hash(&rotated.token)));
+
+        let after = load(&path);
+        assert_eq!(after.agents.len(), 1);
+        assert_eq!(after.agents[0].id, "ci");
+        assert_eq!(after.agents[0].targets, before.agents[0].targets);
+        assert_eq!(after.acl.len(), before.acl.len());
+        assert_eq!(after.upstreams.len(), before.upstreams.len());
+        after.validate().unwrap();
+    }
+
+    /// `token_ref` points at 1Password, a file or the environment. Rotating
+    /// here would move where the credential comes from — a second change
+    /// nobody asked for, on the one command run under time pressure.
+    #[test]
+    fn rotating_an_agent_whose_token_lives_elsewhere_is_refused() {
+        let (_dir, path) = populated_policy();
+        let before = format!(
+            "{}\n[[agents]]\nid = \"vault\"\ntoken_ref = \"op://Private/Agent/token\"\n",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, &before).unwrap();
+
+        let error = rotate_agent(&path, "vault").unwrap_err().to_string();
+
+        assert!(error.contains("token_ref"), "{error}");
+        assert!(error.contains("rotate it there"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// `agent add --target` refuses a target that names nothing; this is the
+    /// same check from the other end, and without it the file would only fail
+    /// at the next restart.
+    #[test]
+    fn removing_a_service_an_agent_is_scoped_to_is_refused() {
+        let (_dir, path) = populated_policy();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = remove_upstream(&path, "github", false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("`ci`"), "{error}");
+        assert!(error.contains("--prune"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn pruning_a_service_detaches_the_agents_scoped_to_it() {
+        let (_dir, path) = populated_policy();
+
+        let removal = remove_upstream(&path, "github", true).unwrap();
+
+        assert_eq!(removal.detached_agents, vec!["ci".to_string()]);
+        assert_eq!(removal.pruned_rules.len(), 2, "both rules aimed at github");
+        let config = load(&path);
+        assert!(config.upstreams.iter().all(|up| up.name != "github"));
+        assert_eq!(config.agents[0].targets, vec!["anthropic".to_string()]);
+        assert_eq!(config.acl.len(), 1);
+        config.validate().unwrap();
+    }
+
+    /// An empty `targets` is not "no targets", it is *any* target. Pruning the
+    /// last one would hand out a grant on the way to a removal.
+    #[test]
+    fn a_removal_never_widens_an_agent_to_every_target() {
+        let (_dir, path) = empty_policy();
+        add_upstream(
+            &path,
+            "anthropic",
+            "https://api.anthropic.com",
+            &AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+        add_agent(&path, "ci", None, &["anthropic".into()]).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = remove_upstream(&path, "anthropic", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("only target of `ci`"), "{error}");
+        assert!(error.contains("any"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn an_mcp_server_is_removed_the_same_way() {
+        let (_dir, path) = empty_policy();
+        add_mcp_server(
+            &path,
+            "notes",
+            &McpTransportSpec::Stdio {
+                command: "notes-mcp".into(),
+                args: vec!["--stdio".into()],
+                env: vec![("NOTES_TOKEN".into(), "op://Private/Notes/token".into())],
+                cwd: None,
+            },
+            &AuthSpec::None,
+        )
+        .unwrap();
+        add_rule(
+            &path,
+            None,
+            "*",
+            "mcp",
+            "notes",
+            &["tools/call".into()],
+            &["get_*".into()],
+            "allow",
+        )
+        .unwrap();
+
+        let removal = remove_mcp_server(&path, "notes", true).unwrap();
+
+        assert_eq!(removal.pruned_rules.len(), 1);
+        let config = load(&path);
+        assert!(config.mcp_servers.is_empty());
+        assert!(config.acl.is_empty());
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("NOTES_TOKEN"),
+            "the child's credential reference went with it"
+        );
+    }
+
+    /// Position is the ACL's whole semantics, so a removal by number has to be
+    /// the number the operator was shown.
+    #[test]
+    fn removing_a_rule_renumbers_the_ones_after_it() {
+        let (_dir, path) = populated_policy();
+
+        let removed = remove_rule(&path, 0).unwrap();
+
+        assert_eq!(removed.rule.name.as_deref(), Some("gh-read"));
+        assert_eq!(removed.remaining, 2);
+        let acl = load(&path).acl;
+        assert_eq!(acl.len(), 2);
+        assert_eq!(acl[0].target, "anthropic", "rule 1 is now rule 0");
+        assert_eq!(acl[1].name.as_deref(), Some("gh-write"));
+    }
+
+    #[test]
+    fn a_rule_number_that_is_not_there_names_the_range() {
+        let (_dir, path) = populated_policy();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = remove_rule(&path, 7).unwrap_err().to_string();
+
+        assert!(error.contains("numbered 0 to 2"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Removals go through the same document as the adds, so the comments the
+    /// template wrote have to survive them too.
+    #[test]
+    fn removing_preserves_the_comments_the_template_wrote() {
+        let (_dir, path) = populated_policy();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        remove_agent(&path, "ci", true).unwrap();
+        remove_upstream(&path, "github", true).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for line in before.lines().filter(|line| line.starts_with('#')) {
+            assert!(after.contains(line), "comment was dropped: {line}");
+        }
+    }
+
+    /// TOML admits `agents = [{…}]` as well as `[[agents]]`, and these
+    /// commands edit the second. Matching nothing and reporting success would
+    /// leave a revoked token live.
+    #[test]
+    fn an_inline_array_is_refused_rather_than_silently_missed() {
+        let (_dir, path) = empty_policy();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Before the first table header, so the key is top-level rather than
+        // swallowed by whichever section the template ends with.
+        std::fs::write(
+            &path,
+            format!(
+                "agents = [{{ id = \"ci\", token_sha256 = \"{}\" }}]\n{text}",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+
+        let error = remove_agent(&path, "ci", false).unwrap_err().to_string();
+
+        assert!(error.contains("inline array"), "{error}");
     }
 
     /// TLS is configured by hand in `[server.tls]`; enrolment is done by these

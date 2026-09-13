@@ -132,19 +132,19 @@ enum Command {
         #[command(flatten)]
         config: ConfigArg,
     },
-    /// Enrol an agent, an upstream or a rule into the policy file.
+    /// Enrol, revoke or re-key the agents allowed to call the proxy.
     #[command(subcommand)]
     Agent(AgentCommand),
-    /// Add or inspect the services the proxy fronts.
+    /// Add or remove the services the proxy fronts.
     #[command(subcommand)]
     Upstream(UpstreamCommand),
-    /// Add an MCP server to the policy file.
+    /// Add or remove an MCP server in the policy file.
     #[command(subcommand, name = "mcp-server")]
     McpServer(McpServerCommand),
     /// Ready-made service definitions: base URL, credential scheme and rules.
     #[command(subcommand)]
     Profile(ProfileCommand),
-    /// Add a rule to the ACL.
+    /// Add or remove ACL rules.
     #[command(subcommand)]
     Acl(AclCommand),
     /// Mint an agent token and print the config block to paste.
@@ -218,6 +218,26 @@ enum AgentCommand {
         #[arg(long = "target", value_name = "NAME")]
         targets: Vec<String>,
     },
+    /// Revoke an agent: remove it, and its token stops being one.
+    #[command(alias = "remove")]
+    Rm {
+        /// Id of the agent to remove.
+        id: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Also delete the ACL rules that name this agent outright. Without
+        /// it they stay, matching nothing, and are listed by number.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Replace an agent's token with a new one. The leaked-token path: one
+    /// command, and nothing upstream rotates.
+    Rotate {
+        /// Id of the agent to re-key.
+        id: String,
+        #[command(flatten)]
+        config: ConfigArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -231,12 +251,27 @@ enum UpstreamCommand {
         /// Where the proxy forwards to, e.g. `https://api.anthropic.com`.
         #[arg(long, value_name = "URL")]
         base_url: String,
+        // Boxed only for its size: the credential flags dwarf every other
+        // variant of this enum, `rm` most of all.
         #[command(flatten)]
-        auth: AuthFlags,
+        auth: Box<AuthFlags>,
         /// Static header to send upstream, `Name=Value`. Repeatable. Never a
         /// credential — that is what `--secret` is for.
         #[arg(long = "set-header", value_name = "NAME=VALUE")]
         set_headers: Vec<String>,
+    },
+    /// Remove a service, and stop injecting its credential.
+    #[command(alias = "remove")]
+    Rm {
+        /// Name of the `[[upstreams]]` entry to remove.
+        name: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Also delete the ACL rules aimed at it, and drop it from the
+        /// `targets` of agents scoped to it. Without it, an agent still
+        /// naming it makes the removal a refusal rather than a broken file.
+        #[arg(long)]
+        prune: bool,
     },
 }
 
@@ -267,8 +302,21 @@ enum McpServerCommand {
         /// Working directory for the child.
         #[arg(long, value_name = "DIR", requires = "command")]
         cwd: Option<String>,
+        // Boxed for size, as in `UpstreamCommand::Add`.
         #[command(flatten)]
-        auth: AuthFlags,
+        auth: Box<AuthFlags>,
+    },
+    /// Remove a `[[mcp_servers]]` entry.
+    #[command(alias = "remove")]
+    Rm {
+        /// Name of the `[[mcp_servers]]` entry to remove.
+        name: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Also delete the ACL rules aimed at it, and drop it from the
+        /// `targets` of agents scoped to it.
+        #[arg(long)]
+        prune: bool,
     },
 }
 
@@ -494,6 +542,15 @@ enum AclCommand {
         #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
         action: ActionArg,
     },
+    /// Remove a rule by its number. Everything after it moves up one, so
+    /// removing several means re-reading the list between them.
+    #[command(alias = "remove")]
+    Rm {
+        /// Rule number — the `#` column of `agent-iap list acl`, counting from 0.
+        index: usize,
+        #[command(flatten)]
+        config: ConfigArg,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -685,6 +742,10 @@ fn main() -> Result<()> {
             name,
             targets,
         }) => add_agent(&config.config, &id, name.as_deref(), &targets),
+        Command::Agent(AgentCommand::Rm { id, config, prune }) => {
+            remove_agent(&config.config, &id, prune)
+        }
+        Command::Agent(AgentCommand::Rotate { id, config }) => rotate_agent(&config.config, &id),
         Command::Upstream(UpstreamCommand::Add {
             name,
             config,
@@ -698,6 +759,11 @@ fn main() -> Result<()> {
             auth,
             set_headers,
         }),
+        Command::Upstream(UpstreamCommand::Rm {
+            name,
+            config,
+            prune,
+        }) => remove_upstream(&config.config, &name, prune),
         Command::Profile(ProfileCommand::List { vendor, output }) => {
             list_profiles(vendor.as_deref(), output)
         }
@@ -742,6 +808,11 @@ fn main() -> Result<()> {
             cwd,
             auth,
         }),
+        Command::McpServer(McpServerCommand::Rm {
+            name,
+            config,
+            prune,
+        }) => remove_mcp_server(&config.config, &name, prune),
         Command::Acl(AclCommand::Add {
             config,
             name,
@@ -761,6 +832,7 @@ fn main() -> Result<()> {
             &paths,
             action,
         ),
+        Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
         Command::GenToken { id } => gen_token(&id),
         Command::HashToken { token } => {
             let token = match token {
@@ -1262,12 +1334,89 @@ fn add_agent(path: &Path, id: &str, name: Option<&str>, targets: &[String]) -> R
     Ok(())
 }
 
+fn remove_agent(path: &Path, id: &str, prune: bool) -> Result<()> {
+    let removal = enroll::remove_agent(path, id, prune)?;
+    println!("Removed agent `{id}` from {}.", path.display());
+    println!("Its token authenticates nothing now, and no upstream credential rotated.");
+    report_removal(&removal, id);
+    restart_notice("the running proxy still accepts the old token");
+    Ok(())
+}
+
+fn rotate_agent(path: &Path, id: &str) -> Result<()> {
+    let rotated = enroll::rotate_agent(path, id)?;
+    println!(
+        "Rotated the token for agent `{id}` in {}.\n",
+        path.display()
+    );
+    println!("Its new token — shown once, and not any upstream's credential:\n");
+    println!("  {}\n", rotated.token);
+    println!("The old hash is gone from the file. Hand this to the agent before you restart,");
+    println!("so the two changes land together rather than as an outage in between.");
+    restart_notice("the running proxy still accepts the old token and rejects this one");
+    Ok(())
+}
+
+/// The half of a removal that is not the entry itself: the rules that pointed
+/// at it and the agents that were scoped to it. Saying nothing here is the
+/// failure these commands exist to prevent — a file that still names something
+/// that is gone, or an operator who thinks it does not.
+fn report_removal(removal: &enroll::Removal, subject: &str) {
+    for agent in &removal.detached_agents {
+        println!("Dropped `{subject}` from the targets of agent `{agent}`.");
+    }
+    if !removal.pruned_rules.is_empty() {
+        println!(
+            "Removed {} that named it: {}.",
+            plural(removal.pruned_rules.len(), "ACL rule"),
+            joined(&removal.pruned_rules)
+        );
+        println!("What is left has renumbered — `agent-iap list acl` for the current numbers.");
+    }
+    if !removal.orphaned_rules.is_empty() {
+        println!(
+            "\nStill naming `{subject}`, and now matching nothing: {}.",
+            joined(&removal.orphaned_rules)
+        );
+        println!(
+            "Remove with `agent-iap acl rm <#>` — one at a time, since the numbers shift — \
+             or re-run this with `--prune`."
+        );
+    }
+}
+
+/// The policy file is read once, at startup. Every removal edits a file the
+/// running proxy stopped looking at, and an operator who has just revoked a
+/// leaked token is exactly the person who must not assume otherwise.
+fn restart_notice(consequence: &str) {
+    println!(
+        "\nThis takes effect at the next restart — there is no hot reload, so until then \
+         {consequence}."
+    );
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+fn joined(rules: &[enroll::RuleRef]) -> String {
+    rules
+        .iter()
+        .map(|rule| rule.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Grouped because clap hands back a base URL, a name and a whole auth scheme.
 struct AddUpstream {
     path: PathBuf,
     name: String,
     base_url: String,
-    auth: AuthFlags,
+    auth: Box<AuthFlags>,
     set_headers: Vec<String>,
 }
 
@@ -1295,6 +1444,15 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     Ok(())
 }
 
+fn remove_upstream(path: &Path, name: &str, prune: bool) -> Result<()> {
+    let removal = enroll::remove_upstream(path, name, prune)?;
+    println!("Removed upstream `{name}` from {}.", path.display());
+    println!("`/{name}/…` routes nowhere now, and its credential is no longer resolved.");
+    report_removal(&removal, name);
+    restart_notice("the running proxy still fronts it with the credential it already resolved");
+    Ok(())
+}
+
 /// `Name=Value` pairs from a repeatable flag. Splits on the *first* `=` only,
 /// because a secret reference (`op://vault/item/field`) may contain more.
 fn parse_pairs(raw: &[String], flag: &str) -> Result<Vec<(String, String)>> {
@@ -1316,7 +1474,7 @@ struct AddMcpServer {
     args: Vec<String>,
     env: Vec<String>,
     cwd: Option<String>,
-    auth: AuthFlags,
+    auth: Box<AuthFlags>,
 }
 
 fn add_mcp_server(options: AddMcpServer) -> Result<()> {
@@ -1363,6 +1521,15 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
     Ok(())
 }
 
+fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<()> {
+    let removal = enroll::remove_mcp_server(path, name, prune)?;
+    println!("Removed MCP server `{name}` from {}.", path.display());
+    println!("`agent-iap mcp --server {name}` has nothing to bridge now.");
+    report_removal(&removal, name);
+    restart_notice("the running proxy still relays to it, and a live stdio child keeps running");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_rule(
     path: &Path,
@@ -1395,6 +1562,40 @@ fn add_rule(
     // Position is the whole semantics of an ACL, so say it rather than making
     // the operator infer it from the file.
     println!("Rules match in file order and the first match wins, so this one is checked last.");
+    Ok(())
+}
+
+fn remove_rule(path: &Path, index: usize) -> Result<()> {
+    let removed = enroll::remove_rule(path, index)?;
+    let rule = &removed.rule;
+    println!(
+        "Removed rule {index} from {}: {} {} {} on `{}` for `{}`.",
+        path.display(),
+        rule.action,
+        rule.methods.join(","),
+        rule.paths.join(","),
+        rule.target,
+        rule.agent,
+    );
+    if removed.remaining == 0 {
+        println!(
+            "No rules left, so every request falls through to `acl_default` — which is `deny` \
+             unless the file says otherwise."
+        );
+    } else if index == removed.remaining {
+        // It was the last one, so nothing behind it moved.
+        println!(
+            "{} left, still numbered as they were.",
+            plural(removed.remaining, "rule")
+        );
+    } else {
+        println!(
+            "{} left, and every rule after this one has moved up by one. Removing another means \
+             re-reading `agent-iap list acl` first.",
+            plural(removed.remaining, "rule")
+        );
+    }
+    restart_notice("the running proxy still decides by the old rule");
     Ok(())
 }
 
