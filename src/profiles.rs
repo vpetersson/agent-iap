@@ -6,7 +6,7 @@
 //! Getting a service wrong in that list does not fail loudly: a scope typo is a
 //! 403 an hour later, and `--paths '/**'` is a grant nobody reviews.
 //!
-//! A profile is that answer, written down once. `mcp-iap profile add graylog`
+//! A profile is that answer, written down once. `agent-iap profile add graylog`
 //! knows Graylog authenticates an access token as `<token>:token`, that its API
 //! hangs off `/api`, and which of its routes are reads. What it does *not* know
 //! is your credential, and it never asks for one: `--secret` takes the same
@@ -230,7 +230,7 @@ pub fn get(id: &str) -> Result<Profile> {
         .into_iter()
         .find(|profile| profile.id == id)
         .with_context(|| {
-            format!("no profile `{id}` — `mcp-iap profile list` shows every one there is")
+            format!("no profile `{id}` — `agent-iap profile list` shows every one there is")
         })
 }
 
@@ -980,7 +980,7 @@ pub fn catalog() -> Vec<Profile> {
                 "One proxy fronts as many PostHog accounts as you have keys — add the \
                  profile once per account with `--as posthog-<account> --secret <that \
                  account's key>`. Each gets its own rules, its own audit rows and its own \
-                 line in `mcp-iap list`, and an agent scoped to one cannot reach the other."
+                 line in `agent-iap list`, and an agent scoped to one cannot reach the other."
                     .into(),
             ),
         },
@@ -1153,7 +1153,7 @@ pub fn catalog() -> Vec<Profile> {
             ],
             note: Some(
                 "DataForSEO bills per call and its `live` endpoints cost more than the \
-                 queued ones, so the default level makes those prompt. `mcp-iap audit tail \
+                 queued ones, so the default level makes those prompt. `agent-iap audit tail \
                  --target dataforseo` is the per-agent spend trail."
                     .into(),
             ),

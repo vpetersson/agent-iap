@@ -129,7 +129,7 @@ pub fn add_agent(
         if !reachable.iter().any(|name| *name == target) {
             bail!(
                 "no upstream or MCP server named `{target}` in `{}` — add it first with \
-                 `mcp-iap upstream add {target} --base-url <url>`, or drop the `--target`",
+                 `agent-iap upstream add {target} --base-url <url>`, or drop the `--target`",
                 path.display()
             );
         }
@@ -447,7 +447,7 @@ pub fn rule_count(path: &Path) -> Result<usize> {
 fn read(path: &Path) -> Result<DocumentMut> {
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
-            "reading `{}` — `mcp-iap init` writes one if you have not yet",
+            "reading `{}` — `agent-iap init` writes one if you have not yet",
             path.display()
         )
     })?;
@@ -1187,7 +1187,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let text = text.replace(
             "[audit]",
-            "[server.tls]\ncert = \"file:/etc/mcp-iap/fullchain.pem\"\nkey = \"file:/etc/mcp-iap/key.pem\"\n\n[audit]",
+            "[server.tls]\ncert = \"file:/etc/agent-iap/fullchain.pem\"\nkey = \"file:/etc/agent-iap/key.pem\"\n\n[audit]",
         );
         std::fs::write(&path, &text).unwrap();
 
@@ -1217,7 +1217,7 @@ mod tests {
             .server
             .tls
             .expect("`[server.tls]` must survive enrolment");
-        assert_eq!(tls.cert, "file:/etc/mcp-iap/fullchain.pem");
-        assert_eq!(tls.key, "file:/etc/mcp-iap/key.pem");
+        assert_eq!(tls.cert, "file:/etc/agent-iap/fullchain.pem");
+        assert_eq!(tls.key, "file:/etc/agent-iap/key.pem");
     }
 }

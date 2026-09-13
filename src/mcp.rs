@@ -1,6 +1,6 @@
 //! The MCP bridge.
 //!
-//! An agent configures `mcp-iap mcp --server github` as its MCP server. This
+//! An agent configures `agent-iap mcp --server github` as its MCP server. This
 //! process speaks JSON-RPC to the agent on stdio, asks the running daemon to
 //! authorize every call, and only then relays it to the real MCP server — whose
 //! credentials it holds and the agent never sees.
@@ -78,7 +78,7 @@ pub fn blocked_response(message: &Value, reason: &str) -> Option<Value> {
         "id": id,
         "error": {
             "code": BLOCKED_BY_POLICY,
-            "message": format!("blocked by mcp-iap: {reason}"),
+            "message": format!("blocked by agent-iap: {reason}"),
         }
     }))
 }
@@ -247,13 +247,13 @@ impl Authorizer {
             .await
             .with_context(|| {
                 format!(
-                    "cannot reach the mcp-iap daemon at {} — start `mcp-iap run` first",
+                    "cannot reach the agent-iap daemon at {} — start `agent-iap run` first",
                     self.admin_url
                 )
             })?;
         if !response.status().is_success() {
             bail!(
-                "the mcp-iap daemon at {} answered /health with {}",
+                "the agent-iap daemon at {} answered /health with {}",
                 self.admin_url,
                 response.status()
             );

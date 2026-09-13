@@ -4,22 +4,22 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mcp_iap::audit;
-use mcp_iap::config::Config;
-use mcp_iap::enroll;
-use mcp_iap::identity;
-use mcp_iap::init::{self, InitOptions, Template};
-use mcp_iap::list::{Inventory, ListOptions, What};
-use mcp_iap::mcp;
-use mcp_iap::profiles;
-use mcp_iap::state::AppState;
-use mcp_iap::stdio;
-use mcp_iap::tls::{self, ServerTls};
-use mcp_iap::tui::{self, Console};
+use agent_iap::audit;
+use agent_iap::config::Config;
+use agent_iap::enroll;
+use agent_iap::identity;
+use agent_iap::init::{self, InitOptions, Template};
+use agent_iap::list::{Inventory, ListOptions, What};
+use agent_iap::mcp;
+use agent_iap::profiles;
+use agent_iap::state::AppState;
+use agent_iap::stdio;
+use agent_iap::tls::{self, ServerTls};
+use agent_iap::tui::{self, Console};
 
 #[derive(Parser)]
 #[command(
-    name = "mcp-iap",
+    name = "agent-iap",
     version,
     about = "Identity-aware proxy for LLM agents — authenticated, ACL-gated, audited access to APIs and MCP servers without handing over the credential."
 )]
@@ -86,7 +86,7 @@ enum Command {
         #[arg(long, conflicts_with = "tui")]
         no_tui: bool,
     },
-    /// Bridge one MCP server for an agent. Requires a running `mcp-iap run`.
+    /// Bridge one MCP server for an agent. Requires a running `agent-iap run`.
     Mcp {
         #[command(flatten)]
         config: ConfigArg,
@@ -100,8 +100,8 @@ enum Command {
         #[arg(long, env = "IAP_ADMIN_URL")]
         admin_url: Option<String>,
     },
-    /// Serve mcp-iap's own MCP gateway on stdio for a client that cannot speak
-    /// HTTP MCP. Requires a running `mcp-iap run`.
+    /// Serve agent-iap's own MCP gateway on stdio for a client that cannot speak
+    /// HTTP MCP. Requires a running `agent-iap run`.
     Gateway {
         #[command(flatten)]
         config: ConfigArg,
@@ -284,12 +284,12 @@ enum ProfileCommand {
     },
     /// Show what a profile would add: endpoint, credential, scopes, rules.
     Show {
-        /// Profile id, from `mcp-iap profile list`.
+        /// Profile id, from `agent-iap profile list`.
         id: String,
     },
     /// Add a profile's service and rules to the policy file.
     Add {
-        /// Profile id, from `mcp-iap profile list`.
+        /// Profile id, from `agent-iap profile list`.
         id: String,
         #[command(flatten)]
         config: ConfigArg,
@@ -817,7 +817,7 @@ fn init_tracing(console: Console, config: &Config) -> Result<()> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
-            .join("mcp-iap.log");
+            .join("agent-iap.log");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -864,7 +864,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
         .with_context(|| format!("binding the proxy to {listen}"))?;
     let proxy = tls::serve(
         proxy_listener,
-        mcp_iap::proxy::router(Arc::clone(&state)),
+        agent_iap::proxy::router(Arc::clone(&state)),
         tls.proxy,
     )?;
 
@@ -882,7 +882,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
             }
             Some(tls::serve(
                 listener,
-                mcp_iap::admin::router(Arc::clone(&state)),
+                agent_iap::admin::router(Arc::clone(&state)),
                 tls.admin,
             )?)
         }
@@ -891,7 +891,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
 
     if !console.draws() {
         eprintln!(
-            "mcp-iap listening on {}://{listen} — {} agents, {} rules, default {}",
+            "agent-iap listening on {}://{listen} — {} agents, {} rules, default {}",
             proxy_scheme,
             state.agents.len(),
             state.acl.rule_count(),
@@ -913,7 +913,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
 
     let drawing = console.draws().then(|| {
         let state = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || mcp_iap::tui::run(state))
+        tokio::task::spawn_blocking(move || agent_iap::tui::run(state))
     });
 
     match (admin, drawing) {
@@ -1050,12 +1050,12 @@ fn check(path: &Path) -> Result<()> {
     println!(
         "identity    agent tokens{}",
         match workload.mode {
-            mcp_iap::config::WorkloadMode::Off => String::new(),
-            mcp_iap::config::WorkloadMode::Optional => format!(
+            agent_iap::config::WorkloadMode::Off => String::new(),
+            agent_iap::config::WorkloadMode::Optional => format!(
                 ", workload tokens accepted ({}s) — set mode = \"required\" to insist",
                 workload.lifetime_secs
             ),
-            mcp_iap::config::WorkloadMode::Required => format!(
+            agent_iap::config::WorkloadMode::Required => format!(
                 " to mint only, workload tokens required ({}s)",
                 workload.lifetime_secs
             ),
@@ -1077,7 +1077,7 @@ fn check(path: &Path) -> Result<()> {
         }
     }
 
-    let resolver = mcp_iap::secrets::SecretResolver::new(config.server.op_binary.clone());
+    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone());
     let references = config.secret_refs();
     if references.is_empty() {
         println!("secrets     none referenced");
@@ -1143,7 +1143,7 @@ fn mcp_handshake_warnings(config: &Config) -> Vec<String> {
         let admits_handshake = config.acl.iter().any(|rule| {
             matches!(rule.kind.as_str(), "mcp" | "*")
                 && glob_matches(&rule.target, &server.name)
-                && rule.action == mcp_iap::config::Action::Allow
+                && rule.action == agent_iap::config::Action::Allow
                 && unconstrained(&rule.paths)
                 && rule
                     .methods
@@ -1161,7 +1161,7 @@ fn mcp_handshake_warnings(config: &Config) -> Vec<String> {
         if !reachable {
             continue;
         }
-        if config.acl_default.action == mcp_iap::config::Action::Allow {
+        if config.acl_default.action == agent_iap::config::Action::Allow {
             continue;
         }
         let fix = profiles::MCP_SESSION_METHODS
@@ -1173,7 +1173,7 @@ fn mcp_handshake_warnings(config: &Config) -> Vec<String> {
             "mcp server `{name}` has rules, but none of them admits `initialize`.\n\
              The handshake will be denied by `<default>`, and the agent will see a\n\
              server that never starts. Add a session rule before the tool rules:\n\n\
-             \x20 mcp-iap acl add --kind mcp --target {name} --paths '**' \\\n\
+             \x20 agent-iap acl add --kind mcp --target {name} --paths '**' \\\n\
              \x20   {fix}",
             name = server.name,
         ));
@@ -1204,13 +1204,13 @@ fn init_config(options: &InitOptions) -> Result<()> {
         );
         println!("Add what it should front:");
         println!(
-            "  mcp-iap upstream add anthropic --base-url https://api.anthropic.com \\\n             \x20     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY"
+            "  agent-iap upstream add anthropic --base-url https://api.anthropic.com \\\n             \x20     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY"
         );
-        println!("  mcp-iap acl add --target anthropic --methods POST --paths /v1/messages");
-        println!("  mcp-iap agent add claude-code --target anthropic\n");
+        println!("  agent-iap acl add --target anthropic --methods POST --paths /v1/messages");
+        println!("  agent-iap agent add claude-code --target anthropic\n");
         println!("Then:");
-        println!("  mcp-iap check --config {path}   # resolves every credential reference");
-        println!("  mcp-iap run --config {path}       # the approval console");
+        println!("  agent-iap check --config {path}   # resolves every credential reference");
+        println!("  agent-iap run --config {path}       # the approval console");
         return Ok(());
     };
 
@@ -1228,8 +1228,8 @@ fn init_config(options: &InitOptions) -> Result<()> {
     {
         println!("  export {name}=...   # the credential the proxy injects on the way out");
     }
-    println!("  mcp-iap check --config {path}   # resolves every credential reference");
-    println!("  mcp-iap run --config {path}       # the approval console\n");
+    println!("  agent-iap check --config {path}   # resolves every credential reference");
+    println!("  agent-iap run --config {path}       # the approval console\n");
 
     println!("Then point the agent at the proxy:");
     println!(
@@ -1237,7 +1237,7 @@ fn init_config(options: &InitOptions) -> Result<()> {
         written.listen
     );
     println!("  export ANTHROPIC_AUTH_TOKEN={token}");
-    println!("\nAdd another agent with `mcp-iap agent add <id>`.");
+    println!("\nAdd another agent with `agent-iap agent add <id>`.");
     Ok(())
 }
 
@@ -1256,7 +1256,7 @@ fn add_agent(path: &Path, id: &str, name: Option<&str>, targets: &[String]) -> R
     if enroll::rule_count(path)? == 0 {
         println!(
             "\nThere are no `[[acl]]` rules yet, so every request still falls through to \
-             `acl_default` and is denied. Add one with `mcp-iap acl add`."
+             `acl_default` and is denied. Add one with `agent-iap acl add`."
         );
     }
     Ok(())
@@ -1289,7 +1289,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     if enroll::rule_count(&path)? == 0 {
         println!(
             "\nNo `[[acl]]` rules yet, so it is not reachable. Allow something with:\n  \
-             mcp-iap acl add --target {name} --methods GET --paths '/**'"
+             agent-iap acl add --target {name} --methods GET --paths '/**'"
         );
     }
     Ok(())
@@ -1355,9 +1355,9 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
         println!(
             "\nNo `[[acl]]` rules yet, so it is not reachable — and an MCP server needs two \
              kinds of rule:\n  \
-             mcp-iap acl add --kind mcp --target {name} --methods initialize \\\n    \
+             agent-iap acl add --kind mcp --target {name} --methods initialize \\\n    \
                  --methods 'notifications/*' --methods ping --methods 'tools/list' --paths '**'\n  \
-             mcp-iap acl add --kind mcp --target {name} --methods 'tools/call' --paths 'get_*'"
+             agent-iap acl add --kind mcp --target {name} --methods 'tools/call' --paths 'get_*'"
         );
     }
     Ok(())
@@ -1584,7 +1584,7 @@ fn list_profiles(vendor: Option<&str>, output: OutputArg) -> Result<()> {
         // Silence here reads as "there are none", which is a different answer
         // from "that vendor is not one of the ones with profiles".
         bail!(
-            "no profiles for vendor `{}` — `mcp-iap profile list` shows every vendor there is",
+            "no profiles for vendor `{}` — `agent-iap profile list` shows every vendor there is",
             vendor.unwrap_or("")
         );
     }
@@ -1625,7 +1625,7 @@ fn list_profiles(vendor: Option<&str>, output: OutputArg) -> Result<()> {
         );
     }
     println!(
-        "\n`mcp-iap profile show <id>` for the detail, `profile add <id> --secret <ref>` to use one."
+        "\n`agent-iap profile show <id>` for the detail, `profile add <id> --secret <ref>` to use one."
     );
     Ok(())
 }
@@ -1712,8 +1712,8 @@ fn add_profile(path: &Path, id: &str, options: profiles::AddOptions) -> Result<(
     }
 
     println!(
-        "\nNext:\n  mcp-iap agent add <agent-id> --target {}   # mints its token\n  \
-         mcp-iap check --config {}                  # proves the credential resolves",
+        "\nNext:\n  agent-iap agent add <agent-id> --target {}   # mints its token\n  \
+         agent-iap check --config {}                  # proves the credential resolves",
         added.name,
         path.display()
     );

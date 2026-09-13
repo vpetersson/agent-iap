@@ -369,7 +369,7 @@ mod tests {
             admin_tls: Some(TlsConfig {
                 cert: format!("literal:{cert}"),
                 key: format!("literal:{key}"),
-                ca: Some("file:/nonexistent/mcp-iap/root_ca.crt".into()),
+                ca: Some("file:/nonexistent/agent-iap/root_ca.crt".into()),
             }),
             ..Default::default()
         };
@@ -405,8 +405,8 @@ mod tests {
     fn the_error_names_which_section_failed() {
         let server = ServerConfig {
             tls: Some(TlsConfig {
-                cert: "file:/nonexistent/mcp-iap/cert.pem".into(),
-                key: "file:/nonexistent/mcp-iap/key.pem".into(),
+                cert: "file:/nonexistent/agent-iap/cert.pem".into(),
+                key: "file:/nonexistent/agent-iap/key.pem".into(),
                 ca: None,
             }),
             ..Default::default()

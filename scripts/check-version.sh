@@ -56,7 +56,7 @@ fi
 # `--locked` elsewhere in CI already fails on a stale lock, but with a message
 # about the whole manifest rather than about the one line that moved.
 lock_version=$(
-    awk '/^name = "mcp-iap"$/ { getline; gsub(/"/, ""); print $3; exit }' Cargo.lock
+    awk '/^name = "agent-iap"$/ { getline; gsub(/"/, ""); print $3; exit }' Cargo.lock
 )
 if [ "$lock_version" != "$package_version" ]; then
     echo "check-version: Cargo.lock says \`$lock_version\`, Cargo.toml says \`$package_version\` — run \`cargo check\` and commit the lock" >&2

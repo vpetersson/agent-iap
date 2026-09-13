@@ -70,7 +70,7 @@ pub fn run(state: Arc<AppState>) -> Result<()> {
     // default, a terminal it cannot drive has to name the flag that runs the
     // proxy anyway, not panic through a half-configured terminal.
     let mut terminal = ratatui::try_init().context(
-        "opening the approval console — `mcp-iap run --no-tui` runs the proxy without it",
+        "opening the approval console — `agent-iap run --no-tui` runs the proxy without it",
     )?;
     let result = event_loop(&state, &mut terminal, &mut feed_rx);
     ratatui::restore();
@@ -178,7 +178,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &Arc<AppState>, pending: us
 
     let line = Line::from(vec![
         Span::styled(
-            " mcp-iap ",
+            " agent-iap ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -455,7 +455,7 @@ action = "ask"
         println!("{rendered}");
 
         for expected in [
-            "mcp-iap",
+            "agent-iap",
             "1 waiting",
             "Claude Code",
             "/repos/acme/api/issues",

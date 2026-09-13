@@ -103,16 +103,16 @@ jobs:
           # tarballs, which everyone downstream then has to ignore.
           COPYFILE_DISABLE: "1"
         run: |
-          staging="mcp-iap-${{ needs.version.outputs.version }}-${{ matrix.name }}"
+          staging="agent-iap-${{ needs.version.outputs.version }}-${{ matrix.name }}"
           mkdir -p "$staging"
-          cp target/${{ matrix.target }}/release/mcp-iap "$staging/"
+          cp target/${{ matrix.target }}/release/agent-iap "$staging/"
           cp LICENSE README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: mcp-iap-*.tar.gz
+          path: agent-iap-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -134,7 +134,7 @@ jobs:
       - name: checksums
         working-directory: dist
         run: |
-          sha256sum mcp-iap-*.tar.gz > SHA256SUMS
+          sha256sum agent-iap-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: publish
@@ -145,7 +145,7 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag \
-            dist/mcp-iap-*.tar.gz dist/SHA256SUMS
+            dist/agent-iap-*.tar.gz dist/SHA256SUMS
 
   image:
     name: ghcr image
@@ -175,10 +175,10 @@ jobs:
             arch=${pair%%:*}
             name=${pair#*:}
             mkdir -p "dist/$arch"
-            tar xzf "artifacts/mcp-iap-$v-$name.tar.gz" \
-                -C "dist/$arch" --strip-components=1 "mcp-iap-$v-$name/mcp-iap"
+            tar xzf "artifacts/agent-iap-$v-$name.tar.gz" \
+                -C "dist/$arch" --strip-components=1 "agent-iap-$v-$name/agent-iap"
           done
-          ls -l dist/*/mcp-iap
+          ls -l dist/*/agent-iap
 
       # `latest` has to mean the newest release, not the most recently pushed
       # tag: a backport cut after a newer version would otherwise walk it
@@ -208,7 +208,7 @@ jobs:
           # Named for the binary it contains, not for `github.repository`: an
           # image name that follows a repo rename silently orphans everyone's
           # `docker pull`, and this repo has been renamed once already.
-          images: ghcr.io/vpetersson/mcp-iap
+          images: ghcr.io/vpetersson/agent-iap
           # CalVer, so `2026.9` floats within a month. There is no `2026`
           # tag: the year is the major only because semver needs one, and a
           # year-wide alias would imply a compatibility promise nothing here
@@ -232,7 +232,7 @@ jobs:
           sbom: true
 
   # Dormant until someone decides crates.io is wanted and adds the token: the
-  # crate packages cleanly today, but `cargo install mcp-iap` cannot work until
+  # crate packages cleanly today, but `cargo install agent-iap` cannot work until
   # a version is actually published, and publishing is irreversible. Skipping
   # rather than failing keeps that decision off the critical path of a release.
   crates-io:
@@ -249,7 +249,7 @@ jobs:
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "No \`CARGO_REGISTRY_TOKEN\` secret — crates.io skipped." \
               >> "$GITHUB_STEP_SUMMARY"
-            echo "Add one to publish \`cargo install mcp-iap\` from the next tag." \
+            echo "Add one to publish \`cargo install agent-iap\` from the next tag." \
               >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi

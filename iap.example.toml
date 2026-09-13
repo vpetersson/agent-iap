@@ -1,4 +1,4 @@
-# mcp-iap policy file.
+# agent-iap policy file.
 #
 # Nothing here is a credential — only *references* to credentials, resolved
 # inside the proxy at startup. This file is safe to commit.
@@ -23,11 +23,11 @@ max_body_bytes = 10485760
 # stops the process rather than failing the first handshake.
 #
 # [server.tls]
-# cert = "file:/etc/mcp-iap/fullchain.pem"     # PEM chain, leaf first
-# key  = "op://Infra/mcp-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
-# ca   = "file:/etc/mcp-iap/root_ca.crt"       # the CA that signed `cert`
+# cert = "file:/etc/agent-iap/fullchain.pem"     # PEM chain, leaf first
+# key  = "op://Infra/agent-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
+# ca   = "file:/etc/agent-iap/root_ca.crt"       # the CA that signed `cert`
 #
-# `ca` is optional and is what `mcp-iap mcp` verifies the control plane against.
+# `ca` is optional and is what `agent-iap mcp` verifies the control plane against.
 # Omit it for a public CA, which every trust store already has, and for a
 # self-signed certificate, which is its own CA. Name it for a private CA, so the
 # anchor is the root rather than whatever the served chain happens to contain.
@@ -50,12 +50,12 @@ max_body_bytes = 10485760
 # The control plane follows onto HTTPS with the same certificate. Give it one of
 # its own when that certificate does not name the address the control plane is
 # reached at — a cert for host.tailnet.ts.net is not valid for 127.0.0.1, and
-# `mcp-iap mcp` dials `admin_listen` and does check the name:
+# `agent-iap mcp` dials `admin_listen` and does check the name:
 #
 # [server.admin_tls]
-# cert = "file:/etc/mcp-iap/admin-fullchain.pem"
-# key  = "file:/etc/mcp-iap/admin-key.pem"
-# ca   = "file:/etc/mcp-iap/root_ca.crt"
+# cert = "file:/etc/agent-iap/admin-fullchain.pem"
+# key  = "file:/etc/agent-iap/admin-key.pem"
+# ca   = "file:/etc/agent-iap/root_ca.crt"
 
 # Workload identity. The agent token above says *who* is calling; it is
 # long-lived and identical for every call that agent ever makes. A workload
@@ -80,13 +80,13 @@ max_logged_body_bytes = 4096
 redact_headers = ["authorization", "x-api-key", "cookie", "x-iap-token"]
 
 # --- who may connect -------------------------------------------------------
-# Mint a token with `mcp-iap gen-token claude-code`. It is not an upstream
+# Mint a token with `agent-iap gen-token claude-code`. It is not an upstream
 # credential; revoking it costs nothing and rotates nothing else.
 
 [[agents]]
 id = "claude-code"
 name = "Claude Code"
-# Replace with the hash printed by `mcp-iap gen-token claude-code`. Left
+# Replace with the hash printed by `agent-iap gen-token claude-code`. Left
 # deliberately invalid: an unedited policy file should refuse to start, not come
 # up looking healthy with an agent that can never authenticate.
 token_sha256 = "REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token"
@@ -141,7 +141,7 @@ scopes = ["https://www.googleapis.com/auth/devstorage.read_only"]
 #   scopes = ["read:data"]
 
 # --- MCP servers -----------------------------------------------------------
-# The agent runs `mcp-iap mcp --server github-mcp` as its MCP server. The real
+# The agent runs `agent-iap mcp --server github-mcp` as its MCP server. The real
 # server is spawned here, with the credential in *its* environment.
 
 [[mcp_servers]]

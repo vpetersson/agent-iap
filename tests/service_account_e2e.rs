@@ -5,13 +5,13 @@
 //! anything, so these tests prove the proxy mints a genuinely valid assertion
 //! rather than merely a well-shaped one.
 
+use agent_iap::config::Config;
+use agent_iap::state::AppState;
 use axum::extract::{Request, State};
 use axum::routing::{any, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use mcp_iap::config::Config;
-use mcp_iap::state::AppState;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -217,7 +217,7 @@ paths = ["/**"]
 action = "allow"
 "#,
         audit = audit_path.display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
         upstream = upstream,
         key_path = key_path.display(),
     ))
@@ -230,7 +230,7 @@ action = "allow"
     tokio::spawn(async move {
         axum::serve(
             listener,
-            mcp_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            agent_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
         .unwrap()
@@ -357,7 +357,7 @@ async fn the_mint_is_audited_and_leaks_neither_the_token_nor_the_key() {
     );
 
     // And the chain still verifies with the extra record in it.
-    mcp_iap::audit::verify_file(&harness.audit_path).unwrap();
+    agent_iap::audit::verify_file(&harness.audit_path).unwrap();
 }
 
 #[tokio::test]
@@ -389,7 +389,7 @@ type = "service_account_jwt"
 key_file = "file:{key_path}"
 "#,
         audit = harness.audit_path.display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
         key_path = harness.key_path.display(),
     ))
     .unwrap();

@@ -59,7 +59,7 @@ awk -v v="$next" '
 # The lock records the workspace member's own version too, and CI builds with
 # `--locked`, so it has to move in the same commit.
 awk -v v="$next" '
-    /^name = "mcp-iap"$/ && !done {
+    /^name = "agent-iap"$/ && !done {
         print
         getline
         print "version = \"" v "\""

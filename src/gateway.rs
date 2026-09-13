@@ -1,4 +1,4 @@
-//! The gateway: mcp-iap as an MCP server in its own right.
+//! The gateway: agent-iap as an MCP server in its own right.
 //!
 //! The proxy fronts REST APIs in REST's own idiom — point an SDK at
 //! `http://127.0.0.1:8080/<upstream>` and it works unchanged. That is the right
@@ -139,7 +139,7 @@ fn unauthenticated(failure: &crate::identity::AuthFailure) -> Response {
         failure.status(),
         Json(json!({
             "error": { "type": failure.code(), "message": failure.message() },
-            "proxy": "mcp-iap",
+            "proxy": "agent-iap",
         })),
     )
         .into_response()
@@ -214,8 +214,8 @@ fn initialize(state: &AppState, caller: &Caller) -> Value {
             "resources": {},
         },
         "serverInfo": {
-            "name": "mcp-iap",
-            "title": "mcp-iap gateway",
+            "name": "agent-iap",
+            "title": "agent-iap gateway",
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": skills::instructions(state, caller.agent()),
@@ -646,7 +646,7 @@ fn response_result(
     }
     if truncated {
         text.push_str(
-            "\n\n[truncated by mcp-iap at the configured max_body_bytes — narrow the \
+            "\n\n[truncated by agent-iap at the configured max_body_bytes — narrow the \
              request rather than asking again]",
         );
     }

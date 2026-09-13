@@ -6,11 +6,11 @@
 //! enforce the same things. The upstream gets the real credential, the agent
 //! never sees it, the policy decides, and the log records it.
 
+use agent_iap::config::Config;
+use agent_iap::state::AppState;
 use axum::extract::Request;
 use axum::routing::any;
 use axum::{Json, Router};
-use mcp_iap::config::Config;
-use mcp_iap::state::AppState;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -164,8 +164,8 @@ action = "allow"
 {extra_acl}
 "#,
         audit = audit_path.display(),
-        token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
-        outsider_hash = mcp_iap::identity::token_hash("iap_outsider"),
+        token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
+        outsider_hash = agent_iap::identity::token_hash("iap_outsider"),
         key = UPSTREAM_KEY,
     );
 
@@ -181,7 +181,7 @@ action = "allow"
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                mcp_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                agent_iap::proxy::router(state).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             .unwrap();
@@ -428,7 +428,7 @@ async fn initialize_serves_instructions_naming_what_this_agent_can_reach() {
         .await;
     let result = &frame["result"];
 
-    assert_eq!(result["serverInfo"]["name"], "mcp-iap");
+    assert_eq!(result["serverInfo"]["name"], "agent-iap");
     assert!(result["capabilities"]["tools"].is_object());
     let instructions = result["instructions"].as_str().unwrap();
     assert!(instructions.contains("`echo`"), "{instructions}");
@@ -505,14 +505,14 @@ async fn the_catalog_and_the_skills_describe_the_running_policy() {
         .map(|resource| resource["uri"].as_str().unwrap().to_string())
         .collect();
     assert!(
-        uris.contains(&"skill://mcp-iap/upstream/echo".to_string()),
+        uris.contains(&"skill://agent-iap/upstream/echo".to_string()),
         "{uris:?}"
     );
 
     let read = harness
         .rpc(
             "resources/read",
-            json!({ "uri": "skill://mcp-iap/upstream/echo" }),
+            json!({ "uri": "skill://agent-iap/upstream/echo" }),
         )
         .await;
     assert_eq!(
@@ -675,7 +675,7 @@ async fn the_log_verifies_after_a_session_through_the_gateway() {
         .await;
 
     // The chain is walked end to end; a break is an error, not a flag.
-    let report = mcp_iap::audit::verify_file(&harness.audit_path).unwrap();
+    let report = agent_iap::audit::verify_file(&harness.audit_path).unwrap();
     assert!(
         report.entries >= 4,
         "startup, the session, one allowed call and one refusal"
