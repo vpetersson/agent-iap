@@ -222,6 +222,12 @@ impl Acl {
     pub fn default_action(&self) -> Action {
         self.default
     }
+
+    /// Can this policy ever stop a request on a human? A proxy running without
+    /// the console loses nothing if it cannot, and silently denies if it can.
+    pub fn can_ask(&self) -> bool {
+        self.default == Action::Ask || self.rules.iter().any(|rule| rule.action == Action::Ask)
+    }
 }
 
 fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {

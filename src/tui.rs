@@ -4,7 +4,7 @@
 //! a human answers it. The bottom pane is a live tail of the audit log, so the
 //! operator can see what the agent has been doing while deciding what to allow next.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,9 +22,56 @@ use crate::state::AppState;
 const FEED_CAPACITY: usize = 200;
 const TICK: Duration = Duration::from_millis(120);
 
+/// What `run` does with the terminal it was started in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Console {
+    /// Draw the approval console. The terminal is the console's, so the
+    /// diagnostic log goes to a file beside the audit log instead.
+    Draw,
+    /// Stream the log to stderr. Nobody is at a keyboard, so an `ask` is
+    /// answered over the control plane or not at all.
+    Headless,
+}
+
+impl Console {
+    pub fn draws(self) -> bool {
+        matches!(self, Console::Draw)
+    }
+}
+
+/// Which of the two `run` is.
+///
+/// `run` is the console: an `ask` rule parks a request until a human answers,
+/// and the one thing it must not do is park it in a queue nobody is looking
+/// at. Where there is no terminal to draw on — a unit file, a container, a
+/// pipe into `tee` — that is already the answer, and no flag should be needed
+/// to say so. `--no-tui` is for a terminal you want the log stream on anyway;
+/// `--tui` is for a terminal we failed to recognise as one.
+pub fn choose(tui: bool, no_tui: bool, terminal: bool) -> Console {
+    if tui || (terminal && !no_tui) {
+        Console::Draw
+    } else {
+        Console::Headless
+    }
+}
+
+/// Is a human at the other end of this process?
+///
+/// The console draws on stdout, and stdin being redirected is how a supervisor
+/// says that nobody is going to type. Either one missing means the log stream.
+pub fn at_a_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
+}
+
 pub fn run(state: Arc<AppState>) -> Result<()> {
     let mut feed_rx = state.audit.subscribe();
-    let mut terminal = ratatui::init();
+    // `try_init` rather than `init`: now that the console is what `run` does by
+    // default, a terminal it cannot drive has to name the flag that runs the
+    // proxy anyway, not panic through a half-configured terminal.
+    let mut terminal = ratatui::try_init().context(
+        "opening the approval console — `mcp-iap run --no-tui` runs the proxy without it",
+    )?;
     let result = event_loop(&state, &mut terminal, &mut feed_rx);
     ratatui::restore();
     result
@@ -422,6 +469,22 @@ action = "ask"
                 "console did not render `{expected}`:\n{rendered}"
             );
         }
+    }
+
+    /// `run` is the console, so a terminal is all it should take to get one —
+    /// and a unit file, which has no terminal, must not get one by accident.
+    #[test]
+    fn a_terminal_gets_the_console_and_a_unit_file_gets_the_log() {
+        assert_eq!(choose(false, false, true), Console::Draw);
+        assert_eq!(choose(false, false, false), Console::Headless);
+    }
+
+    #[test]
+    fn either_flag_beats_what_the_terminal_looks_like() {
+        // A terminal we failed to recognise; and a terminal whose operator
+        // wants the log stream on it anyway.
+        assert_eq!(choose(true, false, false), Console::Draw);
+        assert_eq!(choose(false, true, true), Console::Headless);
     }
 
     #[tokio::test]

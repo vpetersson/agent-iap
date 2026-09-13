@@ -14,6 +14,7 @@ use mcp_iap::mcp;
 use mcp_iap::profiles;
 use mcp_iap::state::AppState;
 use mcp_iap::tls::{self, ServerTls};
+use mcp_iap::tui::{self, Console};
 
 #[derive(Parser)]
 #[command(
@@ -61,7 +62,7 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
-    /// Run the proxy.
+    /// Run the proxy, with the approval console on a terminal.
     Run {
         #[command(flatten)]
         config: ConfigArg,
@@ -73,9 +74,16 @@ enum Command {
         /// `server.admin_listen`.
         #[arg(long, value_name = "ADDR", env = "IAP_ADMIN_LISTEN")]
         admin_listen: Option<String>,
-        /// Open the interactive approval console.
+        /// Open the approval console. The default wherever there is a
+        /// terminal to draw it on; pass it to insist on one we did not
+        /// recognise.
         #[arg(long)]
         tui: bool,
+        /// Run without the console: the log on stderr, and an `ask` answered
+        /// over the control plane or not at all. The default with no terminal,
+        /// so a unit file or a container needs neither this flag nor a TTY.
+        #[arg(long, conflicts_with = "tui")]
+        no_tui: bool,
     },
     /// Bridge one MCP server for an agent. Requires a running `mcp-iap run`.
     Mcp {
@@ -469,7 +477,7 @@ enum AclCommand {
         /// URL paths, or for MCP the tool name. Repeatable.
         #[arg(long = "paths", value_name = "PATH", default_values_t = [String::from("**")])]
         paths: Vec<String>,
-        /// `allow`, `deny`, or `ask` to prompt a human in `run --tui`.
+        /// `allow`, `deny`, or `ask` to prompt a human at the `run` console.
         #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
         action: ActionArg,
     },
@@ -553,6 +561,7 @@ fn main() -> Result<()> {
             listen,
             admin_listen,
             tui,
+            no_tui,
         } => {
             let mut config = Config::load(&config.config)?;
 
@@ -574,7 +583,8 @@ fn main() -> Result<()> {
                     .context("after applying the listen overrides")?;
             }
 
-            init_tracing(tui, &config)?;
+            let console = tui::choose(tui, no_tui, tui::at_a_terminal());
+            init_tracing(console, &config)?;
             if overridden {
                 // Otherwise the file and the socket disagree and nothing says why.
                 tracing::info!(
@@ -583,7 +593,7 @@ fn main() -> Result<()> {
                     "listen addresses overridden outside the config file"
                 );
             }
-            tokio_runtime()?.block_on(run(config, tui))
+            tokio_runtime()?.block_on(run(config, console))
         }
         Command::Mcp {
             config,
@@ -593,7 +603,7 @@ fn main() -> Result<()> {
         } => {
             let config = Config::load(&config.config)?;
             // stdout belongs to the JSON-RPC stream; diagnostics go to stderr.
-            init_tracing(false, &config)?;
+            init_tracing(Console::Headless, &config)?;
             let admin_url = admin_url
                 .or_else(|| {
                     let scheme = tls::scheme(config.server.admin_tls_material().is_some());
@@ -748,11 +758,11 @@ fn tokio_runtime() -> Result<tokio::runtime::Runtime> {
         .context("starting the async runtime")
 }
 
-fn init_tracing(tui: bool, config: &Config) -> Result<()> {
+fn init_tracing(console: Console, config: &Config) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_env("IAP_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    if tui {
+    if console.draws() {
         // The terminal is the console's; send diagnostics to a file beside the log.
         let path = config
             .audit
@@ -783,11 +793,11 @@ fn init_tracing(tui: bool, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run(config: Config, tui: bool) -> Result<()> {
+async fn run(config: Config, console: Console) -> Result<()> {
     let listen = config.server.listen;
     let admin_listen = config.server.admin_listen;
     let audit_path = config.audit.path.clone();
-    let audit_to_stderr = config.audit.stderr && !tui;
+    let audit_to_stderr = config.audit.stderr && !console.draws();
 
     let state = AppState::build(config, audit_to_stderr)?;
 
@@ -801,7 +811,7 @@ async fn run(config: Config, tui: bool) -> Result<()> {
 
     // The console and the control API are the only things that can answer an
     // `ask`. Without either, `ask` denies rather than hanging.
-    state.broker.set_has_approver(tui);
+    state.broker.set_has_approver(console.draws());
 
     let proxy_listener = std::net::TcpListener::bind(listen)
         .with_context(|| format!("binding the proxy to {listen}"))?;
@@ -816,7 +826,7 @@ async fn run(config: Config, tui: bool) -> Result<()> {
             let listener = std::net::TcpListener::bind(addr)
                 .with_context(|| format!("binding the control plane to {addr}"))?;
             let token_path = write_admin_token(&audit_path, &state.admin_token)?;
-            if !tui {
+            if !console.draws() {
                 eprintln!(
                     "control plane on {}://{addr} (token in {})",
                     admin_scheme,
@@ -832,7 +842,7 @@ async fn run(config: Config, tui: bool) -> Result<()> {
         None => None,
     };
 
-    if !tui {
+    if !console.draws() {
         eprintln!(
             "mcp-iap listening on {}://{listen} — {} agents, {} rules, default {}",
             proxy_scheme,
@@ -841,18 +851,29 @@ async fn run(config: Config, tui: bool) -> Result<()> {
             state.acl.default_action()
         );
         eprintln!("audit log: {}", audit_path.display());
+        // Running headless is what silences the `ask` rules: with no console,
+        // nothing parks a request unless something is polling the queue. Say
+        // so here rather than leaving it to be discovered in the audit log.
+        if state.acl.can_ask() {
+            match admin_listen {
+                Some(addr) => eprintln!(
+                    "no console: `ask` denies unless something polls {admin_scheme}://{addr}/pending"
+                ),
+                None => eprintln!("no console and no control plane: `ask` denies immediately"),
+            }
+        }
     }
 
-    let console = tui.then(|| {
+    let drawing = console.draws().then(|| {
         let state = Arc::clone(&state);
         tokio::task::spawn_blocking(move || mcp_iap::tui::run(state))
     });
 
-    match (admin, console) {
-        (Some(admin), Some(console)) => tokio::select! {
+    match (admin, drawing) {
+        (Some(admin), Some(drawing)) => tokio::select! {
             result = proxy => result?,
             result = admin => result?,
-            result = console => result??,
+            result = drawing => result??,
             _ = tokio::signal::ctrl_c() => {}
         },
         (Some(admin), None) => tokio::select! {
@@ -860,9 +881,9 @@ async fn run(config: Config, tui: bool) -> Result<()> {
             result = admin => result?,
             _ = tokio::signal::ctrl_c() => {}
         },
-        (None, Some(console)) => tokio::select! {
+        (None, Some(drawing)) => tokio::select! {
             result = proxy => result?,
-            result = console => result??,
+            result = drawing => result??,
             _ = tokio::signal::ctrl_c() => {}
         },
         (None, None) => tokio::select! {
@@ -1132,7 +1153,7 @@ fn init_config(options: &InitOptions) -> Result<()> {
         println!("  mcp-iap agent add claude-code --target anthropic\n");
         println!("Then:");
         println!("  mcp-iap check --config {path}   # resolves every credential reference");
-        println!("  mcp-iap run --config {path} --tui");
+        println!("  mcp-iap run --config {path}       # the approval console");
         return Ok(());
     };
 
@@ -1151,7 +1172,7 @@ fn init_config(options: &InitOptions) -> Result<()> {
         println!("  export {name}=...   # the credential the proxy injects on the way out");
     }
     println!("  mcp-iap check --config {path}   # resolves every credential reference");
-    println!("  mcp-iap run --config {path} --tui\n");
+    println!("  mcp-iap run --config {path}       # the approval console\n");
 
     println!("Then point the agent at the proxy:");
     println!(

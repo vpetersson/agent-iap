@@ -317,7 +317,7 @@ headers = {{ "anthropic-version" = "2023-06-01" }}
 # --- policy ----------------------------------------------------------------
 # First matching rule wins. Anything unmatched falls through to acl_default,
 # so an upstream with no rule is an upstream the agent cannot reach.
-# `action` is "allow", "deny" or "ask" — "ask" prompts a human in `run --tui`.
+# `action` is "allow", "deny" or "ask" — "ask" prompts a human at the `run` console.
 
 [[acl]]
 name = "anthropic-inference"
