@@ -26,8 +26,21 @@ max_body_bytes = 10485760
 # cert = "file:/etc/mcp-iap/fullchain.pem"     # PEM chain, leaf first
 # key  = "op://Infra/mcp-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
 #
+# Any provider works — these are a PEM chain and a PEM key, nothing more. The
+# two shortest paths, both written up in the README under "TLS":
+#
+#   tailscale  sudo tailscale cert --cert-file … --key-file … host.tailnet.ts.net
+#              A publicly trusted certificate, so agents need no CA anywhere.
+#              Valid for the ts.net name only, so bind `listen` to the tailnet
+#              address rather than 0.0.0.0.
+#   step-ca    step ca certificate iap.internal.example.com fullchain.pem key.pem
+#              Your own CA, the way internal x509 usually works: every host an
+#              agent runs on has to be given `step ca root`'s output.
+#
 # The control plane follows onto HTTPS with the same certificate. Give it one of
-# its own only if it needs one:
+# its own when that certificate does not name the address the control plane is
+# reached at — a cert for host.tailnet.ts.net is not valid for 127.0.0.1, and
+# `mcp-iap mcp` dials `admin_listen` and does check the name:
 #
 # [server.admin_tls]
 # cert = "file:/etc/mcp-iap/admin-fullchain.pem"

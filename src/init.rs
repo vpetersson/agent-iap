@@ -242,7 +242,9 @@ admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
 
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
-# control plane follows onto HTTPS with the same certificate.
+# control plane follows onto HTTPS with the same certificate. Any provider
+# works; `tailscale cert` and `step ca certificate` are the two the README
+# walks through.
 # [server.tls]
 # cert = "file:/etc/mcp-iap/fullchain.pem"
 # key = "op://Infra/mcp-iap tls/private key"
@@ -278,7 +280,9 @@ admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
 
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
-# control plane follows onto HTTPS with the same certificate.
+# control plane follows onto HTTPS with the same certificate. Any provider
+# works; `tailscale cert` and `step ca certificate` are the two the README
+# walks through.
 # [server.tls]
 # cert = "file:/etc/mcp-iap/fullchain.pem"
 # key = "op://Infra/mcp-iap tls/private key"
