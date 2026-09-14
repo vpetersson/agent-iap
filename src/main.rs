@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_iap::audit;
+use agent_iap::clipboard;
 use agent_iap::config::Config;
 use agent_iap::enroll;
 use agent_iap::identity;
@@ -42,6 +43,26 @@ struct ConfigArg {
     config: PathBuf,
 }
 
+/// The opt-out for the one convenience that touches a secret.
+///
+/// A token is printed once and has to be pasted somewhere; putting it on the
+/// clipboard is the point. But a desktop clipboard is shared with everything
+/// else on that desktop and is often kept in a history, so the operator gets a
+/// say — per command here, or once and for all with `IAP_NO_CLIPBOARD`.
+#[derive(Args, Clone, Copy)]
+struct ClipboardArg {
+    /// Do not put the minted token on the terminal's clipboard. The
+    /// `IAP_NO_CLIPBOARD` environment variable does the same for every command.
+    #[arg(long)]
+    no_clipboard: bool,
+}
+
+impl ClipboardArg {
+    fn allowed(self) -> bool {
+        !self.no_clipboard
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Write a policy file the proxy will start with.
@@ -63,6 +84,8 @@ enum Command {
         /// Replace an existing file. Mints a new token, retiring the old one.
         #[arg(short, long)]
         force: bool,
+        #[command(flatten)]
+        clipboard: ClipboardArg,
     },
     /// Run the proxy, with the approval console on a terminal.
     Run {
@@ -153,6 +176,8 @@ enum Command {
         /// Agent id to use in the printed block.
         #[arg(default_value = "my-agent")]
         id: String,
+        #[command(flatten)]
+        clipboard: ClipboardArg,
     },
     /// Print the sha256 of a token you already have (reads stdin when omitted).
     HashToken { token: Option<String> },
@@ -220,6 +245,8 @@ enum AgentCommand {
         /// Omit for "any", which still leaves the ACL in charge.
         #[arg(long = "target", value_name = "NAME")]
         targets: Vec<String>,
+        #[command(flatten)]
+        clipboard: ClipboardArg,
     },
     /// Revoke an agent: remove it, and its token stops being one.
     #[command(alias = "remove")]
@@ -240,6 +267,8 @@ enum AgentCommand {
         id: String,
         #[command(flatten)]
         config: ConfigArg,
+        #[command(flatten)]
+        clipboard: ClipboardArg,
     },
 }
 
@@ -591,13 +620,17 @@ fn main() -> Result<()> {
             secret,
             template,
             force,
-        } => init_config(&InitOptions {
-            path: config.config,
-            agent,
-            secret,
-            template: template.into(),
-            force,
-        }),
+            clipboard,
+        } => init_config(
+            &InitOptions {
+                path: config.config,
+                agent,
+                secret,
+                template: template.into(),
+                force,
+            },
+            clipboard,
+        ),
         Command::Run {
             config,
             listen,
@@ -698,11 +731,16 @@ fn main() -> Result<()> {
             config,
             name,
             targets,
-        }) => add_agent(&config.config, &id, name.as_deref(), &targets),
+            clipboard,
+        }) => add_agent(&config.config, &id, name.as_deref(), &targets, clipboard),
         Command::Agent(AgentCommand::Rm { id, config, prune }) => {
             remove_agent(&config.config, &id, prune)
         }
-        Command::Agent(AgentCommand::Rotate { id, config }) => rotate_agent(&config.config, &id),
+        Command::Agent(AgentCommand::Rotate {
+            id,
+            config,
+            clipboard,
+        }) => rotate_agent(&config.config, &id, clipboard),
         Command::Upstream(UpstreamCommand::Add {
             name,
             config,
@@ -792,7 +830,7 @@ fn main() -> Result<()> {
             expires_in,
         }),
         Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
-        Command::GenToken { id } => gen_token(&id),
+        Command::GenToken { id, clipboard } => gen_token(&id, clipboard),
         Command::HashToken { token } => {
             let token = match token {
                 Some(token) => token,
@@ -1329,11 +1367,28 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Print a freshly minted token, and put it on the clipboard on the way past.
+///
+/// Every command that mints one goes through here, so the token is indented the
+/// same way, the "shown once" warning is worded the same way, and the clipboard
+/// is offered — or declined — on the same terms wherever it came from.
+fn show_token(headline: &str, token: &str, clipboard: ClipboardArg) {
+    println!("{headline}\n");
+    println!("  {token}\n");
+    // The note goes to stderr, unlike everything around it: it is about what
+    // just happened to this machine's clipboard, not part of what the command
+    // produced. `agent-iap gen-token > token.txt` should leave the operator
+    // reading it on the terminal, not find it in the file a week later.
+    if let Some(note) = clipboard::copy(token, clipboard.allowed()).note() {
+        eprintln!("{note}\n");
+    }
+}
+
 /// Write a policy file and tell the operator what is left to do.
 ///
 /// The token is printed rather than stored: only its hash went into the file,
 /// so this is the one moment it exists in plaintext.
-fn init_config(options: &InitOptions) -> Result<()> {
+fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
     let written = init::init(options)?;
     let path = written.path.display();
 
@@ -1356,8 +1411,11 @@ fn init_config(options: &InitOptions) -> Result<()> {
     };
 
     println!("Wrote {path} for agent `{agent}`.\n");
-    println!("The agent's token — shown once, and not any upstream's credential:\n");
-    println!("  {token}\n");
+    show_token(
+        "The agent's token — shown once, and not any upstream's credential:",
+        token,
+        clipboard,
+    );
 
     println!("Next:");
     // Only `env:` has a step the operator can act on from here; anything else
@@ -1382,11 +1440,20 @@ fn init_config(options: &InitOptions) -> Result<()> {
     Ok(())
 }
 
-fn add_agent(path: &Path, id: &str, name: Option<&str>, targets: &[String]) -> Result<()> {
+fn add_agent(
+    path: &Path,
+    id: &str,
+    name: Option<&str>,
+    targets: &[String],
+    clipboard: ClipboardArg,
+) -> Result<()> {
     let enrolled = enroll::add_agent(path, id, name, targets)?;
     println!("Added agent `{}` to {}.\n", enrolled.id, path.display());
-    println!("Its token — shown once, and not any upstream's credential:\n");
-    println!("  {}\n", enrolled.token);
+    show_token(
+        "Its token — shown once, and not any upstream's credential:",
+        &enrolled.token,
+        clipboard,
+    );
     if targets.is_empty() {
         println!("It may address any target, subject to the ACL.");
     } else {
@@ -1412,14 +1479,17 @@ fn remove_agent(path: &Path, id: &str, prune: bool) -> Result<()> {
     Ok(())
 }
 
-fn rotate_agent(path: &Path, id: &str) -> Result<()> {
+fn rotate_agent(path: &Path, id: &str, clipboard: ClipboardArg) -> Result<()> {
     let rotated = enroll::rotate_agent(path, id)?;
     println!(
         "Rotated the token for agent `{id}` in {}.\n",
         path.display()
     );
-    println!("Its new token — shown once, and not any upstream's credential:\n");
-    println!("  {}\n", rotated.token);
+    show_token(
+        "Its new token — shown once, and not any upstream's credential:",
+        &rotated.token,
+        clipboard,
+    );
     println!("The old hash is gone from the file. Hand this to the agent before you restart,");
     println!("so the two changes land together rather than as an outage in between.");
     reload_notice("the running proxy still accepts the old token and rejects this one");
@@ -1695,11 +1765,14 @@ fn remove_rule(path: &Path, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn gen_token(id: &str) -> Result<()> {
+fn gen_token(id: &str, clipboard: ClipboardArg) -> Result<()> {
     let token = identity::generate_token()?;
     let hash = identity::token_hash(&token);
-    println!("Give this token to the agent — it is not any upstream credential:\n");
-    println!("  {token}\n");
+    show_token(
+        "Give this token to the agent — it is not any upstream credential:",
+        &token,
+        clipboard,
+    );
     println!("Add this to your policy file:\n");
     println!("[[agents]]");
     println!("id = \"{id}\"");

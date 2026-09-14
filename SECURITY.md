@@ -102,6 +102,11 @@ Out of scope — these are documented limitations rather than bugs. README
   where that distinction matters.
 - **Response bodies are not inspected.** Nothing here stops an upstream from
   returning data the agent should not have.
+- **A minted agent token reaching the desktop clipboard.** Every command that
+  mints one copies it there over OSC 52, where any other process on that
+  desktop can read it and a clipboard manager may keep it. That is deliberate,
+  it is announced on the line under the token, and `IAP_NO_CLIPBOARD` or
+  `--no-clipboard` turns it off. No upstream credential is ever copied.
 - An operator writing a policy that grants more than they meant to, a
   `literal:` secret committed despite the tooling refusing to write one, or a
   host on which the attacker already has the proxy's own user.
