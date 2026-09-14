@@ -743,7 +743,7 @@ read once and owned forever. A reload replaces the lot:
 | --- | --- |
 | `[[acl]]`, `[[agents]]` | recompiled and re-enrolled; the next request is judged by the new list |
 | `[[upstreams]]`, `[[mcp_servers]]` | routable immediately, credential and all |
-| a credential reference | re-resolved; a minted token is dropped when its target went away, and when the credential under it was repointed |
+| a credential reference | re-read from source, so a value rotated behind an unchanged reference takes effect too, not only a repointed reference; a minted token is dropped when its target went away, and when the credential under it was repointed |
 | `[server.tls]`, `[server.admin_tls]` | re-read from source and served from the next handshake; connections already up keep the certificate they negotiated |
 | `server.listen`, `server.admin_listen` | the new address is bound, then the old listener drains for ten seconds |
 | timeouts, `max_body_bytes`, `approval_timeout_secs`, workload settings | in force for the next request; anything already in flight keeps what it started with |
@@ -963,9 +963,10 @@ certificate the control plane serves has to name the address it is reached at;
 see below.
 
 Renewal does not mean a restart. A reload re-reads `cert` and `key` from source
-— past the cache, because a certificate is the one credential in this file that
-is *expected* to be replaced under a running process — and serves the new one
-from the next handshake; connections already up keep what they negotiated. What
+— past the cache, the way every reference in this file is re-read on reload, so
+a certificate renewed or a credential rotated behind an unchanged reference
+takes effect without bouncing the process — and serves the new one from the
+next handshake; connections already up keep what they negotiated. What
 it needs is something to *trigger* the reload, and the trigger is the policy
 file changing or a `SIGHUP`, not the certificate file itself: so pair the
 renewal with `systemctl reload agent-iap` (§ Reloading). Client certificates are
