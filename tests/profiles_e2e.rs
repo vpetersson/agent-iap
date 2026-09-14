@@ -532,3 +532,154 @@ fn base64_encode(value: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(value)
 }
+
+// ---- `upstream add --profile` ---------------------------------------------
+//
+// The two used to be separate commands for one decision: `upstream add` asked
+// for a base URL, a scheme and a set of ACL paths, and never mentioned that a
+// profile with all three already existed. These drive the joined-up path
+// through the real binary, because the refusals below are argument parsing and
+// a library test would not see them.
+
+fn minimal_policy() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iap.toml");
+    agent_iap::init::init(&agent_iap::init::InitOptions {
+        path: path.clone(),
+        agent: "workflow-agent".into(),
+        secret: None,
+        template: agent_iap::init::Template::Minimal,
+        force: true,
+    })
+    .unwrap();
+    (dir, path)
+}
+
+fn agent_iap(path: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_agent-iap"))
+        .args(args)
+        .args(["--config", path.to_str().unwrap()])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn adding_an_upstream_can_start_from_a_profile() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "gh",
+            "--profile",
+            "github",
+            "--secret",
+            "env:GITHUB_TOKEN",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let upstream = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.name == "gh")
+        .expect("the profile writes the upstream under the name the command was given");
+    assert_eq!(upstream.base_url, "https://api.github.com");
+    assert!(
+        config.acl.iter().any(|rule| rule.target == "gh"),
+        "and the rules that come with it — the part `upstream add` never wrote"
+    );
+}
+
+#[test]
+fn a_dry_run_from_upstream_add_writes_nothing() {
+    let (_dir, path) = minimal_policy();
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "gh",
+            "--profile",
+            "github",
+            "--secret",
+            "env:GITHUB_TOKEN",
+            "--dry-run",
+        ],
+    );
+
+    assert!(output.status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("api.github.com"), "{stdout}");
+}
+
+/// Upstream and MCP names share one namespace, so writing an `[[mcp_servers]]`
+/// entry from a command called `upstream add` would put a service somewhere
+/// nobody goes looking for it.
+#[test]
+fn an_mcp_profile_is_refused_by_upstream_add_with_the_command_that_does_take_it() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(
+        &path,
+        &["upstream", "add", "ph", "--profile", "posthog-mcp"],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("not an upstream"), "{stderr}");
+    assert!(
+        stderr.contains("profile add posthog-mcp --as ph"),
+        "{stderr}"
+    );
+}
+
+/// A credential flag next to `--profile` is an operator configuring something
+/// that is not going to be read — which shows up as a 401 an hour later.
+#[test]
+fn a_credential_flag_the_profile_would_ignore_is_refused_rather_than_dropped() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "gh",
+            "--profile",
+            "github",
+            "--secret",
+            "env:GITHUB_TOKEN",
+            "--header",
+            "x-api-key",
+        ],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("supplies the credential scheme"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn spelling_a_service_out_still_needs_a_base_url() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(&path, &["upstream", "add", "gh"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--base-url"), "{stderr}");
+}

@@ -281,6 +281,7 @@ upstream *and* its rules — see [§ Profiles](#profiles):
 
 ```bash
 agent-iap profile add cloudflare --secret op://Private/Cloudflare/token
+agent-iap upstream add gh --profile github --secret op://Private/GitHub/token
 ```
 
 The enrolment commands compose the same way for everything else:
@@ -347,6 +348,21 @@ Graylog's API hangs off `/api`, it authenticates an access token as basic
 so a GET-only "read" level cannot read anything. Getting any of those wrong
 fails late — a 401 with no detail, or a rule that quietly grants more than you
 meant.
+
+`upstream add` takes the same thing from the other direction, for when the name
+you want is the thing you started from:
+
+```bash
+agent-iap upstream add gh --profile github --secret op://Private/GitHub/token
+```
+
+That is `profile add github --as gh` — the upstream and its rules — and it is
+there because "add an upstream" is what somebody sets out to do; having to know
+that profiles exist before finding out that one covers their service was the
+whole problem. `--access`, `--var`, `--agent` and `--dry-run` mean what they do
+below. The credential flags do not: the profile supplies the scheme, so anything
+beyond `--secret` is refused rather than silently ignored. In the console, `n`
+on the upstreams pane opens on the same picker (§ The approval console).
 
 `--secret` is the same credential reference every other command takes, and
 `profile add` never asks for a credential itself. `--dry-run` prints the exact
@@ -660,11 +676,22 @@ from a shell is a form here, over the same functions with the same validation:
 | --- | --- | --- |
 | approvals | the queue, and the request in full | `enter` `a` `d` `f` |
 | agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
-| upstreams | base URL, scheme, credential reference | `n` add · `e` edit · `x` remove |
+| upstreams | base URL, scheme, credential reference | `n` add, from a profile or spelled out · `e` edit · `x` remove |
 | mcp | transport, command or URL, credential references | `n` `x` |
 | acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
+
+`n` on the upstreams pane opens on a profile picker rather than on a blank
+form. `←`/`→` walks the catalogue, and landing on one replaces the form with
+that profile's: no base URL to type, no scheme to pick, its own variables and
+access levels as named fields, and the credential reference the only thing left
+to fill in. Left where it starts — *none* — it is the form it always was. The
+two were separate panes before, so an operator who came here to add GitHub had
+no way of learning from this form that a `github` profile existed, and typed out
+a base URL, a scheme and a set of ACL paths nobody reviewed. Only the HTTP
+profiles are offered here; an MCP profile is not an upstream and belongs to the
+`mcp` pane.
 
 `e` on an upstream — or `enter`, or a double-click — opens that entry rather
 than a blank one: the base URL it has, the scheme it uses, the references it
