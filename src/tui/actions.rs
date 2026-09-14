@@ -16,20 +16,23 @@
 //!
 //! The console is not the only thing that writes this file. `agent-iap acl add`
 //! in the next terminal over, or an editor, edits the same policy the console
-//! is displaying — so it watches the file rather than assuming it is the only
-//! author, and a pane showing a rule list that is no longer the rule list is a
-//! pane worth distrusting.
+//! is displaying — and a pane showing a rule list that is no longer the rule
+//! list is a pane worth distrusting. The watching itself belongs to the daemon
+//! (`crate::reload`), which does it whether or not anyone is looking; the
+//! console shares that watcher, so pressing `r` does not leave it believing an
+//! edit is still outstanding, and it hears about every reload either of them
+//! causes.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use crate::config::Config;
 use crate::enroll::{self, McpTransportSpec};
 use crate::list::{Inventory, ListOptions, What};
 use crate::profiles;
+use crate::reload::{Trigger, Watcher};
 use crate::state::AppState;
 
 use super::form::{Form, Intent};
@@ -41,64 +44,21 @@ pub struct Policy {
     pub config: Arc<Config>,
     pub inventory: Inventory,
     pub credentials: Vec<CredentialStatus>,
-    /// The mark on the file the current view was read from. What the console
-    /// compares against to notice somebody else editing the policy.
-    seen: Option<Stamp>,
-}
-
-/// Enough of a file's identity to notice it changing, cheaply enough to ask
-/// every frame.
-///
-/// Not a hash: the console asks this question eight times a second, and reading
-/// and digesting the whole policy file to find out that nothing happened is a
-/// cost paid continuously for an event that happens twice a day. Length and
-/// modification time miss an edit only if it changed neither, which for a TOML
-/// file rewritten by hand or by `enroll` does not come up.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stamp {
-    modified: Option<SystemTime>,
-    len: u64,
-}
-
-/// The file's current mark, or `None` if it cannot be stat'd at all.
-pub fn stamp(path: &Path) -> Option<Stamp> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(Stamp {
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
-    })
+    /// The daemon's watcher, shared. The console does not read the file itself.
+    watcher: Arc<Watcher>,
 }
 
 impl Policy {
-    pub fn load(path: &Path, state: &Arc<AppState>) -> Result<Self> {
+    pub fn load(watcher: Arc<Watcher>, state: &Arc<AppState>) -> Result<Self> {
         let mut policy = Policy {
-            path: path.to_path_buf(),
+            path: watcher.path().to_path_buf(),
             config: state.config(),
             inventory: Inventory::default(),
             credentials: Vec::new(),
-            seen: None,
+            watcher,
         };
-        policy.rebuild(state)?;
+        policy.show(state.config())?;
         Ok(policy)
-    }
-
-    /// Has somebody else written to the policy file since the console read it?
-    pub fn edited_on_disk(&self) -> bool {
-        match stamp(&self.path) {
-            // Unreadable is not "changed": a file briefly absent mid-rename
-            // would otherwise be reported as an edit and then as an error.
-            None => false,
-            current => current != self.seen,
-        }
-    }
-
-    /// Stop reporting the file as edited, whatever it currently says.
-    ///
-    /// For the one case `rebuild` cannot cover: it refused to load, and asking
-    /// it again every frame would put the same error on screen eight times a
-    /// second. The next edit produces a new mark and is tried again.
-    pub fn accept_on_disk(&mut self) {
-        self.seen = stamp(&self.path);
     }
 
     /// Re-read the file and put it in charge of the running proxy.
@@ -107,17 +67,23 @@ impl Policy {
     /// not load and leaves the proxy on the one it already had, so a failure
     /// here is a message on the footer rather than a proxy in an unknown state.
     pub fn rebuild(&mut self, state: &Arc<AppState>) -> Result<()> {
-        // Marked before the read rather than after. A write landing between the
-        // two would otherwise leave the console holding the old contents under
-        // the new file's mark, and never looking at the file again.
-        let stamp = stamp(&self.path);
-        let config = Config::load(&self.path)?;
+        let config = self.watcher.reload(state, Trigger::Asked)?;
+        self.show(config)
+    }
 
-        self.config = state.reload(config)?;
-        self.inventory = Inventory::build(&self.config, &ListOptions::default())
+    /// The watcher the daemon is running, shared with this console.
+    #[cfg(test)]
+    pub fn watcher(&self) -> &Arc<Watcher> {
+        &self.watcher
+    }
+
+    /// Catch the panes up to a policy that is already in force — the daemon's
+    /// watcher having reloaded it, or the console itself a moment ago.
+    pub fn show(&mut self, config: Arc<Config>) -> Result<()> {
+        self.inventory = Inventory::build(&config, &ListOptions::default())
             .context("reading the policy file back")?;
-        self.credentials = credential_statuses(&self.config, &self.credentials);
-        self.seen = stamp;
+        self.credentials = credential_statuses(&config, &self.credentials);
+        self.config = config;
         Ok(())
     }
 

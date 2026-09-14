@@ -20,6 +20,7 @@ pub mod list;
 pub mod mcp;
 pub mod profiles;
 pub mod proxy;
+pub mod reload;
 pub mod secrets;
 pub mod service_account;
 pub mod skills;

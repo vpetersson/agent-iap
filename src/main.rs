@@ -12,6 +12,7 @@ use agent_iap::init::{self, InitOptions, Template};
 use agent_iap::list::{Inventory, ListOptions, What};
 use agent_iap::mcp;
 use agent_iap::profiles;
+use agent_iap::reload::Watcher;
 use agent_iap::state::AppState;
 use agent_iap::stdio;
 use agent_iap::tls::{self, Listener, ServerTls};
@@ -605,27 +606,18 @@ fn main() -> Result<()> {
             no_tui,
         } => {
             let config_path = config.config.clone();
-            let mut config = Config::load(&config_path)?;
+            // Held rather than applied once: the file is re-read under a
+            // running proxy, and the watcher puts these back on top of every
+            // read. Otherwise somebody else's unrelated edit would move the
+            // proxy off the address `--listen` put it on.
+            let overrides = agent_iap::config::Overrides {
+                listen: listen.clone(),
+                admin_listen: admin_listen.clone(),
+            };
+            let overridden = overrides.any();
+            let watcher = Arc::new(Watcher::new(&config_path, overrides));
+            let config = watcher.read()?;
 
-            let overridden = listen.is_some() || admin_listen.is_some();
-            if let Some(spec) = &listen {
-                config.server.override_listen(spec).context("--listen")?;
-            }
-            if let Some(spec) = &admin_listen {
-                config
-                    .server
-                    .override_admin_listen(spec)
-                    .context("--admin-listen")?;
-            }
-            if overridden {
-                // The file was validated on load; the addresses it was
-                // validated with are no longer the ones being bound.
-                config
-                    .validate()
-                    .context("after applying the listen overrides")?;
-            }
-
-            let config_path = config_path.clone();
             let console = tui::choose(tui, no_tui, tui::at_a_terminal());
             init_tracing(console, &config)?;
             if overridden {
@@ -636,7 +628,7 @@ fn main() -> Result<()> {
                     "listen addresses overridden outside the config file"
                 );
             }
-            tokio_runtime()?.block_on(run(config, console, config_path))
+            tokio_runtime()?.block_on(run(config, console, watcher))
         }
         Command::Mcp {
             config,
@@ -879,7 +871,7 @@ fn init_tracing(console: Console, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<()> {
+async fn run(config: Config, console: Console, watcher: Arc<Watcher>) -> Result<()> {
     let listen = config.server.listen;
     let admin_listen = config.server.admin_listen;
     let audit_path = config.audit.path.clone();
@@ -949,10 +941,24 @@ async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<(
         }
     }
 
+    // Running whether or not anything is drawn. This is what makes a `--no-tui`
+    // unit file reload rather than restart — the deployment least able to take
+    // a restart is exactly the one with nobody at a keyboard.
+    tokio::spawn(Arc::clone(&watcher).run(Arc::clone(&state)));
+
+    if !console.draws() {
+        eprintln!(
+            "watching {} — edit it, or send SIGHUP, and this picks it up without a restart",
+            watcher.path().display()
+        );
+    }
+
     let mut drawing = console.draws().then(|| {
         let state = Arc::clone(&state);
-        let config_path = config_path.clone();
-        tokio::task::spawn_blocking(move || agent_iap::tui::run(state, &config_path))
+        // The console shares the watcher rather than keeping its own, so `r`
+        // and a form it just submitted do not look like somebody else's edit.
+        let watcher = Arc::clone(&watcher);
+        tokio::task::spawn_blocking(move || agent_iap::tui::run(state, watcher))
     });
 
     // The listeners are the one part of the proxy a lock cannot replace: a

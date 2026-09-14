@@ -200,7 +200,7 @@ impl AppState {
     /// installs cannot fail. An edit that would not have started this process
     /// therefore does not stop it either — it is refused, with the reason, and
     /// the proxy carries on serving what it was already serving.
-    pub fn reload(&self, config: Config) -> Result<Arc<Config>> {
+    pub fn reload(&self, config: Config, why: crate::reload::Trigger) -> Result<Arc<Config>> {
         // 1. Everything that can say no.
         preload_secrets(&config, &self.resolver)?;
         let rules = Acl::prepare(&config)?;
@@ -251,6 +251,24 @@ impl AppState {
 
         let config = Arc::new(config);
         *self.config.write() = Arc::clone(&config);
+
+        // A policy change is a thing this proxy did, and the audit log is where
+        // those go. Without it the log says an agent was allowed something and
+        // nothing says the rule that allowed it appeared ten seconds earlier.
+        // Best-effort on purpose: the policy is already in force, and refusing
+        // to serve it because the log is full would be the wrong way round.
+        let mut record = AuditRecord::new("proxy", "reload");
+        record.target = self.config.read().server.listen.to_string();
+        record.decision = Some(why.as_str().to_string());
+        record.detail = Some(serde_json::json!({
+            "agents": config.agents.len(),
+            "upstreams": config.upstreams.len(),
+            "mcp_servers": config.mcp_servers.len(),
+            "acl_rules": config.acl.len(),
+            "acl_default": config.acl_default.action.to_string(),
+        }));
+        self.audit.write_best_effort(record);
+
         let _ = self.reloads.send(Arc::clone(&config));
         Ok(config)
     }
@@ -320,6 +338,14 @@ impl AppState {
     }
 }
 
+impl AppState {
+    /// `reload` without naming a trigger, for tests that are not about one.
+    #[cfg(test)]
+    pub fn reload_for_test(&self, config: Config) -> Result<Arc<Config>> {
+        self.reload(config, crate::reload::Trigger::Asked)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,7 +404,7 @@ token_sha256 = "{}"
         assert!(state.config().upstream("linear").is_none());
 
         state
-            .reload(policy(
+            .reload_for_test(policy(
                 r#"
 [[upstreams]]
 name = "linear"
@@ -458,7 +484,7 @@ auth = {{ type = "bearer", secret = "env:AGENT_IAP_DEFINITELY_NOT_SET" }}
         ))
         .unwrap();
 
-        let error = state.reload(broken).unwrap_err().to_string();
+        let error = state.reload_for_test(broken).unwrap_err().to_string();
         assert!(error.contains("AGENT_IAP_DEFINITELY_NOT_SET"), "{error}");
 
         // Still serving what it was serving: the agent, and the rule.

@@ -649,6 +649,46 @@ impl Default for AclDefault {
     }
 }
 
+/// Settings given on the command line rather than in the file.
+///
+/// They outlive every edit to the policy file, which is the whole reason this
+/// exists as a thing rather than as two lines in `main`: the file is re-read
+/// under a running proxy now, and a reload that dropped `--listen` would move
+/// the proxy off the address its agents are connected to — silently, on
+/// somebody else's unrelated edit.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub listen: Option<String>,
+    pub admin_listen: Option<String>,
+}
+
+impl Overrides {
+    pub fn any(&self) -> bool {
+        self.listen.is_some() || self.admin_listen.is_some()
+    }
+
+    /// Put them back on top of a freshly loaded config.
+    pub fn apply(&self, config: &mut Config) -> Result<()> {
+        if let Some(spec) = &self.listen {
+            config.server.override_listen(spec).context("--listen")?;
+        }
+        if let Some(spec) = &self.admin_listen {
+            config
+                .server
+                .override_admin_listen(spec)
+                .context("--admin-listen")?;
+        }
+        if self.any() {
+            // The file was validated on load; the addresses it was validated
+            // with are no longer the ones being bound.
+            config
+                .validate()
+                .context("after applying the listen overrides")?;
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|error| {

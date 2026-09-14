@@ -687,11 +687,32 @@ on the console's footer, and the proxy carries on serving the policy it already
 had. A proxy running half of one policy and half of another is running a policy
 nobody wrote.
 
-Two things this does not do. The signing key behind § Workload identity is not
+### What triggers one
+
+The policy file is watched by the daemon, not by the console, so this is the
+same wherever it runs — a terminal, a unit file, a container with nobody
+attached:
+
+```bash
+agent-iap acl add --name migration-window …   # the file changed; picked up
+$EDITOR /etc/agent-iap/iap.toml               # same
+systemctl reload agent-iap                    # SIGHUP, for the impatient
+kill -HUP "$MAINPID"                          # and what that actually sends
+```
+
+A changed file has to hold still for 250ms before it is read, because a rewrite
+is a truncate and then a write and there is a moment in between when the file is
+half a policy. `SIGHUP` skips the wait, which is what makes it the right trigger
+for a config-management tool that has just finished writing. The console's `r`
+is the same call again.
+
+Every reload is logged, and written to the audit log as a `reload` record naming
+which of the three caused it and what the policy became — a rule appearing ten
+seconds before a call it allowed is a thing the log should be able to show you.
+
+One thing this does not do: the signing key behind § Workload identity is not
 rotated, because that would invalidate every token already handed out — a
-fleet-wide outage rather than a config change. And the *watching* lives in the
-console: a `--no-tui` deployment has nothing reading the file, so there it is
-still a restart.
+fleet-wide outage rather than a config change.
 
 ## The policy file
 
@@ -874,11 +895,10 @@ Renewal does not mean a restart. A reload re-reads `cert` and `key` from source
 — past the cache, because a certificate is the one credential in this file that
 is *expected* to be replaced under a running process — and serves the new one
 from the next handshake; connections already up keep what they negotiated. What
-it needs is something to trigger the reload, and the trigger is the policy file
-changing, not the certificate: with the console attached, `r` or a `touch
-iap.toml` after the renewal is enough. Headless, it is still a restart
-(§ Reloading). Client certificates are not an identity here either — agents are
-still the bearer token.
+it needs is something to *trigger* the reload, and the trigger is the policy
+file changing or a `SIGHUP`, not the certificate file itself: so pair the
+renewal with `systemctl reload agent-iap` (§ Reloading). Client certificates are
+not an identity here either — agents are still the bearer token.
 
 #### Where the certificate comes from
 
@@ -961,9 +981,8 @@ tailscale cert --cert-file /etc/agent-iap/fullchain.pem \
   && systemctl restart agent-iap
 ```
 
-With a console attached, `touch /etc/agent-iap/iap.toml` instead: the new
-certificate is served from the next handshake and nothing in flight is dropped
-(§ Reloading).
+Or `systemctl reload agent-iap` instead of `restart`: the new certificate is
+served from the next handshake and nothing in flight is dropped (§ Reloading).
 
 #### Small Step
 
@@ -1023,13 +1042,12 @@ so ship the root with the agent's image or its config, and treat a verification
 failure as a deployment bug rather than a flag to add.
 
 `step-ca` issues short certificates on purpose — 24 hours by default, and the
-provisioner caps what you may ask for. `step ca renew` can own both ends of it,
-with the same choice as above — a restart headless, a `touch` of the policy file
-where a console is attached:
+provisioner caps what you may ask for. At that rate you want a reload rather
+than a restart, and `step ca renew` can own both ends of it:
 
 ```bash
 step ca renew --daemon \
-  --exec "systemctl restart agent-iap" \
+  --exec "systemctl reload agent-iap" \
   /etc/agent-iap/fullchain.pem /etc/agent-iap/key.pem
 ```
 
@@ -1571,9 +1589,9 @@ Two things worth knowing before the first restart:
   restarts, and `agent-iap audit verify` spans them.
 
 There is no console: `--no-tui` logs to the journal and an `ask` is answered
-over the control plane (§ Control plane) or denied. It is also what nothing is
-watching the policy file, so a deployment shaped like this reloads on a restart
-rather than on an edit (§ Reloading). A rule set that is entirely
+over the control plane (§ Control plane) or denied. Reloading is not affected —
+the daemon watches its own policy file and answers `SIGHUP` either way
+(§ Reloading), so `systemctl reload` is a reload and not a restart. A rule set that is entirely
 `allow`/`deny` needs no answerer; one that uses `ask` needs something watching,
 or those calls fail closed.
 
@@ -1666,11 +1684,8 @@ every deployment that has not upgraded yet.
 ## Not built yet
 
 Rate limits and spend caps per agent — that is what a fleet sharing one proxy
-wants next, and § Multiple agents says what it costs until then. Reloading is
-done (§ Reloading), with one gap: the *watching* lives in the console, so a
-`--no-tui` deployment has nothing reading the file and still needs a restart or
-a `SIGHUP` this does not handle yet. Also: a decoupled TUI that attaches to an
-already-running daemon over the control plane;
+wants next, and § Multiple agents says what it costs until then. Also: a
+decoupled TUI that attaches to an already-running daemon over the control plane;
 SSE streaming for the HTTP MCP transport (single JSON responses work, `data:`
 frames are parsed, long-lived streams are not); mTLS agent identity, which is
 the missing half of § Workload identity — the token proves what a run may do,

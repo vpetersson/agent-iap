@@ -80,10 +80,11 @@ async fn an_upstream_added_while_the_proxy_is_running_serves_the_next_request() 
 
     // The edit an operator makes mid-session.
     state
-        .reload(policy(
-            &dir.path().join("audit.jsonl"),
-            &format!(
-                r#"
+        .reload(
+            policy(
+                &dir.path().join("audit.jsonl"),
+                &format!(
+                    r#"
 [[upstreams]]
 name = "later"
 base_url = "http://{origin}"
@@ -96,8 +97,10 @@ methods = ["GET"]
 paths = ["/**"]
 action = "allow"
 "#
+                ),
             ),
-        ))
+            agent_iap::reload::Trigger::Asked,
+        )
         .unwrap();
 
     // No restart, no rebind, no reconnect: the same client, the same socket.

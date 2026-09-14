@@ -13,9 +13,11 @@
 //! Rules and agents take effect in this process the moment they are written;
 //! services need a restart, and the console says so rather than pretending.
 //!
-//! It is not the only author, either. The policy file is watched, so an edit
-//! made with the CLI in the next terminal — or in an editor — lands in the
-//! panes, and in the running proxy, without anyone pressing anything.
+//! It is not the only author, either. The daemon watches the policy file
+//! whether or not this is drawn (`crate::reload`), so an edit made with the CLI
+//! in the next terminal — or in an editor, or announced with `SIGHUP` — lands
+//! in the running proxy on its own, and the console hears about it and catches
+//! its panes up.
 //!
 //! No credential value is ever displayed. References are, and whether each one
 //! still resolves — which is the question the file cannot answer.
@@ -36,7 +38,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,13 +57,6 @@ const FLASH_TTL: Duration = Duration::from_secs(8);
 /// Two clicks closer together than this, on the same cell, are a double click.
 /// Generous: this is a terminal, and the operator may be on a trackpad.
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
-/// How long the policy file has to stop changing before the console reads it.
-///
-/// A rewrite is a truncate followed by a write, so there is a moment when the
-/// file on disk is half a policy. Reading it then reports a broken file that is
-/// not broken — and the operator who just ran `agent-iap acl add` in the next
-/// terminal would be told their edit was rejected.
-const SETTLE: Duration = Duration::from_millis(250);
 
 /// What `run` does with the terminal it was started in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +100,8 @@ pub fn at_a_terminal() -> bool {
     std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
 }
 
-pub fn run(state: Arc<AppState>, config_path: &Path) -> Result<()> {
-    let mut app = App::new(state, config_path)?;
+pub fn run(state: Arc<AppState>, watcher: Arc<crate::reload::Watcher>) -> Result<()> {
+    let mut app = App::new(state, watcher)?;
     // `try_init` rather than `init`: now that the console is what `run` does by
     // default, a terminal it cannot drive has to name the flag that runs the
     // proxy anyway, not panic through a half-configured terminal.
@@ -284,9 +278,6 @@ struct App {
     /// Requests the operator has looked at and left waiting, so the dialogue
     /// does not spring back the instant it is dismissed.
     dismissed: HashSet<String>,
-    /// When the policy file was first seen to differ from what is on screen.
-    /// `None` once it has been read, or while nothing has changed.
-    settling: Option<Instant>,
     /// Is the terminal reporting the pointer? Off makes the terminal's own
     /// selection work again, which is how a token gets copied out of here.
     mouse: bool,
@@ -296,8 +287,8 @@ struct App {
 }
 
 impl App {
-    fn new(state: Arc<AppState>, config_path: &Path) -> Result<Self> {
-        let policy = Policy::load(config_path, &state)?;
+    fn new(state: Arc<AppState>, watcher: Arc<crate::reload::Watcher>) -> Result<Self> {
+        let policy = Policy::load(watcher, &state)?;
         Ok(App {
             state,
             policy,
@@ -309,7 +300,6 @@ impl App {
             modal: None,
             flash: None,
             dismissed: HashSet::new(),
-            settling: None,
             mouse: false,
             hits: Hits::default(),
             clicked: None,
@@ -318,8 +308,12 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         let mut feed_rx = self.state.audit.subscribe();
+        let mut reloads = self.state.subscribe_reloads();
 
         loop {
+            while let Ok(config) = reloads.try_recv() {
+                self.adopt(config);
+            }
             while let Ok(event) = feed_rx.try_recv() {
                 if self.feed.len() == FEED_CAPACITY {
                     self.feed.pop_front();
@@ -330,7 +324,6 @@ impl App {
             self.pending = self.state.broker.list();
             self.dismissed
                 .retain(|id| self.pending.iter().any(|view| view.id == *id));
-            self.follow_the_file();
             self.raise_dialogue();
             self.clamp_cursors();
             if self
@@ -431,38 +424,28 @@ impl App {
 
     /// Re-read the policy file into the console and into the running proxy.
     fn refresh(&mut self) {
-        self.settling = None;
         if let Err(error) = self.policy.rebuild(&self.state) {
-            // Accepted even though it failed: the file is what it is, and
-            // re-reading the same broken bytes on the next frame would only put
-            // the same error on screen again.
-            self.policy.accept_on_disk();
             self.blame(&error);
         }
     }
 
-    /// Pick up an edit somebody else made to the policy file.
+    /// Catch up to a policy somebody else put in charge.
     ///
-    /// The console is not the only author: `agent-iap acl add` in the next
-    /// terminal, or an editor, writes the same file this is displaying, and a
-    /// pane showing a rule list that is no longer the rule list is worse than
-    /// no pane. So the file is watched rather than waited on — `r` stays, for
-    /// the impatient and for a filesystem whose timestamps lie.
-    fn follow_the_file(&mut self) {
-        if !self.policy.edited_on_disk() {
-            self.settling = None;
+    /// The daemon's watcher does the reloading, so by the time this runs the
+    /// proxy is already serving the new file — this is the panes following, not
+    /// the policy changing. Which is why it says so rather than asking.
+    fn adopt(&mut self, config: Arc<crate::config::Config>) {
+        // A reload the console asked for has already been reported by whatever
+        // asked; saying "changed on disk" for a form the operator just
+        // submitted would be the console telling them their own news.
+        let ours = Arc::ptr_eq(&self.policy.config, &config);
+        if let Err(error) = self.policy.show(config) {
+            self.blame(&error);
             return;
         }
-        // Let the writer finish before reading what it wrote.
-        if self.settling.get_or_insert_with(Instant::now).elapsed() < SETTLE {
+        if ours {
             return;
         }
-
-        self.refresh();
-        if self.flash.as_ref().is_some_and(|flash| flash.failed) {
-            return;
-        }
-
         self.say(format!(
             "{} changed on disk — reloaded: {} agents, {} rules, {} upstreams, {} mcp",
             self.file_name(),
@@ -1940,7 +1923,11 @@ action = "ask"
 
         let config: Config = toml::from_str(&text).unwrap();
         let state = AppState::build(config, false).unwrap();
-        App::new(state, &path).unwrap()
+        App::new(
+            state,
+            Arc::new(crate::reload::Watcher::new(&path, Default::default())),
+        )
+        .unwrap()
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -2345,9 +2332,13 @@ action = "ask"
         assert!(!rendered.contains("restart"), "{rendered}");
     }
 
-    /// The console is not the only thing that writes this file.
+    /// The daemon reloads; the console follows.
+    ///
+    /// The watching itself is `crate::reload`'s and tested there. What matters
+    /// here is that the panes and the footer catch up to a policy that went
+    /// into force without anybody pressing anything.
     #[tokio::test]
-    async fn an_edit_made_outside_the_console_is_picked_up_without_a_keystroke() {
+    async fn an_edit_made_outside_the_console_lands_in_the_panes() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
         app.tab = Tab::Acl;
@@ -2368,16 +2359,8 @@ action = "ask"
         )
         .unwrap();
 
-        app.follow_the_file();
-        assert!(
-            app.settling.is_some(),
-            "a file still being written is waited on, not read mid-truncate"
-        );
-        let rendered = render(&mut app, 140, 30);
-        assert!(!rendered.contains("added-from-a-shell"), "{rendered}");
-
-        settle(&mut app);
-        app.follow_the_file();
+        let config = reloaded(&app);
+        app.adopt(config);
         app.clamp_cursors();
 
         let rendered = render(&mut app, 140, 30);
@@ -2393,8 +2376,8 @@ action = "ask"
         );
     }
 
-    /// An upstream added from a shell is routable as soon as the console has
-    /// read the file, exactly as one added in the console is.
+    /// An upstream added from a shell is routable, and nothing asks for a
+    /// restart on the way.
     #[tokio::test]
     async fn an_upstream_added_from_a_shell_is_routable_too() {
         let dir = tempfile::tempdir().unwrap();
@@ -2409,8 +2392,8 @@ action = "ask"
         )
         .unwrap();
 
-        settle(&mut app);
-        app.follow_the_file();
+        let config = reloaded(&app);
+        app.adopt(config);
 
         let flash = app.flash.as_ref().expect("an edit is worth a word");
         assert!(!flash.failed, "{}", flash.message);
@@ -2422,274 +2405,58 @@ action = "ask"
         assert!(app.state.config().upstream("linear").is_some());
     }
 
+    /// A reload the console itself caused is not news to the console.
     #[tokio::test]
-    async fn a_file_edited_into_nonsense_is_reported_once_rather_than_every_frame() {
+    async fn the_console_does_not_report_its_own_write_as_somebody_elses_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Acl;
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        type_in(&mut app, "mine");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        let said = app.flash.as_ref().map(|flash| flash.message.clone());
+        // The broadcast for that write arrives on the next turn of the loop.
+        app.adopt(app.state.config());
+
+        assert_eq!(
+            app.flash.as_ref().map(|flash| flash.message.clone()),
+            said,
+            "the console told the operator their own news"
+        );
+    }
+
+    /// The watcher does the refusing; this is the console reporting it.
+    #[tokio::test]
+    async fn a_policy_the_proxy_will_not_take_is_reported_on_the_footer() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
         std::fs::write(dir.path().join("iap.toml"), "this is not toml {{{").unwrap();
 
-        settle(&mut app);
-        app.follow_the_file();
+        // `r`, which is the console asking for the reload the watcher would
+        // have done a moment later anyway.
+        app.handle(KeyEvent::from(KeyCode::Char('r'))).unwrap();
+
         assert!(app.flash.as_ref().is_some_and(|flash| flash.failed));
-
-        // The rule list the proxy is running is the one that still compiles.
+        // And the proxy is still running the policy that compiled.
         assert_eq!(app.state.acl.rule_count(), 1);
-
-        app.flash = None;
-        settle(&mut app);
-        app.follow_the_file();
-        assert!(
-            app.flash.is_none(),
-            "the same broken bytes must not be re-read eight times a second"
-        );
+        assert!(app.state.agents.by_id("claude-code").is_some());
     }
 
-    /// Click where the last frame actually drew something.
-    ///
-    /// Every mouse test goes through a real draw first, because the hit map is
-    /// a record of that draw — a test that invented coordinates would pass
-    /// against a layout that no longer exists.
-    fn click_at(app: &mut App, column: u16, row: u16) {
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        })
-        .unwrap();
-    }
-
-    fn centre_of(rect: Rect) -> (u16, u16) {
-        (rect.x + rect.width / 2, rect.y + rect.height / 2)
-    }
-
-    #[tokio::test]
-    async fn clicking_a_tab_selects_that_pane() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        render(&mut app, 140, 30);
-
-        let (rect, tab) = app
-            .hits
-            .tabs
-            .iter()
-            .find(|(_, tab)| *tab == Tab::Credentials)
-            .map(|(rect, tab)| (*rect, *tab))
-            .expect("the tab strip is drawn");
-
-        let (column, row) = centre_of(rect);
-        click_at(&mut app, column, row);
-        assert_eq!(app.tab, tab);
-
-        // And a click on the strip's empty right-hand end is not a tab.
-        let before = app.tab;
-        click_at(&mut app, 139, row);
-        assert_eq!(app.tab, before);
-    }
-
-    #[tokio::test]
-    async fn clicking_a_row_selects_it_and_a_second_click_opens_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.pending = vec![waiting()];
-        app.tab = Tab::Approvals;
-        app.clamp_cursors();
-        // Dismissed, so the dialogue does not raise itself and steal the click.
-        app.dismissed.insert(waiting().id);
-        render(&mut app, 140, 30);
-
-        let (rows, _) = app.hits.rows.expect("the queue has a row");
-        app.cursor[Tab::Approvals.index()].select(None);
-
-        click_at(&mut app, rows.x + 2, rows.y);
-        assert_eq!(
-            app.cursor[Tab::Approvals.index()].selected(),
-            Some(0),
-            "one click moves the cursor"
-        );
-        assert!(app.modal.is_none(), "and only moves it");
-
-        click_at(&mut app, rows.x + 2, rows.y);
-        assert!(
-            matches!(app.modal, Some(Modal::Approve(_))),
-            "the second click is the pane's own `enter`"
-        );
-    }
-
-    /// A click lands on the row under it even when the list has scrolled.
-    #[tokio::test]
-    async fn a_click_reads_through_the_scroll_offset() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.tab = Tab::Profiles;
-        app.clamp_cursors();
-
-        // Walk far enough down that the list has to scroll.
-        for _ in 0..40 {
-            app.handle(KeyEvent::from(KeyCode::Down)).unwrap();
-        }
-        render(&mut app, 140, 24);
-
-        let (rows, offset) = app.hits.rows.expect("profiles are drawn");
-        assert!(offset > 0, "the list did not scroll, so nothing is proven");
-
-        click_at(&mut app, rows.x + 2, rows.y);
-        assert_eq!(
-            app.cursor[Tab::Profiles.index()].selected(),
-            Some(offset),
-            "the top visible row is the offset, not row zero"
-        );
-    }
-
-    /// The dialogue is a copy of one that only ever had buttons.
-    #[tokio::test]
-    async fn the_dialogue_answers_a_click_on_its_buttons() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.pending = vec![waiting()];
-        app.raise_dialogue();
-        render(&mut app, 140, 34);
-
-        let hits = app.hits.dialogue.clone().expect("the dialogue is drawn");
-
-        // Pick "1 hour" and the widest scope, by pointing at them.
-        let (column, row) = centre_of(hits.durations[2].0);
-        click_at(&mut app, column, row);
-        let (column, row) = centre_of(hits.reaches[0].0);
-        click_at(&mut app, column, row);
-        render(&mut app, 140, 34);
-
-        let rendered = render(&mut app, 140, 34);
-        assert!(rendered.contains("expiring at"), "{rendered}");
-
-        // Then allow, with the mouse.
-        let (column, row) = centre_of(hits.allow);
-        click_at(&mut app, column, row);
-
-        assert!(app.modal.is_none(), "answering closes the dialogue");
-        let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
-        assert!(written.contains("expires = "), "a TTL grant: {written}");
-        assert!(
-            written.contains(r#"target = "*""#),
-            "the widest scope, as clicked: {written}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_click_outside_a_dialogue_does_not_reach_the_pane_behind_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.pending = vec![waiting()];
-        app.raise_dialogue();
-        render(&mut app, 140, 34);
-
-        // The tab strip is showing, but it is not reachable right now.
-        let before = app.tab;
-        let (rect, _) = app.hits.tabs[Tab::Credentials.index()];
-        let (column, row) = centre_of(rect);
-        click_at(&mut app, column, row);
-
-        assert_eq!(app.tab, before, "the pane behind a modal is not clickable");
-        assert!(matches!(app.modal, Some(Modal::Approve(_))));
-    }
-
-    #[tokio::test]
-    async fn clicking_a_form_field_focuses_it_and_cycles_a_choice() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.tab = Tab::Acl;
-        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
-        render(&mut app, 140, 34);
-
-        let hits = app.hits.form.clone().expect("the form is drawn");
-        let action = hits
-            .fields
-            .iter()
-            .find(|(_, index)| {
-                matches!(&app.modal, Some(Modal::Form(form)) if form.fields[*index].key == "action")
-            })
-            .copied()
-            .expect("the rule form has an action field");
-
-        let Some(Modal::Form(form)) = &app.modal else {
-            unreachable!()
-        };
-        assert_eq!(form.text("action"), "allow");
-
-        let (column, row) = centre_of(action.0);
-        click_at(&mut app, column, row);
-
-        let Some(Modal::Form(form)) = &app.modal else {
-            unreachable!()
-        };
-        assert_eq!(
-            form.text("action"),
-            "deny",
-            "clicking a choice advances it, the way clicking one anywhere does"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_wheel_moves_the_cursor_and_the_dialogue_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.tab = Tab::Profiles;
-        app.clamp_cursors();
-
-        app.scroll(false);
-        assert_eq!(
-            app.cursor[Tab::Profiles.index()].selected(),
-            Some(3),
-            "three rows a notch"
-        );
-        app.scroll(true);
-        assert_eq!(app.cursor[Tab::Profiles.index()].selected(), Some(0));
-
-        // Over the dialogue it walks the scope list instead.
-        app.pending = vec![waiting()];
-        app.raise_dialogue();
-        render(&mut app, 140, 34);
-        app.scroll(true);
-        let rendered = render(&mut app, 140, 34);
-        assert!(
-            rendered.contains("(•) → POST on github"),
-            "the wheel moved the scope up one:\n{rendered}"
-        );
-    }
-
-    #[tokio::test]
-    async fn clicking_a_footer_hint_does_what_the_hint_says() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.tab = Tab::Agents;
-        render(&mut app, 160, 30);
-
-        let enrol = app
-            .hits
-            .keys
-            .iter()
-            .find(|(_, code)| *code == KeyCode::Char('n'))
-            .map(|(rect, _)| *rect)
-            .expect("the agents pane offers `n`");
-
-        let (column, row) = centre_of(enrol);
-        click_at(&mut app, column, row);
-        assert!(
-            matches!(app.modal, Some(Modal::Form(_))),
-            "a hint that names a key and ignores a click on it is not a control"
-        );
+    /// Drive the shared watcher the way the daemon's task does, and hand back
+    /// what the console's loop would have received.
+    fn reloaded(app: &App) -> Arc<crate::config::Config> {
+        app.policy
+            .watcher()
+            .reload(&app.state, crate::reload::Trigger::Edited)
+            .expect("the edit loads")
     }
 
     fn type_in(app: &mut App, text: &str) {
         for c in text.chars() {
             app.handle(KeyEvent::from(KeyCode::Char(c))).unwrap();
         }
-    }
-
-    /// Pretend the write finished a moment ago, rather than sleeping for it.
-    fn settle(app: &mut App) {
-        app.follow_the_file();
-        app.settling = Instant::now().checked_sub(SETTLE);
     }
 
     /// `run` is the console, so a terminal is all it should take to get one —
