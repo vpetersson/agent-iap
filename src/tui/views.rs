@@ -67,7 +67,18 @@ impl Table {
         self.rows.len()
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, title: &str, state: &mut ListState) {
+    /// Draw the table, and hand back the rectangle the rows landed in.
+    ///
+    /// The caller needs it to turn a click's row number back into a row of the
+    /// table. Immediate-mode drawing keeps no widget tree to ask afterwards, so
+    /// the drawing is what says where it put things.
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        state: &mut ListState,
+    ) -> Option<Rect> {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {title} ({}) ", self.rows.len()));
@@ -79,7 +90,7 @@ impl Table {
                 Paragraph::new(self.empty).style(Style::default().fg(Color::DarkGray)),
                 inner,
             );
-            return;
+            return None;
         }
 
         // The header belongs over its columns, not on the border: a heading a
@@ -112,6 +123,7 @@ impl Table {
             split[1],
             state,
         );
+        Some(split[1])
     }
 
     /// One row, or the header when there is no row — laid out on the same

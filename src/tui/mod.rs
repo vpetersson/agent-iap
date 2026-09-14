@@ -26,7 +26,10 @@ mod form;
 mod views;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -50,6 +53,9 @@ const FEED_CAPACITY: usize = 200;
 const TICK: Duration = Duration::from_millis(120);
 /// How long a result stays on the footer before the key hints come back.
 const FLASH_TTL: Duration = Duration::from_secs(8);
+/// Two clicks closer together than this, on the same cell, are a double click.
+/// Generous: this is a terminal, and the operator may be on a trackpad.
+const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 /// How long the policy file has to stop changing before the console reads it.
 ///
 /// A rewrite is a truncate followed by a write, so there is a moment when the
@@ -108,9 +114,43 @@ pub fn run(state: Arc<AppState>, config_path: &Path) -> Result<()> {
     let mut terminal = ratatui::try_init().context(
         "opening the approval console — `agent-iap run --no-tui` runs the proxy without it",
     )?;
+    catch_the_mouse();
+    app.mouse = set_mouse(true);
+
     let result = app.event_loop(&mut terminal);
+
+    set_mouse(false);
     ratatui::restore();
     result
+}
+
+/// Turn mouse reporting on or off, reporting whether it took.
+///
+/// A terminal that will not do it is not an error: the console is driven by the
+/// keyboard and always has been, and refusing to open over a missing
+/// convenience would be the wrong trade for the one surface that answers an
+/// `ask`.
+fn set_mouse(on: bool) -> bool {
+    use std::io::stdout;
+    let result = match on {
+        true => crossterm::execute!(stdout(), EnableMouseCapture),
+        false => crossterm::execute!(stdout(), DisableMouseCapture),
+    };
+    result.is_ok() && on
+}
+
+/// Make sure a panic turns mouse reporting back off.
+///
+/// `ratatui::try_init` installs a hook that leaves the alternate screen and
+/// drops raw mode, and knows nothing about the mouse. Without this, a panic
+/// would hand the operator back a shell that prints garbage every time they
+/// move the pointer — and they would have to know to type `reset` blind.
+fn catch_the_mouse() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        set_mouse(false);
+        hook(info);
+    }));
 }
 
 /// The panes, in the order the number keys select them.
@@ -209,6 +249,28 @@ enum Destructive {
     RemoveRule(usize),
 }
 
+/// Where the last frame put everything a pointer can hit.
+///
+/// A terminal reports a click as a row and a column and nothing else, and
+/// immediate-mode drawing keeps no widget tree to ask what is there. So the
+/// draw records what it put where, and the click looks it up. Rebuilt every
+/// frame, which is also what keeps it honest — a hit map that outlived its
+/// frame is a click on something that has moved.
+#[derive(Default)]
+struct Hits {
+    tabs: Vec<(Rect, Tab)>,
+    /// The rows of the current pane, and how far the list is scrolled.
+    rows: Option<(Rect, usize)>,
+    /// Footer hints: the rect, and the key the hint stands for.
+    keys: Vec<(Rect, KeyCode)>,
+    dialogue: Option<approve::Hits>,
+    form: Option<form::Hits>,
+    /// A modal with nothing to aim at — help, a shown token, a confirmation.
+    /// Clicking it dismisses; clicking past it does nothing.
+    plain_modal: Option<Rect>,
+    confirm: Option<(Rect, Rect)>,
+}
+
 struct App {
     state: Arc<AppState>,
     policy: Policy,
@@ -225,6 +287,12 @@ struct App {
     /// When the policy file was first seen to differ from what is on screen.
     /// `None` once it has been read, or while nothing has changed.
     settling: Option<Instant>,
+    /// Is the terminal reporting the pointer? Off makes the terminal's own
+    /// selection work again, which is how a token gets copied out of here.
+    mouse: bool,
+    hits: Hits,
+    /// The last click, for spotting the second one of a pair.
+    clicked: Option<(Instant, u16, u16)>,
 }
 
 impl App {
@@ -242,6 +310,9 @@ impl App {
             flash: None,
             dismissed: HashSet::new(),
             settling: None,
+            mouse: false,
+            hits: Hits::default(),
+            clicked: None,
         })
     }
 
@@ -275,14 +346,14 @@ impl App {
             if !event::poll(TICK)? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if self.handle(key)? {
-                return Ok(());
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if self.handle(key)? {
+                        return Ok(());
+                    }
+                }
+                Event::Mouse(mouse) if self.handle_mouse(mouse)? => return Ok(()),
+                _ => {}
             }
         }
     }
@@ -442,9 +513,178 @@ impl App {
                     self.say("re-read the policy file");
                 }
             }
+            // Reporting the pointer is what stops the terminal's own
+            // selection working, and the one thing an operator most wants to
+            // select out of this screen is a token. So it is a toggle, and it
+            // says which way it went.
+            KeyCode::Char('m') => {
+                self.mouse = set_mouse(!self.mouse);
+                match self.mouse {
+                    true => self.say("mouse on"),
+                    false => self.say(
+                        "mouse off — the terminal's own text selection works again, `m` to \
+                         switch back",
+                    ),
+                }
+            }
             code => self.handle_tab(code),
         }
         Ok(false)
+    }
+
+    // ---- the pointer ------------------------------------------------------
+
+    /// Route a mouse event to whatever was drawn under it.
+    ///
+    /// Everything here ends in the same handlers the keyboard uses. A click
+    /// that could grant something a keystroke could not would be a second
+    /// policy surface, and this console has one job it cannot get wrong.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll(true),
+            MouseEventKind::ScrollDown => self.scroll(false),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let double = self.double_click(at);
+                return self.click(at, double);
+            }
+            // Motion, drags, and the other buttons. A console that acted on a
+            // pointer merely passing over a control would be a console you
+            // could not read without changing something.
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Is this the second click of a pair, on the same cell?
+    fn double_click(&mut self, (column, row): (u16, u16)) -> bool {
+        let double = self
+            .clicked
+            .is_some_and(|(at, x, y)| (x, y) == (column, row) && at.elapsed() < DOUBLE_CLICK);
+        // Cleared on the second, so a third click does not read as a fourth.
+        self.clicked = (!double).then(|| (Instant::now(), column, row));
+        double
+    }
+
+    fn click(&mut self, at: (u16, u16), double: bool) -> Result<bool> {
+        // A modal owns the screen. A click outside it is not a click on what
+        // is showing through behind — that pane is not reachable right now,
+        // and treating it as reachable is how a form gets abandoned by a
+        // misaimed click.
+        // Cloned rather than borrowed: routing a click needs `&mut self`, and
+        // the hit map is a record of the last frame rather than state the
+        // handler is allowed to change.
+        if let Some(hits) = self.hits.dialogue.clone() {
+            self.click_dialogue(at, &hits);
+            return Ok(false);
+        }
+        if let Some(hits) = self.hits.form.clone() {
+            self.click_form(at, &hits);
+            return Ok(false);
+        }
+        if let Some((yes, no)) = self.hits.confirm {
+            if within(yes, at) {
+                self.handle_modal(KeyEvent::from(KeyCode::Char('y')));
+            } else if within(no, at) {
+                self.handle_modal(KeyEvent::from(KeyCode::Char('n')));
+            }
+            return Ok(false);
+        }
+        if let Some(popup) = self.hits.plain_modal {
+            if within(popup, at) {
+                // Anything dismisses these; the keyboard says so too.
+                self.handle_modal(KeyEvent::from(KeyCode::Enter));
+            }
+            return Ok(false);
+        }
+
+        if let Some((_, tab)) = self.hits.tabs.iter().find(|(rect, _)| within(*rect, at)) {
+            self.tab = *tab;
+            return Ok(false);
+        }
+
+        if let Some((_, code)) = self.hits.keys.iter().find(|(rect, _)| within(*rect, at)) {
+            let code = *code;
+            return self.handle(KeyEvent::from(code));
+        }
+
+        if let Some((rows, offset)) = self.hits.rows {
+            if within(rows, at) {
+                let row = offset + (at.1 - rows.y) as usize;
+                if row < self.rows() {
+                    self.cursor[self.tab.index()].select(Some(row));
+                    // A second click is the pane's own `enter`: open the
+                    // dialogue, add the profile. One click only ever moves the
+                    // cursor, which is what makes the first one safe.
+                    if double {
+                        self.handle_tab(KeyCode::Enter);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn click_dialogue(&mut self, at: (u16, u16), hits: &approve::Hits) {
+        if !within(hits.popup, at) {
+            return;
+        }
+        // The buttons go through the same handler the keys do, so a click and
+        // a keystroke cannot grant different things.
+        for (button, key) in [
+            (hits.deny, KeyCode::Char('d')),
+            (hits.allow, KeyCode::Char('a')),
+            (hits.dismiss, KeyCode::Esc),
+        ] {
+            if within(button, at) {
+                self.handle_modal(KeyEvent::from(key));
+                return;
+            }
+        }
+
+        let Some(Modal::Approve(dialogue)) = &mut self.modal else {
+            return;
+        };
+        if let Some((_, index)) = hits.durations.iter().find(|(rect, _)| within(*rect, at)) {
+            dialogue.choose_duration(*index);
+        } else if let Some((_, index)) = hits.reaches.iter().find(|(rect, _)| within(*rect, at)) {
+            dialogue.choose_reach(*index);
+        }
+    }
+
+    fn click_form(&mut self, at: (u16, u16), hits: &form::Hits) {
+        if !within(hits.popup, at) {
+            return;
+        }
+        let Some((_, index)) = hits.fields.iter().find(|(rect, _)| within(*rect, at)) else {
+            return;
+        };
+        let Some(Modal::Form(form)) = &mut self.modal else {
+            return;
+        };
+        form.nudge(*index);
+    }
+
+    /// The wheel. Over a modal it moves that modal's own list; otherwise it
+    /// moves the pane's cursor, which is what scrolls the pane.
+    fn scroll(&mut self, up: bool) {
+        match &mut self.modal {
+            // The wheel moves the scope list, not the duration strip: one is a
+            // list and the other is a row of buttons, and a wheel that walked
+            // sideways through "from now on" would be a hazard.
+            Some(Modal::Approve(dialogue)) => {
+                let key = if up { KeyCode::Up } else { KeyCode::Down };
+                dialogue.handle(KeyEvent::from(key));
+            }
+            Some(Modal::Form(form)) => {
+                let key = if up { KeyCode::BackTab } else { KeyCode::Tab };
+                form.handle(KeyEvent::from(key));
+            }
+            Some(_) => {}
+            // Three rows a notch: one is a wheel that feels broken, and a page
+            // is a wheel that loses your place.
+            None => self.move_cursor(if up { -3 } else { 3 }),
+        }
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -842,6 +1082,10 @@ impl App {
             ])
             .split(frame.area());
 
+        // Rebuilt from scratch: what is on screen now is the only thing a
+        // click can mean.
+        self.hits = Hits::default();
+
         self.draw_header(frame, areas[0]);
         self.draw_tabs(frame, areas[1]);
         self.draw_body(frame, areas[2]);
@@ -849,15 +1093,23 @@ impl App {
         self.draw_footer(frame, areas[4]);
 
         match &self.modal {
-            Some(Modal::Approve(dialogue)) => dialogue.render(frame, frame.area()),
-            Some(Modal::Form(form)) => form.render(frame, frame.area()),
-            Some(Modal::Confirm(confirm)) => draw_confirm(frame, frame.area(), confirm),
+            Some(Modal::Approve(dialogue)) => {
+                self.hits.dialogue = Some(dialogue.render(frame, frame.area()));
+            }
+            Some(Modal::Form(form)) => {
+                self.hits.form = Some(form.render(frame, frame.area()));
+            }
+            Some(Modal::Confirm(confirm)) => {
+                self.hits.confirm = Some(draw_confirm(frame, frame.area(), confirm));
+            }
             Some(Modal::Show {
                 title,
                 body,
                 secret,
-            }) => draw_show(frame, frame.area(), title, body, *secret),
-            Some(Modal::Help) => draw_help(frame, frame.area()),
+            }) => {
+                self.hits.plain_modal = Some(draw_show(frame, frame.area(), title, body, *secret));
+            }
+            Some(Modal::Help) => self.hits.plain_modal = Some(draw_help(frame, frame.area())),
             None => {}
         }
     }
@@ -899,8 +1151,9 @@ impl App {
         );
     }
 
-    fn draw_tabs(&self, frame: &mut Frame, area: Rect) {
+    fn draw_tabs(&mut self, frame: &mut Frame, area: Rect) {
         let mut spans = Vec::new();
+        let mut x = area.x;
         for (index, tab) in Tab::ALL.iter().enumerate() {
             let selected = *tab == self.tab;
             let badge = if *tab == Tab::Approvals && !self.pending.is_empty() {
@@ -908,6 +1161,21 @@ impl App {
             } else {
                 format!(" {}·{} ", index + 1, tab.label())
             };
+            // Measured from the label itself, so the strip and the hit map
+            // cannot disagree about where a tab ends.
+            let width = badge.chars().count() as u16;
+            if x < area.right() {
+                self.hits.tabs.push((
+                    Rect {
+                        x,
+                        y: area.y,
+                        width: width.min(area.right() - x),
+                        height: 1,
+                    },
+                    *tab,
+                ));
+            }
+            x = x.saturating_add(width);
             spans.push(Span::styled(
                 badge,
                 if selected {
@@ -925,19 +1193,20 @@ impl App {
 
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         let index = self.tab.index();
-        match self.tab {
+        let rows = match self.tab {
             Tab::Approvals => {
                 let split = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .split(area);
-                draw_pending(frame, split[0], &self.pending, &mut self.cursor[index]);
+                let rows = draw_pending(frame, split[0], &self.pending, &mut self.cursor[index]);
                 draw_request(
                     frame,
                     split[1],
                     &self.pending,
                     self.cursor[index].selected(),
                 );
+                rows
             }
             Tab::Agents => views::agents(&self.policy.inventory).render(
                 frame,
@@ -962,7 +1231,7 @@ impl App {
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(3), Constraint::Length(1)])
                     .split(area);
-                views::acl(&self.policy.inventory).render(
+                let rows = views::acl(&self.policy.inventory).render(
                     frame,
                     split[0],
                     "acl — match order, first match wins",
@@ -976,13 +1245,14 @@ impl App {
                     .style(Style::default().fg(Color::DarkGray)),
                     split[1],
                 );
+                rows
             }
             Tab::Credentials => {
                 let split = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(3), Constraint::Length(1)])
                     .split(area);
-                views::credentials(&self.policy.credentials).render(
+                let rows = views::credentials(&self.policy.credentials).render(
                     frame,
                     split[0],
                     "credentials",
@@ -995,13 +1265,14 @@ impl App {
                     .style(Style::default().fg(Color::DarkGray)),
                     split[1],
                 );
+                rows
             }
             Tab::Profiles => {
                 let split = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                     .split(area);
-                views::profiles(&self.profiles).render(
+                let rows = views::profiles(&self.profiles).render(
                     frame,
                     split[0],
                     "profiles",
@@ -1014,8 +1285,13 @@ impl App {
                         .selected()
                         .and_then(|at| self.profiles.get(at)),
                 );
+                rows
             }
-        }
+        };
+
+        // The offset is what turns a click's row into a row of the list once
+        // the list has been scrolled past the top.
+        self.hits.rows = rows.map(|rows| (rows, self.cursor[index].offset()));
     }
 
     fn draw_feed(&self, frame: &mut Frame, area: Rect) {
@@ -1083,7 +1359,7 @@ impl App {
         );
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
         if let Some(flash) = &self.flash {
             let style = if flash.failed {
                 Style::default().fg(Color::Red)
@@ -1106,8 +1382,29 @@ impl App {
         keys.push(("?", "help"));
         keys.push(("q", "quit"));
 
+        // The hints are also buttons. A footer that names the key for a thing
+        // and then ignores a click on it is a footer that looks like a control
+        // and is not one.
+        let inner = block_inner(area);
+        let mut x = inner.x;
         let mut spans = Vec::new();
         for (key, description) in keys {
+            let width = (key.chars().count() + description.chars().count() + 4) as u16;
+            if let Some(code) = hint_key(key) {
+                if x < inner.right() {
+                    self.hits.keys.push((
+                        Rect {
+                            x,
+                            y: inner.y,
+                            width: width.min(inner.right() - x),
+                            height: 1,
+                        },
+                        code,
+                    ));
+                }
+            }
+            x = x.saturating_add(width);
+
             spans.push(Span::styled(
                 format!(" {key} "),
                 Style::default()
@@ -1124,7 +1421,38 @@ impl App {
     }
 }
 
-fn draw_pending(frame: &mut Frame, area: Rect, pending: &[PendingView], state: &mut ListState) {
+/// The key a footer hint stands for, where it stands for a single one. `↑/↓`
+/// and `tab` are directions rather than commands, and have nothing to click.
+fn hint_key(hint: &str) -> Option<KeyCode> {
+    match hint {
+        "enter" => Some(KeyCode::Enter),
+        "↑/↓" | "tab" => None,
+        other => {
+            let mut chars = other.chars();
+            match (chars.next(), chars.next()) {
+                (Some(only), None) => Some(KeyCode::Char(only)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Is this cell inside that rectangle?
+fn within(rect: Rect, (column, row): (u16, u16)) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && column >= rect.x
+        && column < rect.right()
+        && row >= rect.y
+        && row < rect.bottom()
+}
+
+fn draw_pending(
+    frame: &mut Frame,
+    area: Rect,
+    pending: &[PendingView],
+    state: &mut ListState,
+) -> Option<Rect> {
     let items: Vec<ListItem> = pending
         .iter()
         .map(|view| {
@@ -1158,6 +1486,12 @@ fn draw_pending(frame: &mut Frame, area: Rect, pending: &[PendingView], state: &
         area,
         state,
     );
+    (!pending.is_empty()).then(|| block_inner(area))
+}
+
+/// The area inside a single-line border.
+fn block_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
 }
 
 fn draw_request(frame: &mut Frame, area: Rect, pending: &[PendingView], selected: Option<usize>) {
@@ -1262,7 +1596,8 @@ fn draw_profile(frame: &mut Frame, area: Rect, profile: Option<&Profile>) {
     );
 }
 
-fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
+/// Draw the confirmation, and hand back where `y` and `n` landed.
+fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect) {
     let popup = form::centred(area, 70.min(area.width), 11.min(area.height));
     frame.render_widget(Clear, popup);
 
@@ -1305,17 +1640,36 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
     ]));
 
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
-                .title(" confirm "),
-        ),
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" confirm "),
+            ),
         popup,
     );
+
+    // The buttons are the last line drawn, and `y` and `n` sit on it in that
+    // order — measured from the same strings above.
+    let row = popup.y + lines.len() as u16;
+    let yes = Rect {
+        x: popup.x + 1,
+        y: row,
+        width: 11.min(popup.width.saturating_sub(1)),
+        height: 1,
+    };
+    let no = Rect {
+        x: yes.right(),
+        y: row,
+        width: 20.min(popup.right().saturating_sub(yes.right())),
+        height: 1,
+    };
+    (yes, no)
 }
 
-fn draw_show(frame: &mut Frame, area: Rect, title: &str, body: &str, secret: bool) {
+fn draw_show(frame: &mut Frame, area: Rect, title: &str, body: &str, secret: bool) -> Rect {
     let height = (body.lines().count() as u16 + 8).min(area.height);
     let popup = form::centred(area, 80.min(area.width), height);
     frame.render_widget(Clear, popup);
@@ -1349,14 +1703,18 @@ fn draw_show(frame: &mut Frame, area: Rect, title: &str, body: &str, secret: boo
         ),
         popup,
     );
+    popup
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
     let popup = form::centred(area, 72.min(area.width), 22.min(area.height));
     frame.render_widget(Clear, popup);
 
     let mut lines = vec![Line::raw("")];
     for (keys, what) in [
+        ("click", "a tab, a row, a button, a footer hint"),
+        ("double-click", "a row — the same as `enter` on it"),
+        ("wheel", "scroll the pane, or the list in a dialogue"),
         ("1…7 / tab", "move between panes"),
         ("↑ ↓ / j k", "move within one"),
         ("n", "add — agent, upstream, MCP server, rule"),
@@ -1367,6 +1725,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("a / d", "allow or deny the selected request, once"),
         ("f", "forget every standing answer"),
         ("r", "re-read the policy file now — it is watched anyway"),
+        ("m", "pointer off, for the terminal's own text selection"),
         ("q", "quit — which stops the proxy"),
     ] {
         lines.push(Line::from(vec![
@@ -1392,6 +1751,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         popup,
     );
+    popup
 }
 
 // ---- the forms, one per enrolment command ---------------------------------
@@ -2081,6 +2441,242 @@ action = "ask"
         assert!(
             app.flash.is_none(),
             "the same broken bytes must not be re-read eight times a second"
+        );
+    }
+
+    /// Click where the last frame actually drew something.
+    ///
+    /// Every mouse test goes through a real draw first, because the hit map is
+    /// a record of that draw — a test that invented coordinates would pass
+    /// against a layout that no longer exists.
+    fn click_at(app: &mut App, column: u16, row: u16) {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+        .unwrap();
+    }
+
+    fn centre_of(rect: Rect) -> (u16, u16) {
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    #[tokio::test]
+    async fn clicking_a_tab_selects_that_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        render(&mut app, 140, 30);
+
+        let (rect, tab) = app
+            .hits
+            .tabs
+            .iter()
+            .find(|(_, tab)| *tab == Tab::Credentials)
+            .map(|(rect, tab)| (*rect, *tab))
+            .expect("the tab strip is drawn");
+
+        let (column, row) = centre_of(rect);
+        click_at(&mut app, column, row);
+        assert_eq!(app.tab, tab);
+
+        // And a click on the strip's empty right-hand end is not a tab.
+        let before = app.tab;
+        click_at(&mut app, 139, row);
+        assert_eq!(app.tab, before);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_row_selects_it_and_a_second_click_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.pending = vec![waiting()];
+        app.tab = Tab::Approvals;
+        app.clamp_cursors();
+        // Dismissed, so the dialogue does not raise itself and steal the click.
+        app.dismissed.insert(waiting().id);
+        render(&mut app, 140, 30);
+
+        let (rows, _) = app.hits.rows.expect("the queue has a row");
+        app.cursor[Tab::Approvals.index()].select(None);
+
+        click_at(&mut app, rows.x + 2, rows.y);
+        assert_eq!(
+            app.cursor[Tab::Approvals.index()].selected(),
+            Some(0),
+            "one click moves the cursor"
+        );
+        assert!(app.modal.is_none(), "and only moves it");
+
+        click_at(&mut app, rows.x + 2, rows.y);
+        assert!(
+            matches!(app.modal, Some(Modal::Approve(_))),
+            "the second click is the pane's own `enter`"
+        );
+    }
+
+    /// A click lands on the row under it even when the list has scrolled.
+    #[tokio::test]
+    async fn a_click_reads_through_the_scroll_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Profiles;
+        app.clamp_cursors();
+
+        // Walk far enough down that the list has to scroll.
+        for _ in 0..40 {
+            app.handle(KeyEvent::from(KeyCode::Down)).unwrap();
+        }
+        render(&mut app, 140, 24);
+
+        let (rows, offset) = app.hits.rows.expect("profiles are drawn");
+        assert!(offset > 0, "the list did not scroll, so nothing is proven");
+
+        click_at(&mut app, rows.x + 2, rows.y);
+        assert_eq!(
+            app.cursor[Tab::Profiles.index()].selected(),
+            Some(offset),
+            "the top visible row is the offset, not row zero"
+        );
+    }
+
+    /// The dialogue is a copy of one that only ever had buttons.
+    #[tokio::test]
+    async fn the_dialogue_answers_a_click_on_its_buttons() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.pending = vec![waiting()];
+        app.raise_dialogue();
+        render(&mut app, 140, 34);
+
+        let hits = app.hits.dialogue.clone().expect("the dialogue is drawn");
+
+        // Pick "1 hour" and the widest scope, by pointing at them.
+        let (column, row) = centre_of(hits.durations[2].0);
+        click_at(&mut app, column, row);
+        let (column, row) = centre_of(hits.reaches[0].0);
+        click_at(&mut app, column, row);
+        render(&mut app, 140, 34);
+
+        let rendered = render(&mut app, 140, 34);
+        assert!(rendered.contains("expiring at"), "{rendered}");
+
+        // Then allow, with the mouse.
+        let (column, row) = centre_of(hits.allow);
+        click_at(&mut app, column, row);
+
+        assert!(app.modal.is_none(), "answering closes the dialogue");
+        let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
+        assert!(written.contains("expires = "), "a TTL grant: {written}");
+        assert!(
+            written.contains(r#"target = "*""#),
+            "the widest scope, as clicked: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_click_outside_a_dialogue_does_not_reach_the_pane_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.pending = vec![waiting()];
+        app.raise_dialogue();
+        render(&mut app, 140, 34);
+
+        // The tab strip is showing, but it is not reachable right now.
+        let before = app.tab;
+        let (rect, _) = app.hits.tabs[Tab::Credentials.index()];
+        let (column, row) = centre_of(rect);
+        click_at(&mut app, column, row);
+
+        assert_eq!(app.tab, before, "the pane behind a modal is not clickable");
+        assert!(matches!(app.modal, Some(Modal::Approve(_))));
+    }
+
+    #[tokio::test]
+    async fn clicking_a_form_field_focuses_it_and_cycles_a_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Acl;
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        render(&mut app, 140, 34);
+
+        let hits = app.hits.form.clone().expect("the form is drawn");
+        let action = hits
+            .fields
+            .iter()
+            .find(|(_, index)| {
+                matches!(&app.modal, Some(Modal::Form(form)) if form.fields[*index].key == "action")
+            })
+            .copied()
+            .expect("the rule form has an action field");
+
+        let Some(Modal::Form(form)) = &app.modal else {
+            unreachable!()
+        };
+        assert_eq!(form.text("action"), "allow");
+
+        let (column, row) = centre_of(action.0);
+        click_at(&mut app, column, row);
+
+        let Some(Modal::Form(form)) = &app.modal else {
+            unreachable!()
+        };
+        assert_eq!(
+            form.text("action"),
+            "deny",
+            "clicking a choice advances it, the way clicking one anywhere does"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wheel_moves_the_cursor_and_the_dialogue_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Profiles;
+        app.clamp_cursors();
+
+        app.scroll(false);
+        assert_eq!(
+            app.cursor[Tab::Profiles.index()].selected(),
+            Some(3),
+            "three rows a notch"
+        );
+        app.scroll(true);
+        assert_eq!(app.cursor[Tab::Profiles.index()].selected(), Some(0));
+
+        // Over the dialogue it walks the scope list instead.
+        app.pending = vec![waiting()];
+        app.raise_dialogue();
+        render(&mut app, 140, 34);
+        app.scroll(true);
+        let rendered = render(&mut app, 140, 34);
+        assert!(
+            rendered.contains("(•) → POST on github"),
+            "the wheel moved the scope up one:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_a_footer_hint_does_what_the_hint_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Agents;
+        render(&mut app, 160, 30);
+
+        let enrol = app
+            .hits
+            .keys
+            .iter()
+            .find(|(_, code)| *code == KeyCode::Char('n'))
+            .map(|(rect, _)| *rect)
+            .expect("the agents pane offers `n`");
+
+        let (column, row) = centre_of(enrol);
+        click_at(&mut app, column, row);
+        assert!(
+            matches!(app.modal, Some(Modal::Form(_))),
+            "a hint that names a key and ignores a click on it is not a control"
         );
     }
 

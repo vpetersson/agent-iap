@@ -196,6 +196,23 @@ pub enum Answer {
     },
 }
 
+/// Where the dialogue drew the things a mouse can hit.
+///
+/// This dialogue is the one place in the console where pointing at the thing
+/// you mean is the native idiom — it is a copy of a dialogue that only ever had
+/// buttons — so its controls are recorded precisely rather than approximated by
+/// the row they happen to be on.
+#[derive(Default, Clone)]
+pub struct Hits {
+    /// The whole dialogue. A click outside it belongs to nothing.
+    pub popup: Rect,
+    pub durations: Vec<(Rect, usize)>,
+    pub reaches: Vec<(Rect, usize)>,
+    pub deny: Rect,
+    pub allow: Rect,
+    pub dismiss: Rect,
+}
+
 pub struct Dialogue {
     pub view: PendingView,
     reaches: Vec<Reach>,
@@ -237,6 +254,20 @@ impl Dialogue {
             _ => {}
         }
         None
+    }
+
+    /// Pick a duration by position — what a click on a segment means.
+    pub fn choose_duration(&mut self, index: usize) {
+        if index < Duration::ALL.len() {
+            self.duration = index;
+        }
+    }
+
+    /// Pick a reach by position — what a click on a radio row means.
+    pub fn choose_reach(&mut self, index: usize) {
+        if index < self.reaches.len() {
+            self.reach = index;
+        }
     }
 
     fn answer(&self, verdict: Verdict) -> Answer {
@@ -286,7 +317,7 @@ impl Dialogue {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect) -> Hits {
         let width = 76.min(area.width.saturating_sub(4));
         let height = (self.reaches.len() as u16 + 15).min(area.height);
         let popup = centred(area, width, height);
@@ -324,6 +355,30 @@ impl Dialogue {
         );
         frame.render_widget(Paragraph::new(self.durations()), rows[1]);
         frame.render_widget(Paragraph::new(self.options()), rows[2]);
+
+        let mut hits = Hits {
+            popup,
+            // The strip is drawn on the second of the two lines this row holds.
+            durations: self.duration_hits(Rect {
+                y: rows[1].y.saturating_add(1),
+                height: 1,
+                ..rows[1]
+            }),
+            // One radio per line, from the top of the options block.
+            reaches: (0..self.reaches.len())
+                .map(|index| {
+                    (
+                        Rect {
+                            y: rows[2].y.saturating_add(index as u16),
+                            height: 1,
+                            ..rows[2]
+                        },
+                        index,
+                    )
+                })
+                .collect(),
+            ..Hits::default()
+        };
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw(""),
@@ -336,6 +391,51 @@ impl Dialogue {
             rows[3],
         );
         frame.render_widget(Paragraph::new(self.buttons()), rows[4]);
+
+        // The button row, carved up the way `buttons()` lays it out. Widths
+        // taken from the same strings, so the two cannot drift.
+        let mut x = rows[4].x.saturating_add(4);
+        for (label, slot) in [
+            (" d  Deny    ", &mut hits.deny),
+            (" a  Allow    ", &mut hits.allow),
+            (" esc  leave it waiting", &mut hits.dismiss),
+        ] {
+            let width = label.chars().count() as u16;
+            *slot = Rect {
+                x,
+                y: rows[4].y,
+                width: width.min(rows[4].right().saturating_sub(x)),
+                height: 1,
+            };
+            x = x.saturating_add(width);
+        }
+
+        hits
+    }
+
+    /// Where each duration segment landed, measured from the same labels the
+    /// strip is drawn from.
+    fn duration_hits(&self, row: Rect) -> Vec<(Rect, usize)> {
+        let mut x = row.x.saturating_add(4);
+        let mut hits = Vec::new();
+        for (index, duration) in Duration::ALL.iter().enumerate() {
+            // `format!(" {label} ")` and then a space, exactly as `durations()`.
+            let width = duration.label().chars().count() as u16 + 3;
+            if x >= row.right() {
+                break;
+            }
+            hits.push((
+                Rect {
+                    x,
+                    y: row.y,
+                    width: width.min(row.right() - x),
+                    height: 1,
+                },
+                index,
+            ));
+            x = x.saturating_add(width);
+        }
+        hits
     }
 
     fn headline(&self) -> Vec<Line<'_>> {

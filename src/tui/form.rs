@@ -101,6 +101,14 @@ impl Field {
     }
 }
 
+/// Where the form drew the things a mouse can hit.
+#[derive(Clone)]
+pub struct Hits {
+    /// The whole dialogue, so a click outside it can be told from one inside.
+    pub popup: Rect,
+    pub fields: Vec<(Rect, usize)>,
+}
+
 /// What the event loop should do with the form after a keystroke.
 pub enum Outcome {
     Continue,
@@ -304,7 +312,28 @@ impl Form {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    /// Put the cursor on a field by index, ignoring one that is not on screen.
+    pub fn focus(&mut self, index: usize) {
+        if self.visible().contains(&index) {
+            self.focus = index;
+        }
+    }
+
+    /// Advance a `Choice` field, for a click on the value itself. A text field
+    /// is only focused — clicking into a word should not retype it.
+    pub fn nudge(&mut self, index: usize) {
+        self.focus(index);
+        if matches!(
+            self.fields.get(index).map(|f| &f.value),
+            Some(Value::Choice { .. })
+        ) {
+            self.edit(KeyCode::Right);
+        }
+    }
+
+    /// Draw the form, and hand back where each visible field landed so a click
+    /// can be turned back into the field it hit.
+    pub fn render(&self, frame: &mut Frame, area: Rect) -> Hits {
         let visible = self.visible();
         let height = (visible.len() as u16 + 8).min(area.height.saturating_sub(2));
         let width = 78.min(area.width.saturating_sub(4));
@@ -343,9 +372,25 @@ impl Form {
             .max()
             .unwrap_or(0);
 
+        let mut hits = Hits {
+            popup,
+            fields: Vec::new(),
+        };
         let lines: Vec<Line> = visible
             .iter()
-            .map(|index| {
+            .enumerate()
+            .map(|(row, index)| {
+                // One field per line, in order, starting at the top of the
+                // field block — which is what makes the mapping back this
+                // simple.
+                hits.fields.push((
+                    Rect {
+                        y: rows[1].y.saturating_add(row as u16),
+                        height: 1,
+                        ..rows[1]
+                    },
+                    *index,
+                ));
                 let field = &self.fields[*index];
                 let focused = *index == self.focus;
                 let value = field.rendered();
@@ -404,6 +449,8 @@ impl Form {
             .style(Style::default().fg(Color::DarkGray)),
             rows[3],
         );
+
+        hits
     }
 }
 

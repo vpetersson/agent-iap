@@ -585,7 +585,9 @@ is may this agent do this much, for how long.
 ```
 
 `←`/`→` picks how long, `↑`/`↓` picks how far, and the line above the buttons
-says what the pair of them will actually do. The durations are four different
+says what the pair of them will actually do. All of it is clickable — the
+segments, the radio rows, and Deny and Allow — which is how the dialogue this
+copies was always driven. The durations are four different
 mechanisms:
 
 - **Once** answers this request. The next identical call asks again.
@@ -628,6 +630,19 @@ from a shell is a form here, over the same functions with the same validation:
 | acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
+
+It answers the mouse, too. Click a tab to change pane, a row to select it,
+twice to open it — the same thing `enter` does there. The wheel scrolls the
+pane, and the scope list when the dialogue is up. The footer's key hints are
+buttons: if it names a key, clicking it presses that key. Every one of these
+ends in the handler the keyboard uses, because a click that could grant
+something a keystroke could not would be a second policy surface on the one
+screen that cannot afford one.
+
+Reporting the pointer is what stops the terminal's own text selection working,
+and the thing most worth selecting off this screen is a token. So `m` turns it
+off and back on, and most terminals will also let you hold ⇧ to select through
+it.
 
 `?` lists the keys, and `q` quits the console and stops the proxy with it. `r`
 re-reads the policy file, though it rarely has to: the file is watched, so an
