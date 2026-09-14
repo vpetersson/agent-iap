@@ -140,30 +140,32 @@ action = "allow"
     let config: Config = toml::from_str(&config_text).unwrap();
     config.validate().unwrap();
     let state = AppState::build(config, false).unwrap();
-    let loaded = ServerTls::load(&state.config.server, &state.resolver).unwrap();
+    let loaded = ServerTls::load(&state.config().server, &state.resolver).unwrap();
     state.log_startup().unwrap();
     assert_eq!(loaded.proxy_scheme(), "https");
     assert_eq!(loaded.admin_scheme(), "https");
 
-    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let proxy = proxy_listener.local_addr().unwrap();
-    let serving = tls::serve(
-        proxy_listener,
-        agent_iap::proxy::router(Arc::clone(&state)),
-        loaded.proxy,
-    )
-    .unwrap();
-    tokio::spawn(serving);
-
-    let admin_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let admin = admin_listener.local_addr().unwrap();
-    let serving = tls::serve(
-        admin_listener,
-        agent_iap::admin::router(Arc::clone(&state)),
-        loaded.admin,
-    )
-    .unwrap();
-    tokio::spawn(serving);
+    let any = "127.0.0.1:0".parse().unwrap();
+    // Leaked on purpose: the harness hands back the addresses and the listeners
+    // have to outlive it, for as long as the test is talking to them.
+    let proxy = Box::leak(Box::new(
+        tls::Listener::bind(
+            any,
+            agent_iap::proxy::router(Arc::clone(&state)),
+            loaded.proxy,
+        )
+        .unwrap(),
+    ))
+    .addr;
+    let admin = Box::leak(Box::new(
+        tls::Listener::bind(
+            any,
+            agent_iap::admin::router(Arc::clone(&state)),
+            loaded.admin,
+        )
+        .unwrap(),
+    ))
+    .addr;
 
     Harness {
         proxy,
@@ -394,7 +396,7 @@ action = "deny"
     let state = AppState::build(config, false).unwrap();
     let error = format!(
         "{:#}",
-        ServerTls::load(&state.config.server, &state.resolver).unwrap_err()
+        ServerTls::load(&state.config().server, &state.resolver).unwrap_err()
     );
     assert!(error.contains("do not go together"), "{error}");
     assert!(error.contains("server.tls"), "{error}");
@@ -437,16 +439,15 @@ fn ca_signed() -> (String, String, String) {
 
 /// Serve `/health` over TLS on a fresh loopback port, the way `run` does.
 fn spawn_https(certificate: &str, key: &str) -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let serving = tls::serve(
-        listener,
-        Router::new().route("/health", axum::routing::get(|| async { "ok" })),
-        Some(tls::build(certificate, key).unwrap()),
-    )
-    .unwrap();
-    tokio::spawn(serving);
-    addr
+    Box::leak(Box::new(
+        tls::Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Router::new().route("/health", axum::routing::get(|| async { "ok" })),
+            Some(tls::build(certificate, key).unwrap()),
+        )
+        .unwrap(),
+    ))
+    .addr
 }
 
 #[tokio::test]

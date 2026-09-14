@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use globset::GlobMatcher;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -347,8 +347,11 @@ impl WorkloadError {
 
 /// The mint, the ledger, and the verifier. One per process.
 pub struct WorkloadIssuer {
-    mode: WorkloadMode,
-    lifetime: u64,
+    /// Replaceable while running. The signing key is not: rotating it would
+    /// invalidate every token this process has already handed out, which is a
+    /// fleet-wide outage rather than a config change.
+    mode: RwLock<WorkloadMode>,
+    lifetime: RwLock<u64>,
     /// `aud`: random per process, so a token cannot outlive the instance that
     /// signed it even if the key somehow could.
     instance: String,
@@ -361,8 +364,8 @@ pub struct WorkloadIssuer {
 impl std::fmt::Debug for WorkloadIssuer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkloadIssuer")
-            .field("mode", &self.mode)
-            .field("lifetime", &self.lifetime)
+            .field("mode", &self.mode())
+            .field("lifetime", &self.lifetime_secs())
             .field("instance", &self.instance)
             .field("kid", &self.kid)
             .finish_non_exhaustive()
@@ -382,10 +385,12 @@ impl WorkloadIssuer {
         let public = key.public_key().as_ref().to_vec();
 
         Ok(WorkloadIssuer {
-            mode: config.mode,
-            lifetime: config
-                .lifetime_secs
-                .clamp(MIN_WORKLOAD_LIFETIME_SECS, MAX_WORKLOAD_LIFETIME_SECS),
+            mode: RwLock::new(config.mode),
+            lifetime: RwLock::new(
+                config
+                    .lifetime_secs
+                    .clamp(MIN_WORKLOAD_LIFETIME_SECS, MAX_WORKLOAD_LIFETIME_SECS),
+            ),
             instance: uuid::Uuid::new_v4().to_string(),
             kid: hex::encode(&Sha256::digest(&public)[..8]),
             key,
@@ -395,11 +400,20 @@ impl WorkloadIssuer {
     }
 
     pub fn mode(&self) -> WorkloadMode {
-        self.mode
+        *self.mode.read()
     }
 
     pub fn lifetime_secs(&self) -> u64 {
-        self.lifetime
+        *self.lifetime.read()
+    }
+
+    /// Adopt an edited `[server.workload_identity]`. Tokens already minted keep
+    /// the lifetime they were minted with; this governs the next one.
+    pub fn reconfigure(&self, config: &WorkloadIdentityConfig) {
+        *self.mode.write() = config.mode;
+        *self.lifetime.write() = config
+            .lifetime_secs
+            .clamp(MIN_WORKLOAD_LIFETIME_SECS, MAX_WORKLOAD_LIFETIME_SECS);
     }
 
     pub fn key_id(&self) -> &str {
@@ -425,7 +439,7 @@ impl WorkloadIssuer {
         scope: Scope,
         lifetime_secs: Option<u64>,
     ) -> Result<Minted, WorkloadError> {
-        if !self.mode.enabled() {
+        if !self.mode().enabled() {
             return Err(WorkloadError::Disabled);
         }
         if scope.grants().is_empty() {
@@ -454,7 +468,7 @@ impl WorkloadIssuer {
         scope: Option<Scope>,
         lifetime_secs: Option<u64>,
     ) -> Result<Minted, WorkloadError> {
-        if !self.mode.enabled() {
+        if !self.mode().enabled() {
             return Err(WorkloadError::Disabled);
         }
         let scope = match scope {
@@ -493,8 +507,8 @@ impl WorkloadIssuer {
             // Asking for less than the policy allows is the whole idea, so it is
             // honoured; asking for more silently gets the policy's answer rather
             // than an error, because the ceiling is not the caller's business.
-            Some(asked) => asked.clamp(MIN_WORKLOAD_LIFETIME_SECS, self.lifetime),
-            None => self.lifetime,
+            Some(asked) => asked.clamp(MIN_WORKLOAD_LIFETIME_SECS, self.lifetime_secs()),
+            None => self.lifetime_secs(),
         };
 
         let issued_at = now();

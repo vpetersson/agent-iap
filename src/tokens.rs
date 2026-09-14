@@ -335,8 +335,9 @@ fn compile_scope(
     grants: Vec<Grant>,
 ) -> Result<Scope, WorkloadError> {
     for grant in &grants {
-        let upstream = state.config.upstream(&grant.target).is_some();
-        let mcp = state.config.mcp_server(&grant.target).is_some();
+        let config = state.config();
+        let upstream = config.upstream(&grant.target).is_some();
+        let mcp = config.mcp_server(&grant.target).is_some();
         if !upstream && !mcp {
             return Err(WorkloadError::BadRequest(format!(
                 "`{}` is not a configured upstream or MCP server",

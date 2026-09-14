@@ -136,12 +136,13 @@ struct StatusBody {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Response {
+    let config = state.config();
     Json(StatusBody {
         version: env!("CARGO_PKG_VERSION"),
-        listen: state.config.server.listen.to_string(),
+        listen: config.server.listen.to_string(),
         agents: state.agents.len(),
-        upstreams: state.config.upstreams.len(),
-        mcp_servers: state.config.mcp_servers.len(),
+        upstreams: config.upstreams.len(),
+        mcp_servers: config.mcp_servers.len(),
         acl_rules: state.acl.rule_count(),
         acl_default: state.acl.default_action().to_string(),
         pending: state.broker.pending_count(),
@@ -192,7 +193,7 @@ async fn events(
         .unwrap_or(50)
         .min(1000);
 
-    match std::fs::read_to_string(&state.config.audit.path) {
+    match std::fs::read_to_string(state.audit.path()) {
         Ok(text) => {
             let lines: Vec<serde_json::Value> = text
                 .lines()

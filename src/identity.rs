@@ -47,6 +47,10 @@ struct Enrolled {
     by_id: HashMap<String, Arc<AgentConfig>>,
 }
 
+/// A roster that has enrolled cleanly, waiting to be put in charge.
+#[derive(Debug)]
+pub struct Prepared(Enrolled);
+
 #[derive(Debug)]
 pub struct AgentRegistry {
     enrolled: RwLock<Enrolled>,
@@ -60,15 +64,25 @@ impl AgentRegistry {
         })
     }
 
+    /// Enrol a config's agents without putting them in charge.
+    ///
+    /// The fallible half of a reload, separated so a caller swapping the rules
+    /// and the roster together can find out both are good before either is
+    /// live. See `Acl::prepare`.
+    pub fn prepare(config: &Config, resolver: &SecretResolver) -> Result<Prepared> {
+        Ok(Prepared(enrol(config, resolver)?))
+    }
+
+    /// Put a prepared roster in charge. Infallible, and both lookups at once.
+    pub fn install(&self, prepared: Prepared) {
+        *self.enrolled.write() = prepared.0;
+    }
+
     /// Re-enrol from a policy file that has been edited since startup — the
     /// console mints a token and the agent holding it must be able to call
     /// immediately, not after a restart.
-    ///
-    /// Resolved first and swapped second, so a file that no longer enrols
-    /// cleanly leaves the running proxy on the agents it already knows.
     pub fn reload(&self, config: &Config, resolver: &SecretResolver) -> Result<()> {
-        let enrolled = enrol(config, resolver)?;
-        *self.enrolled.write() = enrolled;
+        self.install(AgentRegistry::prepare(config, resolver)?);
         Ok(())
     }
 

@@ -156,7 +156,10 @@ pub struct ApprovalBroker {
     console_attached: AtomicBool,
     last_poll: Mutex<Option<Instant>>,
     changes: broadcast::Sender<()>,
-    timeout: Duration,
+    /// How long a parked request waits. Editable while running, because the
+    /// operator who discovers it is too short is the one currently watching a
+    /// request time out.
+    timeout: Mutex<Duration>,
 }
 
 impl ApprovalBroker {
@@ -168,8 +171,15 @@ impl ApprovalBroker {
             console_attached: AtomicBool::new(false),
             last_poll: Mutex::new(None),
             changes,
-            timeout,
+            timeout: Mutex::new(timeout),
         }
+    }
+
+    /// Adopt an edited `approval_timeout_secs`. Requests already parked keep
+    /// the deadline they were parked with — a timeout that moves under a
+    /// request in flight is a request nobody can reason about.
+    pub fn set_timeout(&self, timeout: Duration) {
+        *self.timeout.lock() = timeout;
     }
 
     /// Declare that the interactive console is running.
@@ -224,7 +234,8 @@ impl ApprovalBroker {
         );
         let _ = self.changes.send(());
 
-        let outcome = match tokio::time::timeout(self.timeout, receiver).await {
+        let timeout = *self.timeout.lock();
+        let outcome = match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(verdict)) => Outcome::Decided(verdict),
             // Sender dropped: the queue was cleared out from under us. Fail closed.
             Ok(Err(_)) => Outcome::TimedOut,

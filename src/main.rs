@@ -14,7 +14,7 @@ use agent_iap::mcp;
 use agent_iap::profiles;
 use agent_iap::state::AppState;
 use agent_iap::stdio;
-use agent_iap::tls::{self, ServerTls};
+use agent_iap::tls::{self, Listener, ServerTls};
 use agent_iap::tui::{self, Console};
 
 #[derive(Parser)]
@@ -890,7 +890,7 @@ async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<(
     // Before anything binds. The secrets are already warm from `AppState`; this
     // is where a malformed certificate, or a key that belongs to a different
     // one, stops the process instead of becoming a failed handshake later.
-    let tls = ServerTls::load(&state.config.server, &state.resolver)?;
+    let tls = ServerTls::load(&state.config().server, &state.resolver)?;
     let (proxy_scheme, admin_scheme) = (tls.proxy_scheme(), tls.admin_scheme());
 
     state.log_startup()?;
@@ -899,18 +899,21 @@ async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<(
     // `ask`. Without either, `ask` denies rather than hanging.
     state.broker.set_has_approver(console.draws());
 
-    let proxy_listener = std::net::TcpListener::bind(listen)
-        .with_context(|| format!("binding the proxy to {listen}"))?;
-    let proxy = tls::serve(
-        proxy_listener,
+    let mut proxy = Listener::bind(
+        listen,
         agent_iap::proxy::router(Arc::clone(&state)),
         tls.proxy,
-    )?;
+    )
+    .context("binding the proxy")?;
 
-    let admin = match admin_listen {
+    let mut admin = match admin_listen {
         Some(addr) => {
-            let listener = std::net::TcpListener::bind(addr)
-                .with_context(|| format!("binding the control plane to {addr}"))?;
+            let listener = Listener::bind(
+                addr,
+                agent_iap::admin::router(Arc::clone(&state)),
+                tls.admin,
+            )
+            .context("binding the control plane")?;
             let token_path = write_admin_token(&audit_path, &state.admin_token)?;
             if !console.draws() {
                 eprintln!(
@@ -919,11 +922,7 @@ async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<(
                     token_path.display()
                 );
             }
-            Some(tls::serve(
-                listener,
-                agent_iap::admin::router(Arc::clone(&state)),
-                tls.admin,
-            )?)
+            Some(listener)
         }
         None => None,
     };
@@ -950,34 +949,131 @@ async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<(
         }
     }
 
-    let drawing = console.draws().then(|| {
+    let mut drawing = console.draws().then(|| {
         let state = Arc::clone(&state);
+        let config_path = config_path.clone();
         tokio::task::spawn_blocking(move || agent_iap::tui::run(state, &config_path))
     });
 
-    match (admin, drawing) {
-        (Some(admin), Some(drawing)) => tokio::select! {
-            result = proxy => result?,
-            result = admin => result?,
-            result = drawing => result??,
-            _ = tokio::signal::ctrl_c() => {}
-        },
-        (Some(admin), None) => tokio::select! {
-            result = proxy => result?,
-            result = admin => result?,
-            _ = tokio::signal::ctrl_c() => {}
-        },
-        (None, Some(drawing)) => tokio::select! {
-            result = proxy => result?,
-            result = drawing => result??,
-            _ = tokio::signal::ctrl_c() => {}
-        },
-        (None, None) => tokio::select! {
-            result = proxy => result?,
-            _ = tokio::signal::ctrl_c() => {}
-        },
+    // The listeners are the one part of the proxy a lock cannot replace: a
+    // socket is bound to an address, and a certificate is negotiated per
+    // connection. So they are supervised instead. Everything else a reload
+    // touches is already live by the time this hears about it.
+    let mut reloads = state.subscribe_reloads();
+
+    loop {
+        tokio::select! {
+            result = proxy.serving() => return Ok(result?),
+            result = serving(&mut admin) => return Ok(result?),
+            result = drawn(&mut drawing) => return result,
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            Ok(config) = reloads.recv() => {
+                if let Err(error) = adopt(&state, &config, &mut proxy, &mut admin).await {
+                    // The policy itself is already in force; only the sockets
+                    // did not follow. Loud, and not fatal — killing a proxy
+                    // that is serving correctly because it could not move to a
+                    // new port is worse than not moving to the new port.
+                    tracing::error!(?error, "the listeners could not follow the edited config");
+                }
+            }
+        }
+    }
+}
+
+/// Await an optional listener, or never — so `select!` has an arm either way.
+async fn serving(listener: &mut Option<Listener>) -> std::io::Result<()> {
+    match listener {
+        Some(listener) => listener.serving().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn drawn(drawing: &mut Option<tokio::task::JoinHandle<Result<()>>>) -> Result<()> {
+    match drawing {
+        Some(handle) => handle.await?,
+        None => std::future::pending().await,
+    }
+}
+
+/// Move the listeners onto an edited config.
+///
+/// A changed certificate is served from the next handshake and costs nothing. A
+/// changed address means a new socket: the new one is bound *first*, so a port
+/// already taken leaves the old listener exactly where it was rather than
+/// leaving the proxy listening on nothing at all.
+async fn adopt(
+    state: &Arc<AppState>,
+    config: &Config,
+    proxy: &mut Listener,
+    admin: &mut Option<Listener>,
+) -> Result<()> {
+    // Re-read rather than reuse: a certificate is the one credential in the
+    // file expected to be replaced under a running process.
+    let tls = ServerTls::reload(&config.server, &state.resolver)?;
+
+    rebind(
+        proxy,
+        config.server.listen,
+        tls.proxy,
+        || agent_iap::proxy::router(Arc::clone(state)),
+        "proxy",
+    )
+    .await?;
+
+    match (config.server.admin_listen, admin.take()) {
+        (Some(addr), Some(mut listening)) => {
+            rebind(
+                &mut listening,
+                addr,
+                tls.admin,
+                || agent_iap::admin::router(Arc::clone(state)),
+                "control plane",
+            )
+            .await?;
+            *admin = Some(listening);
+        }
+        // Turned on while running.
+        (Some(addr), None) => {
+            *admin = Some(
+                Listener::bind(addr, agent_iap::admin::router(Arc::clone(state)), tls.admin)
+                    .context("binding the control plane")?,
+            );
+            tracing::info!(%addr, "control plane opened");
+        }
+        // Turned off while running.
+        (None, Some(listening)) => {
+            tracing::info!(addr = %listening.addr, "control plane closed");
+            listening.stop().await;
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+async fn rebind(
+    listener: &mut Listener,
+    addr: std::net::SocketAddr,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    router: impl Fn() -> axum::Router,
+    what: &str,
+) -> Result<()> {
+    let same_address = listener.addr == addr;
+    let same_mode = listener.tls == tls.is_some();
+
+    if same_address && same_mode {
+        if let Some(tls) = tls {
+            listener.serve_certificate(tls);
+        }
+        return Ok(());
     }
 
+    // Bound before the old one is told to stop, so a port that is taken is a
+    // failed reload rather than a proxy serving nothing.
+    let fresh = Listener::bind(addr, router(), tls)
+        .with_context(|| format!("moving the {what} to {addr}"))?;
+    let retired = std::mem::replace(listener, fresh);
+    tracing::info!(from = %retired.addr, to = %addr, "{what} moved");
+    retired.stop().await;
     Ok(())
 }
 
@@ -1352,21 +1448,12 @@ fn report_removal(removal: &enroll::Removal, subject: &str) {
     }
 }
 
-/// A service and its credential are wired into the running process — a resolved
-/// secret, a warmed signer, an open stdio child — and none of that can be
-/// swapped under a request in flight. So this edit waits for a restart.
-fn restart_notice(consequence: &str) {
-    println!(
-        "\nThis takes effect at the next restart — an upstream or MCP server cannot be \
-         swapped under an open connection, so until then {consequence}."
-    );
-}
-
-/// Agents and rules are pure policy: a hash to compare against and a list to
-/// match in order, both re-derivable from the file at any moment. A console
-/// attached to the running proxy watches this file and picks the edit up on
-/// its own — but an operator who has just revoked a leaked token is exactly the
-/// person who must not assume a console is attached.
+/// What an edit made from a shell costs before it is in force.
+///
+/// A console attached to the running proxy watches the policy file and adopts
+/// the whole of it — rules, agents, services, credentials, the listeners. With
+/// no console there is nothing reading the file, and an operator who has just
+/// revoked a leaked token is exactly the person who must not assume otherwise.
 fn reload_notice(consequence: &str) {
     println!(
         "\nA console on the running proxy picks this up within a second. Without one, it \
@@ -1428,7 +1515,7 @@ fn remove_upstream(path: &Path, name: &str, prune: bool) -> Result<()> {
     println!("Removed upstream `{name}` from {}.", path.display());
     println!("`/{name}/…` routes nowhere now, and its credential is no longer resolved.");
     report_removal(&removal, name);
-    restart_notice("the running proxy still fronts it with the credential it already resolved");
+    reload_notice("the running proxy still fronts it with the credential it already resolved");
     Ok(())
 }
 
@@ -1505,7 +1592,7 @@ fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<()> {
     println!("Removed MCP server `{name}` from {}.", path.display());
     println!("`agent-iap mcp --server {name}` has nothing to bridge now.");
     report_removal(&removal, name);
-    restart_notice("the running proxy still relays to it, and a live stdio child keeps running");
+    reload_notice("the running proxy still relays to it");
     Ok(())
 }
 

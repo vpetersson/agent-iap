@@ -175,6 +175,9 @@ struct Compiled {
     any_expiring: bool,
 }
 
+/// A rule list that has compiled, waiting to be put in charge.
+pub struct Prepared(Compiled);
+
 /// The compiled rule list, behind a lock so the console can replace it.
 ///
 /// Every read is a whole decision taken under one guard: the point of an ACL is
@@ -191,14 +194,24 @@ impl Acl {
         })
     }
 
-    /// Replace the rule list with the one this config spells out.
+    /// Compile a config's rules without installing them.
     ///
-    /// Compiled first and swapped second: a policy file edited into something
-    /// that does not compile must leave the running proxy on the rules it
-    /// already has rather than on no rules at all.
+    /// The half of a reload that can fail, separated from the half that cannot,
+    /// so a caller swapping several things at once can find out that all of
+    /// them compile before any of them is live. A proxy running half of one
+    /// policy and half of another is running a policy nobody wrote.
+    pub fn prepare(config: &Config) -> Result<Prepared> {
+        Ok(Prepared(compile_all(config)?))
+    }
+
+    /// Put prepared rules in charge. Infallible, and the whole list at once.
+    pub fn install(&self, prepared: Prepared) {
+        *self.compiled.write() = prepared.0;
+    }
+
+    /// Prepare and install in one go, for callers with nothing else to swap.
     pub fn reload(&self, config: &Config) -> Result<()> {
-        let compiled = compile_all(config)?;
-        *self.compiled.write() = compiled;
+        self.install(Acl::prepare(config)?);
         Ok(())
     }
 

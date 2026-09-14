@@ -7,13 +7,12 @@
 //! `agent-iap upstream add` would have rejected.
 //!
 //! The second half is the part a one-shot CLI never had to think about: this
-//! process is *running* against the policy it just edited. Rules and agents are
-//! re-read into the live proxy immediately, because those are the edits an
-//! operator makes in the middle of something — a rule written from the approval
-//! dialogue that only took effect after a restart would be a rule that did not
-//! work. Services and server settings cannot be swapped under an open
-//! connection, so those are named as needing a restart rather than silently
-//! not applying.
+//! process is *running* against the policy it just edited. Every write here is
+//! followed by `AppState::reload`, which puts the whole edited file in charge —
+//! rules, agents, upstreams, MCP servers, credentials, timeouts, the audit log,
+//! and the listeners. There is nothing the console can write that takes effect
+//! only after a restart, because an operator who wrote a rule from the approval
+//! dialogue is answering a request that is still parked.
 //!
 //! The console is not the only thing that writes this file. `agent-iap acl add`
 //! in the next terminal over, or an editor, edits the same policy the console
@@ -39,20 +38,9 @@ use super::views::CredentialStatus;
 /// The policy file as the console currently understands it.
 pub struct Policy {
     pub path: PathBuf,
-    pub config: Config,
-    /// The file as it was when this process read it at startup.
-    ///
-    /// The comparison is against *this* rather than against the config the
-    /// proxy is running, because the two legitimately differ: `--listen` is a
-    /// deliberate divergence for the life of the run, and reporting it as an
-    /// unapplied edit would put a restart banner on screen that no restart
-    /// would ever clear.
-    baseline: Config,
+    pub config: Arc<Config>,
     pub inventory: Inventory,
     pub credentials: Vec<CredentialStatus>,
-    /// Edits made since startup that this process cannot adopt without one.
-    /// Empty is the normal state and says nothing on screen.
-    pub restart_needed: Vec<String>,
     /// The mark on the file the current view was read from. What the console
     /// compares against to notice somebody else editing the policy.
     seen: Option<Stamp>,
@@ -83,14 +71,11 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
 
 impl Policy {
     pub fn load(path: &Path, state: &Arc<AppState>) -> Result<Self> {
-        let config = Config::load(path)?;
         let mut policy = Policy {
             path: path.to_path_buf(),
-            baseline: config.clone(),
-            config,
+            config: state.config(),
             inventory: Inventory::default(),
             credentials: Vec::new(),
-            restart_needed: Vec::new(),
             seen: None,
         };
         policy.rebuild(state)?;
@@ -116,7 +101,11 @@ impl Policy {
         self.seen = stamp(&self.path);
     }
 
-    /// Re-read the file and push what can be pushed into the running proxy.
+    /// Re-read the file and put it in charge of the running proxy.
+    ///
+    /// All of it, or none of it. `AppState::reload` refuses a policy that will
+    /// not load and leaves the proxy on the one it already had, so a failure
+    /// here is a message on the footer rather than a proxy in an unknown state.
     pub fn rebuild(&mut self, state: &Arc<AppState>) -> Result<()> {
         // Marked before the read rather than after. A write landing between the
         // two would otherwise leave the console holding the old contents under
@@ -124,21 +113,10 @@ impl Policy {
         let stamp = stamp(&self.path);
         let config = Config::load(&self.path)?;
 
-        // Compiled and enrolled before either is swapped: a file that no longer
-        // makes a policy must leave the proxy on the one it is already running.
-        state.acl.reload(&config).context(
-            "the edited rule list would not compile — the proxy is still on the old one",
-        )?;
-        state
-            .agents
-            .reload(&config, &state.resolver)
-            .context("the edited agent list would not enrol — the proxy is still on the old one")?;
-
-        self.restart_needed = needs_restart(&self.baseline, &config);
-        self.inventory = Inventory::build(&config, &ListOptions::default())
+        self.config = state.reload(config)?;
+        self.inventory = Inventory::build(&self.config, &ListOptions::default())
             .context("reading the policy file back")?;
-        self.credentials = credential_statuses(&config, &self.credentials);
-        self.config = config;
+        self.credentials = credential_statuses(&self.config, &self.credentials);
         self.seen = stamp;
         Ok(())
     }
@@ -159,35 +137,6 @@ impl Policy {
             );
         }
     }
-}
-
-/// Which sections changed in a way this process cannot adopt while running.
-///
-/// Rules and agents are absent on purpose: those *are* reloaded, so naming them
-/// here would tell an operator to restart for something already in effect.
-fn needs_restart(started_with: &Config, edited: &Config) -> Vec<String> {
-    let mut stale = Vec::new();
-    if differs(&started_with.upstreams, &edited.upstreams) {
-        stale.push("upstreams".into());
-    }
-    if differs(&started_with.mcp_servers, &edited.mcp_servers) {
-        stale.push("mcp servers".into());
-    }
-    if differs(&started_with.server, &edited.server) {
-        stale.push("server settings".into());
-    }
-    if differs(&started_with.audit, &edited.audit) {
-        stale.push("audit settings".into());
-    }
-    stale
-}
-
-/// Compared as serialised values rather than field by field, so a field added
-/// to the config schema later is covered without anyone remembering to add it
-/// to a list here — the failure mode being an operator told nothing about a
-/// change that did not take effect.
-fn differs<T: serde::Serialize>(started_with: &T, edited: &T) -> bool {
-    serde_json::to_string(started_with).ok() != serde_json::to_string(edited).ok()
 }
 
 /// Every credential the file names, carrying forward any status already known.
@@ -263,7 +212,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             let headers = form.pairs("set-header")?;
             enroll::add_upstream(path, &name, &base_url, &form.auth().to_spec()?, &headers)?;
             Ok(Effect::said(format!(
-                "added upstream `{name}` — restart agent-iap to start serving it"
+                "added upstream `{name}` — agents can reach it now"
             )))
         }
         Intent::McpServer => {
@@ -281,7 +230,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             };
             enroll::add_mcp_server(path, &name, &transport, &form.auth().to_spec()?)?;
             Ok(Effect::said(format!(
-                "added MCP server `{name}` — restart agent-iap to start serving it"
+                "added MCP server `{name}` — agents can reach it now"
             )))
         }
         Intent::Rule => {
@@ -355,7 +304,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 });
             }
             Ok(Effect::said(format!(
-                "added `{}` ({}) at access `{}`, {} rules — restart agent-iap to serve it",
+                "added `{}` ({}) at access `{}`, {} rules — live now",
                 added.name,
                 added.kind,
                 added.access,
@@ -392,34 +341,6 @@ mod tests {
 
     fn config(text: &str) -> Config {
         toml::from_str(text).unwrap()
-    }
-
-    #[test]
-    fn a_new_rule_is_not_something_to_restart_for() {
-        // The whole point of reloading the ACL: a rule written from the
-        // approval dialogue is in force before the operator looks away.
-        let running = config("");
-        let edited = config(
-            r#"
-[[acl]]
-target = "gh"
-action = "allow"
-"#,
-        );
-        assert!(needs_restart(&running, &edited).is_empty());
-    }
-
-    #[test]
-    fn a_new_upstream_is() {
-        let running = config("");
-        let edited = config(
-            r#"
-[[upstreams]]
-name = "gh"
-base_url = "https://api.github.com"
-"#,
-        );
-        assert_eq!(needs_restart(&running, &edited), vec!["upstreams"]);
     }
 
     #[test]

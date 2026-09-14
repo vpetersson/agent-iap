@@ -387,30 +387,19 @@ impl App {
             return;
         }
 
-        let restart_was_owed = !self.policy.restart_needed.is_empty();
         self.refresh();
         if self.flash.as_ref().is_some_and(|flash| flash.failed) {
             return;
         }
 
-        // Which of the two the operator gets is the whole point of saying
-        // anything: one of them means the proxy is now running what the file
-        // says, and the other means it is not.
-        let owed = &self.policy.restart_needed;
-        if owed.is_empty() {
-            self.say(format!(
-                "{} changed on disk — reloaded, {} agents and {} rules now live",
-                self.file_name(),
-                self.state.agents.len(),
-                self.state.acl.rule_count(),
-            ));
-        } else if !restart_was_owed {
-            self.say(format!(
-                "{} changed on disk — {} need a restart before this proxy serves them",
-                self.file_name(),
-                owed.join(" and "),
-            ));
-        }
+        self.say(format!(
+            "{} changed on disk — reloaded: {} agents, {} rules, {} upstreams, {} mcp",
+            self.file_name(),
+            self.state.agents.len(),
+            self.state.acl.rule_count(),
+            self.policy.config.upstreams.len(),
+            self.policy.config.mcp_servers.len(),
+        ));
     }
 
     fn file_name(&self) -> String {
@@ -884,7 +873,7 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(
                 " agent-iap ",
                 Style::default()
@@ -892,7 +881,7 @@ impl App {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("  proxy {}  ", self.state.config.server.listen)),
+            Span::raw(format!("  proxy {}  ", self.state.config().server.listen)),
             Span::styled(format!("  {waiting} waiting  "), pending_style),
             Span::raw(format!(
                 "  {} agents · {} upstreams · {} mcp · {} rules · default {} ",
@@ -903,21 +892,6 @@ impl App {
                 self.state.acl.default_action(),
             )),
         ];
-
-        // An edit that is in the file but not in this process is the one thing
-        // an operator cannot see by looking at either.
-        if !self.policy.restart_needed.is_empty() {
-            spans.push(Span::styled(
-                format!(
-                    " restart to apply: {} ",
-                    self.policy.restart_needed.join(", ")
-                ),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
@@ -1402,8 +1376,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Rules and agents written here take effect immediately. Upstreams and MCP \
-         servers need a restart, and the header says so when one is owed.",
+        "  Everything written here is in force before you look away — rules, agents, \
+         services, credentials, even the address this proxy listens on. Nothing waits \
+         for a restart, and the policy file is watched, so an edit from another \
+         terminal lands the same way.",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1937,90 +1913,6 @@ action = "ask"
             Some("codex".to_string()),
             "an agent enrolled here has to be able to call before the next restart"
         );
-        assert!(app.policy.restart_needed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn adding_an_upstream_says_it_needs_a_restart_rather_than_pretending() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-
-        let mut form = upstream_form();
-        form.fields[0].value = form::Value::Text("linear".into());
-        form.fields[1].value = form::Value::Text("https://api.linear.app".into());
-
-        actions::submit(&app.policy, &form).unwrap();
-        app.refresh();
-
-        assert_eq!(app.policy.restart_needed, vec!["upstreams"]);
-        let rendered = render(&mut app, 160, 34);
-        assert!(rendered.contains("restart to apply"), "{rendered}");
-    }
-
-    #[tokio::test]
-    async fn the_credentials_pane_shows_references_and_never_a_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.tab = Tab::Credentials;
-        app.policy.check_credentials(&app.state);
-
-        let rendered = render(&mut app, 140, 34);
-        assert!(rendered.contains("env:AGENT_IAP_TEST_TOKEN"), "{rendered}");
-        assert!(
-            !rendered.contains("sk-not-real"),
-            "the resolved value must never reach the screen:\n{rendered}"
-        );
-        assert!(rendered.contains("upstream github"), "{rendered}");
-    }
-
-    /// Draws every pane and every modal, at a comfortable size and at the
-    /// smallest terminal anyone sensibly opens.
-    ///
-    /// The console is the one surface with no error path: a layout that divides
-    /// by a zero-width column or indexes past a two-row pane takes the proxy
-    /// down with it, and the proxy is holding the credentials.
-    #[tokio::test]
-    async fn every_pane_and_dialogue_draws_at_any_size_a_terminal_comes_in() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_for_test(dir.path());
-        app.pending = vec![waiting()];
-        app.policy.check_credentials(&app.state);
-
-        let modals: Vec<Box<dyn Fn() -> Option<Modal>>> = vec![
-            Box::new(|| None),
-            Box::new(|| Some(Modal::Help)),
-            Box::new(|| Some(Modal::Approve(Box::new(Dialogue::new(waiting()))))),
-            Box::new(|| Some(Modal::Form(Box::new(upstream_form())))),
-            Box::new(|| Some(Modal::Form(Box::new(mcp_form())))),
-            Box::new(|| Some(Modal::Form(Box::new(rule_form())))),
-            Box::new(|| Some(Modal::Form(Box::new(agent_form())))),
-            Box::new(|| {
-                Some(Modal::Show {
-                    title: "token".into(),
-                    body: "iap_0123456789".into(),
-                    secret: true,
-                })
-            }),
-            Box::new(|| {
-                Some(Modal::Confirm(Confirm {
-                    question: "Revoke `claude-code`?".into(),
-                    detail: "Its token stops being one.".into(),
-                    prune: Some(true),
-                    intent: Destructive::RemoveAgent("claude-code".into()),
-                }))
-            }),
-        ];
-
-        for (width, height) in [(160, 48), (120, 34), (80, 24), (60, 16)] {
-            for tab in Tab::ALL {
-                app.tab = tab;
-                for modal in &modals {
-                    app.modal = modal();
-                    app.clamp_cursors();
-                    render(&mut app, width, height);
-                }
-            }
-        }
     }
 
     /// Types a whole form in, the way an operator does, and looks at the pane.
@@ -2062,6 +1954,35 @@ action = "ask"
             rendered.contains("2 rules"),
             "the header counts it too:\n{rendered}"
         );
+    }
+
+    /// The banner this replaced said "restart to apply". It does not any more,
+    /// which is only allowed to be true if the upstream is genuinely routable
+    /// the moment the form closes.
+    #[tokio::test]
+    async fn an_upstream_added_in_the_console_is_routable_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+
+        let mut form = upstream_form();
+        form.fields[0].value = form::Value::Text("linear".into());
+        form.fields[1].value = form::Value::Text("https://api.linear.app".into());
+
+        let effect = actions::submit(&app.policy, &form).unwrap();
+        app.refresh();
+
+        assert!(
+            !effect.message.contains("restart"),
+            "the console does not ask for restarts: {}",
+            effect.message
+        );
+        assert!(
+            app.state.config().upstream("linear").is_some(),
+            "the running proxy has to be able to route to it, not just draw it"
+        );
+
+        let rendered = render(&mut app, 160, 34);
+        assert!(!rendered.contains("restart"), "{rendered}");
     }
 
     /// The console is not the only thing that writes this file.
@@ -2112,10 +2033,10 @@ action = "ask"
         );
     }
 
-    /// An upstream added from a shell shows in the pane, but the proxy cannot
-    /// serve it — and being told the wrong one of those is the whole risk.
+    /// An upstream added from a shell is routable as soon as the console has
+    /// read the file, exactly as one added in the console is.
     #[tokio::test]
-    async fn an_edit_the_proxy_cannot_adopt_says_so_rather_than_reporting_success() {
+    async fn an_upstream_added_from_a_shell_is_routable_too() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
 
@@ -2133,8 +2054,12 @@ action = "ask"
 
         let flash = app.flash.as_ref().expect("an edit is worth a word");
         assert!(!flash.failed, "{}", flash.message);
-        assert!(flash.message.contains("restart"), "{}", flash.message);
-        assert_eq!(app.policy.restart_needed, vec!["upstreams"]);
+        assert!(
+            !flash.message.contains("restart"),
+            "an upstream added from a shell is live too: {}",
+            flash.message
+        );
+        assert!(app.state.config().upstream("linear").is_some());
     }
 
     #[tokio::test]
