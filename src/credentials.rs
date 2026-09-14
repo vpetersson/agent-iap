@@ -214,23 +214,58 @@ impl CredentialInjector {
         }
     }
 
-    /// Drop the minted tokens of every target not in `keep`.
+    /// Forget everything this process is holding for one target: the token it
+    /// minted, and the service-account key it parsed.
     ///
-    /// A reload's tidying-up. An upstream removed from the policy file, or
-    /// repointed at a different account, must not keep being served from the
-    /// token this process minted for what it used to be — that token outlives
-    /// the grant that justified it, which is the thing this whole proxy exists
-    /// to stop.
+    /// For the target whose credential *changed* while keeping its name — the
+    /// half `retain_targets` cannot see. A token minted from the old client
+    /// secret, or a key parsed from the old `key_file`, outlives the grant that
+    /// justified it, and the name it is cached under says nothing about that.
+    pub fn forget(&self, target: &str) {
+        if self.token_cache.lock().remove(target).is_some() {
+            tracing::info!(target, "dropped a minted token; its credential changed");
+        }
+        self.service_accounts.lock().remove(target);
+    }
+
+    /// Drop the minted tokens and parsed keys of every target not in `keep`.
+    ///
+    /// A reload's tidying-up, for the targets that left the policy file. What
+    /// this process holds for them is a credential nothing in the file grants
+    /// any more — and a name that comes back later must not come back holding
+    /// what the last thing to wear it was given.
     pub fn retain_targets<'a>(&self, keep: impl Iterator<Item = &'a str>) {
         let keep: std::collections::HashSet<&str> = keep.collect();
-        let mut cache = self.token_cache.lock();
-        cache.retain(|target, _| {
+        self.token_cache.lock().retain(|target, _| {
             let kept = keep.contains(target.as_str());
             if !kept {
                 tracing::info!(target, "dropped a minted token; its target is gone");
             }
             kept
         });
+        self.service_accounts
+            .lock()
+            .retain(|target, _| keep.contains(target.as_str()));
+    }
+
+    /// Plant a minted token, and read one back. For the tests about what a
+    /// policy change is allowed to leave behind: minting one for real needs a
+    /// token endpoint to talk to.
+    #[cfg(test)]
+    pub fn remember(&self, target: &str, token: &str) {
+        self.token_cache.lock().insert(
+            target.to_string(),
+            (
+                Secret::new(token.to_string()),
+                Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+    }
+
+    #[cfg(test)]
+    pub fn holds(&self, target: &str) -> Option<String> {
+        self.cached_token(target)
+            .map(|token| token.expose().to_string())
     }
 
     fn cached_token(&self, target: &str) -> Option<Secret> {

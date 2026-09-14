@@ -16,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use std::borrow::Cow;
 
+use crate::config::AuthConfig;
 use crate::enroll::{AuthInput, AUTH_SCHEMES};
 
 /// What a field holds.
@@ -141,10 +142,14 @@ pub struct Form {
 }
 
 /// Which enrolment a filled-in form is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     Agent,
     Upstream,
+    /// Rewriting the upstream it names. The name travels with the intent
+    /// rather than as a field, because it is the one thing on this form that
+    /// is not being edited — ACL rules and agents' `targets` point at it.
+    EditUpstream(String),
     McpServer,
     Rule,
     Profile,
@@ -196,6 +201,17 @@ impl Form {
     /// CLI flag takes.
     pub fn opt(&self, key: &str) -> Option<String> {
         Some(self.text(key)).filter(|value| !value.is_empty())
+    }
+
+    /// A field's contents with the spaces left on, or `None` when there is
+    /// nothing but spaces.
+    ///
+    /// For the one field whose trailing space is the field: a `prefix` of
+    /// `Token ` is what separates the word from the credential, and trimming it
+    /// would send `Tokensk-…` upstream. Everywhere else the trim is right —
+    /// a stray space in a URL or a secret reference is a typo.
+    fn verbatim(&self, key: &str) -> Option<String> {
+        self.raw(key).filter(|value| !value.trim().is_empty())
     }
 
     pub fn flag(&self, key: &str) -> bool {
@@ -261,7 +277,7 @@ impl Form {
             scheme: self.text("auth"),
             secret: self.opt("secret"),
             header: self.opt("header"),
-            prefix: self.opt("prefix"),
+            prefix: self.verbatim("prefix"),
             username: self.opt("username"),
             username_secret: self.opt("username-secret"),
             param: self.opt("param"),
@@ -532,6 +548,36 @@ pub fn auth_fields() -> Vec<Field> {
     fields
 }
 
+/// The same fields, filled in from a credential the policy file already holds.
+///
+/// An edit form that opened on blanks would be a form where saving a changed
+/// base URL writes `auth = none` — the credential silently gone from an
+/// upstream that still routes. So the form starts as the file reads, and every
+/// value in it is a reference rather than a credential, which is the only
+/// reason showing them is safe at all.
+pub fn auth_fields_for(auth: &AuthConfig) -> Vec<Field> {
+    let filled = AuthInput::of(auth);
+    let mut fields = auth_fields();
+    for field in &mut fields {
+        let scheme = field.key == "auth";
+        let held = filled.value(field.key.as_ref());
+        match &mut field.value {
+            Value::Choice { options, selected } if scheme => {
+                if let Some(at) = options.iter().position(|option| *option == filled.scheme) {
+                    *selected = at;
+                }
+            }
+            Value::Text(text) => {
+                if let Some(value) = held {
+                    *text = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    fields
+}
+
 /// What each credential field is called on screen, and the one line under it.
 fn wording(key: &'static str) -> (&'static str, &'static str) {
     match key {
@@ -599,6 +645,65 @@ mod tests {
             shown.sort_unstable();
             wanted.sort_unstable();
             assert_eq!(shown, wanted, "form for `{scheme}`");
+        }
+    }
+
+    /// The invariant the edit form rests on: it opens showing what the file
+    /// holds, on the scheme the file names. A form that opened blank would
+    /// write `auth = none` over a live credential the first time somebody
+    /// corrected a base URL.
+    #[test]
+    fn an_edit_form_opens_on_the_credential_the_file_holds() {
+        for auth in [
+            AuthConfig::Bearer {
+                secret: "env:GITHUB_TOKEN".into(),
+            },
+            AuthConfig::Header {
+                header: "x-api-key".into(),
+                secret: "op://Private/Anthropic/key".into(),
+                prefix: Some("Token ".into()),
+            },
+            AuthConfig::Oauth2ClientCredentials {
+                token_url: "https://id.example.com/oauth2/token".into(),
+                client_id: "iap".into(),
+                client_secret: "op://Private/Example/client-secret".into(),
+                scope: Some("read:things write:things".into()),
+                audience: None,
+            },
+            AuthConfig::ServiceAccountJwt {
+                key_file: Some("op://Private/GCP/credential".into()),
+                issuer: None,
+                private_key: None,
+                key_id: None,
+                token_url: None,
+                audience: None,
+                scopes: vec!["https://www.googleapis.com/auth/webmasters.readonly".into()],
+                subject: Some("person@example.com".into()),
+                lifetime_secs: Some(600),
+            },
+        ] {
+            let form = Form::new(Intent::Upstream, "t", "a", auth_fields_for(&auth));
+            let filled = AuthInput::of(&auth);
+
+            assert_eq!(
+                form.text("auth"),
+                filled.scheme,
+                "opened on the wrong scheme"
+            );
+            assert_eq!(
+                form.auth(),
+                filled,
+                "a form read straight back must be the credential it was opened on: {auth:?}"
+            );
+            // And the scheme's own fields are the ones on screen, filled in.
+            for key in AuthInput::fields_for(&filled.scheme) {
+                let index = form
+                    .fields
+                    .iter()
+                    .position(|field| field.key == *key)
+                    .unwrap();
+                assert!(form.visible().contains(&index), "`{key}` is not on screen");
+            }
         }
     }
 

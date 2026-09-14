@@ -363,7 +363,11 @@ pub struct UpstreamConfig {
 }
 
 /// Credential injection. Covers the schemes real APIs and MCP servers actually use.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+///
+/// Compared, not just read: a reload has to tell a credential that was left
+/// alone from one that was repointed at another account, because the token this
+/// process minted for the old one is cached under a name that did not change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthConfig {
     /// Pass through with nothing added.

@@ -19,6 +19,13 @@
 //!   file untouched, so a bad flag can never be the reason the proxy stops
 //!   coming up.
 //!
+//! Editing earns it for the same reason adding does — `edit_upstream` is the
+//! console's `e`, and has no CLI command behind it yet: a flag left off a
+//! command line has to mean either "leave it alone" or "set it to nothing", and
+//! for a credential those differ by an upstream that stops being protected. The
+//! console has no such ambiguity, because the form opens on the entry and sends
+//! the whole of it back.
+//!
 //! Removal earns the same treatment, and for a sharper reason. The pitch for
 //! this proxy is that a leaked agent token is revoked by deleting one line and
 //! nothing real rotates — but "delete one line" was a hand-edit of the file,
@@ -36,7 +43,7 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-use crate::config::{AclRuleConfig, Config};
+use crate::config::{AclRuleConfig, AuthConfig, Config};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::identity;
@@ -130,7 +137,7 @@ pub const AUTH_SCHEMES: &[&str] = &[
 /// rule about which subset is the difference between a credential that is
 /// injected and one that silently is not. Two copies of that rule would be two
 /// chances to get it wrong.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthInput {
     /// One of `AUTH_SCHEMES`. `-` and `_` are interchangeable.
     pub scheme: String,
@@ -182,6 +189,120 @@ impl AuthInput {
                 "lifetime-secs",
             ],
             _ => &[],
+        }
+    }
+
+    /// A credential already in the file, read back as the fields a human would
+    /// have typed to produce it.
+    ///
+    /// The inverse of `to_spec`, and the reason an edit form can open on what
+    /// the file says rather than on blanks: a form that starts empty is one
+    /// where changing a base URL quietly drops the `prefix` nobody remembered
+    /// was there.
+    pub fn of(auth: &AuthConfig) -> AuthInput {
+        let scheme = |scheme: &str| AuthInput {
+            scheme: scheme.to_string(),
+            ..AuthInput::default()
+        };
+        match auth {
+            AuthConfig::None => scheme("none"),
+            AuthConfig::Bearer { secret } => AuthInput {
+                secret: Some(secret.clone()),
+                ..scheme("bearer")
+            },
+            AuthConfig::Header {
+                header,
+                secret,
+                prefix,
+            } => AuthInput {
+                header: Some(header.clone()),
+                secret: Some(secret.clone()),
+                prefix: prefix.clone(),
+                ..scheme("header")
+            },
+            AuthConfig::Basic {
+                username,
+                username_secret,
+                secret,
+            } => AuthInput {
+                username: username.clone(),
+                username_secret: username_secret.clone(),
+                secret: Some(secret.clone()),
+                ..scheme("basic")
+            },
+            AuthConfig::Query { param, secret } => AuthInput {
+                param: Some(param.clone()),
+                secret: Some(secret.clone()),
+                ..scheme("query")
+            },
+            AuthConfig::Oauth2ClientCredentials {
+                token_url,
+                client_id,
+                client_secret,
+                scope,
+                audience,
+            } => AuthInput {
+                token_url: Some(token_url.clone()),
+                client_id: Some(client_id.clone()),
+                client_secret: Some(client_secret.clone()),
+                // One space-delimited parameter in the file, a repeatable flag
+                // here — the same split `to_spec` joins back.
+                scopes: scope
+                    .iter()
+                    .flat_map(|scope| scope.split_whitespace())
+                    .map(String::from)
+                    .collect(),
+                audience: audience.clone(),
+                ..scheme("oauth2-client-credentials")
+            },
+            AuthConfig::ServiceAccountJwt {
+                key_file,
+                issuer,
+                private_key,
+                key_id,
+                token_url,
+                audience,
+                scopes,
+                subject,
+                lifetime_secs,
+            } => AuthInput {
+                key_file: key_file.clone(),
+                issuer: issuer.clone(),
+                private_key: private_key.clone(),
+                key_id: key_id.clone(),
+                token_url: token_url.clone(),
+                audience: audience.clone(),
+                scopes: scopes.clone(),
+                subject: subject.clone(),
+                lifetime_secs: *lifetime_secs,
+                ..scheme("service-account-jwt")
+            },
+        }
+    }
+
+    /// One field's value, by the key `fields_for` names it with — the same key
+    /// the CLI flag and the console's field share, so a form can fill itself in
+    /// without a second table mapping fields to values.
+    pub fn value(&self, key: &str) -> Option<String> {
+        match key {
+            "secret" => self.secret.clone(),
+            "header" => self.header.clone(),
+            "prefix" => self.prefix.clone(),
+            "username" => self.username.clone(),
+            "username-secret" => self.username_secret.clone(),
+            "param" => self.param.clone(),
+            "key-file" => self.key_file.clone(),
+            "private-key" => self.private_key.clone(),
+            "issuer" => self.issuer.clone(),
+            "key-id" => self.key_id.clone(),
+            "token-url" => self.token_url.clone(),
+            "audience" => self.audience.clone(),
+            "scope" => (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
+            "subject" => self.subject.clone(),
+            "lifetime-secs" => self.lifetime_secs.map(|secs| secs.to_string()),
+            "client-id" => self.client_id.clone(),
+            "client-secret" => self.client_secret.clone(),
+            _ => None,
         }
     }
 
@@ -467,6 +588,69 @@ fn upstream_entry(
         entry["headers"] = toml_edit::value(table);
     }
     entry
+}
+
+/// Rewrite an existing `[[upstreams]]`: where it points, the credential it
+/// attaches, the static headers it sends.
+///
+/// The alternative was `rm` and `add`, which is not the same operation: it
+/// takes the entry's ACL rules with it or strands the agents scoped to it,
+/// moves the block to the end of the file, and leaves a window where the proxy
+/// fronts nothing under that name. This edits the block in place, so the rules
+/// and the `targets` that name it keep naming the same thing — and the whole
+/// file is validated before it is written, exactly as an add is.
+///
+/// Whole rather than field by field: the caller supplies the entry it wants to
+/// exist, and what it leaves out is left out. A credential is the field where
+/// "unset means keep" and "unset means none" differ by an unprotected upstream,
+/// so the console fills the form in from the file first and sends all of it
+/// back.
+///
+/// The name is not editable here. It is the routing prefix, and ACL rules,
+/// agents' `targets` and the audit log all name it — changing it is a rename of
+/// something other blocks point at rather than an edit of this one.
+pub fn edit_upstream(
+    path: &Path,
+    name: &str,
+    base_url: &str,
+    auth: &AuthSpec,
+    headers: &[(String, String)],
+) -> Result<()> {
+    check_base_url(base_url)?;
+    check_secret_refs(auth)?;
+
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let index = existing
+        .upstreams
+        .iter()
+        .position(|up| up.name == name)
+        .with_context(|| {
+            format!(
+                "no upstream `{name}` in `{}`{}",
+                path.display(),
+                known(existing.upstreams.iter().map(|up| up.name.as_str()))
+            )
+        })?;
+
+    let entry = entry_mut(&mut document, "upstreams", index, path)?;
+    entry["base_url"] = toml_edit::value(base_url);
+    entry["auth"] = toml_edit::value(auth_value(auth));
+    match headers.is_empty() {
+        // Removed rather than written as an empty table: `headers = {}` says
+        // the same thing while reading like something that was meant.
+        true => {
+            entry.remove("headers");
+        }
+        false => {
+            let mut table = toml_edit::InlineTable::new();
+            for (key, value) in headers {
+                table.insert(key, Value::from(value.as_str()));
+            }
+            entry["headers"] = toml_edit::value(table);
+        }
+    }
+    save(path, document)
 }
 
 /// Remove `[[upstreams]]`, and with `prune` everything that pointed at it.
@@ -2323,6 +2507,205 @@ mod tests {
         let error = remove_agent(&path, "ci", false).unwrap_err().to_string();
 
         assert!(error.contains("inline array"), "{error}");
+    }
+
+    /// Every scheme a policy file can hold, one of each — the set an edit has
+    /// to be able to read back and write out again untouched.
+    fn every_scheme() -> Vec<AuthConfig> {
+        vec![
+            AuthConfig::None,
+            AuthConfig::Bearer {
+                secret: "env:GITHUB_TOKEN".into(),
+            },
+            AuthConfig::Header {
+                header: "x-api-key".into(),
+                secret: "op://Private/Anthropic/key".into(),
+                prefix: Some("Token ".into()),
+            },
+            AuthConfig::Basic {
+                username: None,
+                username_secret: Some("op://Private/Graylog/token".into()),
+                secret: "literal:token".into(),
+            },
+            AuthConfig::Query {
+                param: "key".into(),
+                secret: "env:MAPS_KEY".into(),
+            },
+            AuthConfig::Oauth2ClientCredentials {
+                token_url: "https://id.example.com/oauth2/token".into(),
+                client_id: "iap".into(),
+                client_secret: "op://Private/Example/client-secret".into(),
+                scope: Some("read:things write:things".into()),
+                audience: Some("https://api.example.com".into()),
+            },
+            AuthConfig::ServiceAccountJwt {
+                key_file: Some("op://Private/GCP/credential".into()),
+                issuer: None,
+                private_key: None,
+                key_id: None,
+                token_url: None,
+                audience: None,
+                scopes: vec!["https://www.googleapis.com/auth/webmasters.readonly".into()],
+                subject: Some("person@example.com".into()),
+                lifetime_secs: Some(600),
+            },
+        ]
+    }
+
+    /// The edit the console is: repoint a service, or swap the credential it
+    /// attaches, without the entry ever leaving the file.
+    #[test]
+    fn an_upstream_can_be_repointed_without_being_removed_and_re_added() {
+        let (_dir, path) = populated_policy();
+        let before_text = std::fs::read_to_string(&path).unwrap();
+        let before = load(&path);
+        assert_eq!(before.acl.len(), 3);
+
+        edit_upstream(
+            &path,
+            "github",
+            "https://github.example.com/api/v3",
+            &AuthSpec::Header {
+                header: "authorization".into(),
+                secret: "op://Private/GHE/token".into(),
+                prefix: Some("token ".into()),
+            },
+            &[("accept".into(), "application/vnd.github+json".into())],
+        )
+        .unwrap();
+
+        let after = load(&path);
+        after
+            .validate()
+            .expect("an edit cannot leave a file the proxy would refuse");
+        let upstream = after
+            .upstream("github")
+            .expect("it is still there, under its own name");
+        assert_eq!(upstream.base_url, "https://github.example.com/api/v3");
+        assert_eq!(
+            upstream.headers.get("accept").map(String::as_str),
+            Some("application/vnd.github+json")
+        );
+        assert!(
+            matches!(&upstream.auth, AuthConfig::Header { secret, .. } if secret == "op://Private/GHE/token")
+        );
+
+        // The half `rm` and `add` could not have done: the rules aimed at it
+        // and the agent scoped to it are pointing at the same entry, in the
+        // same place in the file.
+        assert_eq!(
+            after.acl.len(),
+            before.acl.len(),
+            "no rule was taken with it"
+        );
+        assert_eq!(after.agents[0].targets, before.agents[0].targets);
+        assert_eq!(
+            after
+                .upstreams
+                .iter()
+                .map(|up| up.name.as_str())
+                .collect::<Vec<_>>(),
+            before
+                .upstreams
+                .iter()
+                .map(|up| up.name.as_str())
+                .collect::<Vec<_>>(),
+            "and it did not move to the end of the file"
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("env:GITHUB_TOKEN"),
+            "the old credential reference is still there:\n{text}"
+        );
+        for line in before_text.lines().filter(|line| line.starts_with('#')) {
+            assert!(text.contains(line), "comment was dropped: {line}");
+        }
+    }
+
+    /// What the console's edit form does when it is opened and saved: read the
+    /// credential out of the file, and put it back. Anything this loses is a
+    /// credential an operator dropped by editing a base URL.
+    #[test]
+    fn a_credential_read_out_of_the_file_goes_back_in_unchanged() {
+        let (_dir, path) = populated_policy();
+        for auth in every_scheme() {
+            let spec = AuthInput::of(&auth)
+                .to_spec()
+                .unwrap_or_else(|error| panic!("{auth:?} could not be read back: {error:#}"));
+            edit_upstream(&path, "github", "https://api.github.com", &spec, &[]).unwrap();
+
+            assert_eq!(
+                load(&path).upstream("github").unwrap().auth,
+                auth,
+                "a round trip through the form's fields changed the credential"
+            );
+        }
+    }
+
+    /// Clearing the headers has to clear them, not leave the last set in place.
+    #[test]
+    fn an_edit_that_drops_the_headers_drops_them() {
+        let (_dir, path) = populated_policy();
+        edit_upstream(
+            &path,
+            "github",
+            "https://api.github.com",
+            &AuthSpec::None,
+            &[("accept".into(), "application/json".into())],
+        )
+        .unwrap();
+        edit_upstream(
+            &path,
+            "github",
+            "https://api.github.com",
+            &AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+
+        assert!(load(&path).upstream("github").unwrap().headers.is_empty());
+    }
+
+    /// An edit is checked exactly as an add is, and a refused one leaves the
+    /// file as it was — including the credential it is refusing to overwrite.
+    #[test]
+    fn an_edit_is_validated_like_an_add() {
+        let (_dir, path) = populated_policy();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for spec in [
+            AuthSpec::Bearer {
+                secret: "ghp_the_token_itself".into(),
+            },
+            AuthSpec::Bearer {
+                secret: "literal:ghp_the_token_itself".into(),
+            },
+        ] {
+            edit_upstream(&path, "github", "https://api.github.com", &spec, &[]).unwrap_err();
+        }
+        edit_upstream(&path, "github", "api.github.com", &AuthSpec::None, &[]).unwrap_err();
+
+        let error = edit_upstream(
+            &path,
+            "gihtub",
+            "https://api.github.com",
+            &AuthSpec::None,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no upstream `gihtub`"), "{error}");
+        assert!(
+            error.contains("anthropic"),
+            "and says what is there: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a refused edit rewrote the file anyway"
+        );
     }
 
     /// TLS is configured by hand in `[server.tls]`; enrolment is done by these

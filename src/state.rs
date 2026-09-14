@@ -206,6 +206,29 @@ impl AppState {
         let rules = Acl::prepare(&config)?;
         let roster = AgentRegistry::prepare(&config, &self.resolver)?;
 
+        // A credential edited in place keeps the name it is cached under, so
+        // the tidying by name below cannot see it. Forget what this process is
+        // holding for those targets *before* warming, or a changed
+        // service-account key would be "parsed" from the copy of the old one
+        // and a malformed new key would sail through this reload. Dropped even
+        // if a later step refuses the policy, which costs one re-parse from the
+        // config still in force — the safe direction.
+        let current = self.config();
+        for (target, auth) in config
+            .upstreams
+            .iter()
+            .map(|upstream| (&upstream.name, &upstream.auth))
+            .chain(config.mcp_servers.iter().map(|s| (&s.name, &s.auth)))
+        {
+            let was = current
+                .upstream(target)
+                .map(|upstream| &upstream.auth)
+                .or_else(|| current.mcp_server(target).map(|server| &server.auth));
+            if was.is_some_and(|was| was != auth) {
+                self.injector.forget(target);
+            }
+        }
+
         // Warming parses each service-account key. Done before the swap so a
         // malformed one is a refused reload rather than a 502 on first use.
         for upstream in &config.upstreams {
@@ -215,7 +238,6 @@ impl AppState {
             self.injector.warm(&server.name, &server.auth)?;
         }
 
-        let current = self.config();
         let http = match timeouts_changed(&current, &config) {
             true => Some(build_http_client(&config)?),
             false => None,
@@ -491,6 +513,59 @@ auth = {{ type = "bearer", secret = "env:AGENT_IAP_DEFINITELY_NOT_SET" }}
         assert!(state.agents.by_id("claude").is_some());
         assert_eq!(state.acl.rule_count(), 1);
         assert!(state.config().upstreams.is_empty());
+    }
+
+    /// The half `retain_targets` cannot see: an upstream whose credential was
+    /// edited keeps its name, so a token minted from the old one is cached
+    /// under a key that still looks current. That token outlives the grant
+    /// that justified it, which is the thing this proxy exists to stop.
+    #[test]
+    fn a_reload_that_repoints_a_credential_drops_the_token_minted_for_the_old_one() {
+        std::env::set_var("AGENT_IAP_RELOAD_SECRET_ONE", "client-secret-one");
+        std::env::set_var("AGENT_IAP_RELOAD_SECRET_TWO", "client-secret-two");
+        let dir = tempfile::tempdir().unwrap();
+        let policy = |reference: &str| -> Config {
+            toml::from_str(&format!(
+                r#"
+[audit]
+path = "{}"
+stderr = false
+
+[[upstreams]]
+name = "gh"
+base_url = "https://api.github.com"
+auth = {{ type = "oauth2_client_credentials", token_url = "https://id.example.com/token", client_id = "iap", client_secret = "{reference}" }}
+"#,
+                dir.path().join("audit.jsonl").display(),
+            ))
+            .unwrap()
+        };
+
+        let state = AppState::build(policy("env:AGENT_IAP_RELOAD_SECRET_ONE"), false).unwrap();
+        state
+            .injector
+            .remember("gh", "access-token-from-the-old-client");
+
+        // A reload that changed something else entirely must not throw the
+        // token away — that is a round trip to the token endpoint on every
+        // unrelated edit.
+        state
+            .reload_for_test(policy("env:AGENT_IAP_RELOAD_SECRET_ONE"))
+            .unwrap();
+        assert_eq!(
+            state.injector.holds("gh").as_deref(),
+            Some("access-token-from-the-old-client"),
+            "an unrelated reload re-minted a perfectly good token"
+        );
+
+        state
+            .reload_for_test(policy("env:AGENT_IAP_RELOAD_SECRET_TWO"))
+            .unwrap();
+        assert_eq!(
+            state.injector.holds("gh"),
+            None,
+            "the token minted from the credential that was just replaced is still being served"
+        );
     }
 
     #[test]

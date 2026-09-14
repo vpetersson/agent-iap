@@ -10,6 +10,11 @@
 //! shell is a form here, over the same `enroll` functions — because the answer
 //! to "this agent needs GitHub" arrives while you are sitting in front of the
 //! queue, and a console you have to quit to act on it is a console you quit.
+//! One form has no shell command behind it: `e` on an upstream opens the entry
+//! as the file has it, to be corrected and written back. On a command line the
+//! same thing needs a rule for what an omitted flag means, and "omitted" and
+//! "no credential" are one keystroke apart; a form that opens on the answer and
+//! sends all of it back does not have to have that rule.
 //! Rules and agents take effect in this process the moment they are written;
 //! services need a restart, and the console says so rather than pretending.
 //!
@@ -43,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use crate::approval::{PendingView, Verdict};
 use crate::audit::AuditEvent;
+use crate::config::UpstreamConfig;
 use crate::profiles::Profile;
 use crate::state::AppState;
 
@@ -196,7 +202,8 @@ impl Tab {
                 ("f", "forget"),
             ],
             Tab::Agents => &[("n", "enrol"), ("t", "new token"), ("x", "revoke")],
-            Tab::Upstreams | Tab::Mcp => &[("n", "add"), ("x", "remove")],
+            Tab::Upstreams => &[("n", "add"), ("e", "edit"), ("x", "remove")],
+            Tab::Mcp => &[("n", "add"), ("x", "remove")],
             Tab::Acl => &[("n", "add rule"), ("x", "remove rule")],
             Tab::Credentials => &[("c", "re-check")],
             Tab::Profiles => &[("enter", "add")],
@@ -777,6 +784,23 @@ impl App {
 
             (Tab::Upstreams, KeyCode::Char('n')) => {
                 self.modal = Some(Modal::Form(Box::new(upstream_form())))
+            }
+            // `enter` too, so a double-click on the row opens what the row is
+            // — the same pairing every other pane has.
+            (Tab::Upstreams, KeyCode::Char('e')) | (Tab::Upstreams, KeyCode::Enter) => {
+                if let Some(upstream) = self
+                    .named_at_cursor(|inventory| {
+                        inventory
+                            .upstreams
+                            .iter()
+                            .flatten()
+                            .map(|row| row.name.clone())
+                            .collect()
+                    })
+                    .and_then(|name| self.policy.config.upstream(&name).cloned())
+                {
+                    self.modal = Some(Modal::Form(Box::new(upstream_edit_form(&upstream))));
+                }
             }
             (Tab::Upstreams, KeyCode::Char('x')) => {
                 if let Some(name) = self.named_at_cursor(|inventory| {
@@ -1764,7 +1788,10 @@ fn draw_show(frame: &mut Frame, area: Rect, shown: &Shown) -> Rect {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
-    let popup = form::centred(area, 72.min(area.width), 22.min(area.height));
+    // Tall enough for the whole list and the paragraph under it: a help modal
+    // that cuts its last line off is one the operator cannot trust to be the
+    // whole list. Still clamped, so a short terminal gets what fits.
+    let popup = form::centred(area, 72.min(area.width), 26.min(area.height));
     frame.render_widget(Clear, popup);
 
     let mut lines = vec![Line::raw("")];
@@ -1775,13 +1802,17 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ("1…7 / tab", "move between panes"),
         ("↑ ↓ / j k", "move within one"),
         ("n", "add — agent, upstream, MCP server, rule"),
+        ("e", "edit the upstream the cursor is on"),
         ("x", "remove what the cursor is on"),
         ("t", "mint a new token for the selected agent"),
         (
             "c",
             "copy the token a modal is showing — or, on credentials, re-resolve them",
         ),
-        ("enter", "answer a request, or add the selected profile"),
+        (
+            "enter",
+            "answer a request, open a row — edit, or add a profile",
+        ),
         ("a / d", "allow or deny the selected request, once"),
         ("f", "forget every standing answer"),
         ("r", "re-read the policy file now — it is watched anyway"),
@@ -1856,6 +1887,40 @@ fn upstream_form() -> Form {
         Intent::Upstream,
         "add an upstream",
         "A service to front, and the credential to attach on the way out. The credential is a reference; the proxy resolves it.",
+        fields,
+    )
+}
+
+/// The same form, opened on an upstream that already exists.
+///
+/// Prefilled from the file rather than blank, and submitted whole: what is on
+/// screen is what gets written, so a field left alone is a field that survives.
+/// The name is missing on purpose — it is the routing prefix, and the ACL rules
+/// and agent `targets` that name it would be pointing at nothing the moment it
+/// changed.
+fn upstream_edit_form(upstream: &UpstreamConfig) -> Form {
+    let mut fields = vec![Field::prefilled(
+        "base-url",
+        "base url",
+        "where the proxy forwards to, e.g. https://api.github.com",
+        &upstream.base_url,
+    )];
+    fields.extend(form::auth_fields_for(&upstream.auth));
+    fields.push(Field::prefilled(
+        "set-header",
+        "headers",
+        "static headers to send upstream, NAME=VALUE — never a credential, that is what the secret is for",
+        &upstream
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ));
+    Form::new(
+        Intent::EditUpstream(upstream.name.clone()),
+        &format!("edit upstream `{}`", upstream.name),
+        "Rewrites this entry whole. Credentials are references, so what is shown is what the file holds — never a credential itself.",
         fields,
     )
 }
@@ -2427,6 +2492,82 @@ action = "ask"
 
         let rendered = render(&mut app, 160, 34);
         assert!(!rendered.contains("restart"), "{rendered}");
+    }
+
+    /// The pane could add and remove and nothing else, so "this API moved" or
+    /// "the credential is in a different vault item now" meant an editor and a
+    /// restart.
+    #[tokio::test]
+    async fn an_upstream_can_be_edited_in_the_console_without_losing_its_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        assert!(
+            matches!(app.modal, Some(Modal::Form(_))),
+            "`e` on an upstream opens the form"
+        );
+        // The cursor starts on the base URL, filled in with what the file
+        // holds — so this is a correction, not a retyping of the whole entry.
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        type_in(&mut app, "https://github.example.com/api/v3");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(app.modal.is_none(), "a saved form closes");
+
+        let upstream = app
+            .state
+            .config()
+            .upstream("github")
+            .cloned()
+            .expect("still there, under the name its rules and targets use");
+        assert_eq!(
+            upstream.base_url, "https://github.example.com/api/v3",
+            "the running proxy forwards to the edited address, without a restart"
+        );
+        assert!(
+            matches!(&upstream.auth, crate::config::AuthConfig::Bearer { secret }
+                     if secret == "env:AGENT_IAP_TEST_TOKEN"),
+            "a form that never asked about the credential must not have dropped it: {:?}",
+            upstream.auth
+        );
+        assert_eq!(
+            app.state.acl.rule_count(),
+            1,
+            "and the rule aimed at it is still aimed at it"
+        );
+
+        let rendered = render(&mut app, 140, 30);
+        assert!(rendered.contains("github.example.com"), "{rendered}");
+        assert!(!rendered.contains("restart"), "{rendered}");
+    }
+
+    /// Same form, from the pointer: a double-click opens the row.
+    #[tokio::test]
+    async fn enter_on_an_upstream_opens_the_same_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.intent, form::Intent::EditUpstream("github".into()));
+                assert_eq!(
+                    form.text("base-url"),
+                    "https://api.github.com",
+                    "it opens on the entry as the file has it"
+                );
+            }
+            other => panic!(
+                "`enter` on an upstream should open its form, got {:?}",
+                other.is_some()
+            ),
+        }
     }
 
     /// The daemon reloads; the console follows.
