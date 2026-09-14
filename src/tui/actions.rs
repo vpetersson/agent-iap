@@ -157,7 +157,7 @@ impl Effect {
 /// Apply a filled-in form to the policy file.
 pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
     let path = policy.path.as_path();
-    match form.intent {
+    match &form.intent {
         Intent::Agent => {
             let id = required(form, "id")?;
             let agent = enroll::add_agent(
@@ -179,6 +179,14 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             enroll::add_upstream(path, &name, &base_url, &form.auth().to_spec()?, &headers)?;
             Ok(Effect::said(format!(
                 "added upstream `{name}` — agents can reach it now"
+            )))
+        }
+        Intent::EditUpstream(name) => {
+            let base_url = required(form, "base-url")?;
+            let headers = form.pairs("set-header")?;
+            enroll::edit_upstream(path, name, &base_url, &form.auth().to_spec()?, &headers)?;
+            Ok(Effect::said(format!(
+                "updated upstream `{name}` — the next call through it uses this"
             )))
         }
         Intent::McpServer => {

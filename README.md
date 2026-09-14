@@ -660,11 +660,20 @@ from a shell is a form here, over the same functions with the same validation:
 | --- | --- | --- |
 | approvals | the queue, and the request in full | `enter` `a` `d` `f` |
 | agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
-| upstreams | base URL, scheme, credential reference | `n` `x` |
+| upstreams | base URL, scheme, credential reference | `n` add · `e` edit · `x` remove |
 | mcp | transport, command or URL, credential references | `n` `x` |
 | acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
+
+`e` on an upstream — or `enter`, or a double-click — opens that entry rather
+than a blank one: the base URL it has, the scheme it uses, the references it
+names, ready to be corrected. An API that moved, a credential that now lives in
+a different vault item, a header the vendor started requiring. Saving writes the
+entry in place, so the ACL rules aimed at it and the agents scoped to it go on
+naming the same thing — which `x` and `n` could not have managed between them.
+The name itself is not on the form for that reason. No credential *value* is
+shown, because the file holds none: what is prefilled is the reference.
 
 It answers the mouse, too. Click a tab to change pane, a row to select it,
 twice to open it — the same thing `enter` does there. The wheel scrolls the
@@ -707,7 +716,7 @@ read once and owned forever. A reload replaces the lot:
 | --- | --- |
 | `[[acl]]`, `[[agents]]` | recompiled and re-enrolled; the next request is judged by the new list |
 | `[[upstreams]]`, `[[mcp_servers]]` | routable immediately, credential and all |
-| a credential reference | re-resolved; a minted token for a target that went away is dropped |
+| a credential reference | re-resolved; a minted token is dropped when its target went away, and when the credential under it was repointed |
 | `[server.tls]`, `[server.admin_tls]` | re-read from source and served from the next handshake; connections already up keep the certificate they negotiated |
 | `server.listen`, `server.admin_listen` | the new address is bound, then the old listener drains for ten seconds |
 | timeouts, `max_body_bytes`, `approval_timeout_secs`, workload settings | in force for the next request; anything already in flight keeps what it started with |
@@ -1734,7 +1743,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 298 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 357 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
