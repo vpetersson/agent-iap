@@ -703,7 +703,15 @@ impl App {
         let Some(Modal::Form(form)) = &mut self.modal else {
             return;
         };
+        let picked = picked(form);
         form.nudge(*index);
+        // A click on the picker advances it, exactly as `→` does — and so it
+        // has to swap the form the same way.
+        if let Some(before) = picked {
+            if form.text("id") != before {
+                **form = upstream_form(&self.profiles, &form.text("id"));
+            }
+        }
     }
 
     /// The wheel. Over a modal it moves that modal's own list; otherwise it
@@ -783,7 +791,10 @@ impl App {
             }
 
             (Tab::Upstreams, KeyCode::Char('n')) => {
-                self.modal = Some(Modal::Form(Box::new(upstream_form())))
+                self.modal = Some(Modal::Form(Box::new(upstream_form(
+                    &self.profiles,
+                    NO_PROFILE,
+                ))))
             }
             // `enter` too, so a double-click on the row opens what the row is
             // — the same pairing every other pane has.
@@ -935,38 +946,50 @@ impl App {
                     reach,
                 }) => self.answer(&dialogue.view, verdict, duration, *reach),
             },
-            Some(Modal::Form(mut form)) => match form.handle(key) {
-                Outcome::Continue => self.modal = Some(Modal::Form(form)),
-                Outcome::Cancel => {}
-                Outcome::Submit => match actions::submit(&self.policy, &form) {
-                    Ok(effect) => {
-                        self.refresh();
-                        self.say(effect.message);
-                        if let Some((id, token)) = effect.token {
-                            let body = format!(
-                                "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
+            Some(Modal::Form(mut form)) => {
+                let was = picked(&form);
+                match form.handle(key) {
+                    Outcome::Continue => {
+                        // The picker moved, so this is a different enrolment with
+                        // different fields. Rebuilding rather than prefilling is
+                        // what keeps a profile's own variables and access levels
+                        // on screen under their own names.
+                        if was.is_some_and(|before| before != form.text("id")) {
+                            form = Box::new(upstream_form(&self.profiles, &form.text("id")));
+                        }
+                        self.modal = Some(Modal::Form(form))
+                    }
+                    Outcome::Cancel => {}
+                    Outcome::Submit => match actions::submit(&self.policy, &form) {
+                        Ok(effect) => {
+                            self.refresh();
+                            self.say(effect.message);
+                            if let Some((id, token)) = effect.token {
+                                let body = format!(
+                                    "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
                                  upstream key: it buys nothing anywhere else, and revoking it \
                                  rotates nothing. The file got only its sha256, so this is the \
                                  last time anything can print it."
-                            );
-                            self.modal = Some(Modal::Show(Shown::token(
-                                format!("token for `{id}` — shown once"),
-                                &token,
-                                body,
-                            )));
-                        } else if let Some(preview) = effect.preview {
-                            self.modal = Some(Modal::Show(Shown::plain(
-                                "dry run — nothing was written".into(),
-                                preview,
-                            )));
+                                );
+                                self.modal = Some(Modal::Show(Shown::token(
+                                    format!("token for `{id}` — shown once"),
+                                    &token,
+                                    body,
+                                )));
+                            } else if let Some(preview) = effect.preview {
+                                self.modal = Some(Modal::Show(Shown::plain(
+                                    "dry run — nothing was written".into(),
+                                    preview,
+                                )));
+                            }
                         }
-                    }
-                    Err(error) => {
-                        form.error = Some(format!("{error:#}"));
-                        self.modal = Some(Modal::Form(form));
-                    }
-                },
-            },
+                        Err(error) => {
+                            form.error = Some(format!("{error:#}"));
+                            self.modal = Some(Modal::Form(form));
+                        }
+                    },
+                }
+            }
             Some(Modal::Confirm(confirm)) => self.handle_confirm(confirm, key),
             None => {}
         }
@@ -1801,7 +1824,10 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ("wheel", "scroll the pane, or the list in a dialogue"),
         ("1…7 / tab", "move between panes"),
         ("↑ ↓ / j k", "move within one"),
-        ("n", "add — agent, upstream, MCP server, rule"),
+        (
+            "n",
+            "add — agent, upstream (from a profile, or spelled out), MCP server, rule",
+        ),
         ("e", "edit the upstream the cursor is on"),
         ("x", "remove what the cursor is on"),
         ("t", "mint a new token for the selected agent"),
@@ -1847,6 +1873,14 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
 
 // ---- the forms, one per enrolment command ---------------------------------
 
+/// What the profile picker holds, for a form that has one.
+///
+/// Read before a keystroke and again after, because a picker that moved is not
+/// a field that was edited — it is a form that has to be rebuilt.
+fn picked(form: &Form) -> Option<String> {
+    form.picker.then(|| form.text("id"))
+}
+
 fn agent_form() -> Form {
     Form::new(
         Intent::Agent,
@@ -1864,31 +1898,88 @@ fn agent_form() -> Form {
     )
 }
 
-fn upstream_form() -> Form {
-    let mut fields = vec![
-        Field::text(
-            "name",
-            "name",
-            "routing prefix and policy name: agents call /<name>/<path>",
-        ),
-        Field::text(
-            "base-url",
-            "base url",
-            "where the proxy forwards to, e.g. https://api.github.com",
-        ),
-    ];
-    fields.extend(form::auth_fields());
-    fields.push(Field::text(
-        "set-header",
-        "headers",
-        "static headers to send upstream, NAME=VALUE — never a credential, that is what the secret is for",
-    ));
-    Form::new(
-        Intent::Upstream,
-        "add an upstream",
-        "A service to front, and the credential to attach on the way out. The credential is a reference; the proxy resolves it.",
-        fields,
-    )
+/// The first option on the profile picker: no profile, spell the service out.
+/// Deliberately not a word that could ever be a profile id.
+const NO_PROFILE: &str = "— none: spell it out below —";
+
+/// Add an upstream, from a profile or by hand.
+///
+/// The picker is the first field because it decides what the rest of the form
+/// is. A profile already knows the base URL, the credential scheme and a set of
+/// ACL rules narrow enough to be worth having; what is left to ask for is the
+/// credential reference and what to call the service here. So picking one does
+/// not prefill this form — it replaces it, and the console rebuilds it on the
+/// keystroke. That is what lets a profile's own variables and access levels
+/// arrive as labelled fields rather than as a `NAME=VALUE` line the operator
+/// has to know how to complete.
+///
+/// Segregating the two was the bug: an operator who came here to add GitHub had
+/// no way of learning from this form that a `github` profile existed, and so
+/// typed out a base URL, a scheme and — the part that actually matters — a set
+/// of ACL paths that nobody had reviewed.
+///
+/// Only the HTTP profiles are offered. An MCP profile is not an upstream: it
+/// belongs to the `mcp` pane, and writing an `[[mcp_servers]]` entry from a
+/// form headed "add an upstream" would be a form that lied about what it did.
+fn upstream_form(catalogue: &[Profile], picked: &str) -> Form {
+    let offered: Vec<&Profile> = catalogue
+        .iter()
+        .filter(|profile| profile.service.kind() == "http")
+        .collect();
+    let mut options = vec![NO_PROFILE.to_string()];
+    options.extend(offered.iter().map(|profile| profile.id.clone()));
+    let selected = options
+        .iter()
+        .position(|option| option == picked)
+        .unwrap_or(0);
+
+    // Keyed `id`, which is what the profile enrolment reads the profile out of
+    // — the same key the profiles pane's own form uses, so one submit handler
+    // covers both.
+    let mut fields = vec![Field::choices(
+        "id",
+        "profile",
+        "a service worked out in advance: its endpoint, its credential scheme and its ACL rules. ←/→ to browse.",
+        options,
+        selected,
+    )];
+
+    match offered.into_iter().find(|profile| profile.id == picked) {
+        Some(profile) => {
+            fields.extend(profile_fields(profile));
+            Form::new(
+                Intent::Profile,
+                &format!("add an upstream — `{}`", profile.id),
+                &format!("{} — {}", profile.credential.about, profile.credential.url),
+                fields,
+            )
+        }
+        None => {
+            fields.push(Field::text(
+                "name",
+                "name",
+                "routing prefix and policy name: agents call /<name>/<path>",
+            ));
+            fields.push(Field::text(
+                "base-url",
+                "base url",
+                "where the proxy forwards to, e.g. https://api.github.com",
+            ));
+            fields.extend(form::auth_fields());
+            fields.push(Field::text(
+                "set-header",
+                "headers",
+                "static headers to send upstream, NAME=VALUE — never a credential, that is what the secret is for",
+            ));
+            Form::new(
+                Intent::Upstream,
+                "add an upstream",
+                "Pick a profile above, or spell the service out. The credential is a reference — the proxy resolves it and attaches it on the way out.",
+                fields,
+            )
+        }
+    }
+    .with_picker()
 }
 
 /// The same form, opened on an upstream that already exists.
@@ -1996,13 +2087,29 @@ fn rule_form() -> Form {
 }
 
 fn profile_form(profile: &Profile) -> Form {
+    let mut fields = vec![Field::prefilled("id", "profile", "", &profile.id)];
+    fields.extend(profile_fields(profile));
+    Form::new(
+        Intent::Profile,
+        &format!("add `{}`", profile.id),
+        &format!("{} — {}", profile.credential.about, profile.credential.url),
+        fields,
+    )
+}
+
+/// Everything a profile enrolment asks for beyond which profile it is.
+///
+/// Shared by the profiles pane, which knows the profile from the row the
+/// cursor is on, and the upstream form, which knows it from its picker — so
+/// the same profile asks for the same things whichever door it was reached
+/// through.
+fn profile_fields(profile: &Profile) -> Vec<Field> {
     let levels: Vec<&str> = profile
         .access
         .iter()
         .map(|level| level.name.as_str())
         .collect();
     let mut fields = vec![
-        Field::prefilled("id", "profile", "", &profile.id),
         Field::prefilled("as", "name", "name it takes in the policy file — how one proxy fronts two accounts of the same service", &profile.default_name),
         Field::text("secret", "secret", "credential reference: env:NAME, file:/path, op://vault/item/field"),
         Field::choice("access", "access", "which bundle of scopes and rules to write", &levels),
@@ -2036,12 +2143,7 @@ fn profile_form(profile: &Profile) -> Form {
         "show the TOML it would write, and write nothing",
     ));
 
-    Form::new(
-        Intent::Profile,
-        &format!("add `{}`", profile.id),
-        &format!("{} — {}", profile.credential.about, profile.credential.url),
-        fields,
-    )
+    fields
 }
 
 #[cfg(test)]
@@ -2435,6 +2537,9 @@ action = "ask"
         app.tab = Tab::Upstreams;
 
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        // The form opens on the profile picker, left where it starts: this is
+        // the operator who is spelling the service out.
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
         type_in(&mut app, "linear");
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
         type_in(&mut app, "https://api.linear.app");
@@ -2473,9 +2578,9 @@ action = "ask"
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
 
-        let mut form = upstream_form();
-        form.fields[0].value = form::Value::Text("linear".into());
-        form.fields[1].value = form::Value::Text("https://api.linear.app".into());
+        let mut form = upstream_form(&app.profiles, NO_PROFILE);
+        set(&mut form, "name", "linear");
+        set(&mut form, "base-url", "https://api.linear.app");
 
         let effect = actions::submit(&app.policy, &form).unwrap();
         app.refresh();
@@ -2492,6 +2597,107 @@ action = "ask"
 
         let rendered = render(&mut app, 160, 34);
         assert!(!rendered.contains("restart"), "{rendered}");
+    }
+
+    /// The bug this closes: the two doors to the same service were separate
+    /// rooms. `n` on the upstreams pane opened a blank form, so the operator
+    /// typed out a base URL, a credential scheme and — the part that actually
+    /// matters — a set of ACL paths nobody reviewed, while a profile that had
+    /// all three sat unfound on a pane they had no reason to visit.
+    #[tokio::test]
+    async fn an_upstream_can_be_added_from_a_profile_without_leaving_the_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        let picked = |app: &App| match &app.modal {
+            Some(Modal::Form(form)) => form.text("id"),
+            _ => panic!("the form is open"),
+        };
+        assert_eq!(
+            picked(&app),
+            NO_PROFILE,
+            "it opens on no profile — the blank form is still one keystroke away"
+        );
+
+        // `→` walks the catalogue. Every step is a different form.
+        while picked(&app) != "github" {
+            app.handle(KeyEvent::from(KeyCode::Right)).unwrap();
+            assert!(app.modal.is_some(), "browsing does not close the form");
+        }
+
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form is open")
+        };
+        assert_eq!(
+            form.text("as"),
+            "github",
+            "the picked profile names the service"
+        );
+        assert!(
+            form.fields.iter().all(|field| field.key != "base-url"),
+            "a profile already knows where it forwards to — asking again is the segregation"
+        );
+        assert_eq!(
+            form.text("access"),
+            "read",
+            "and opens on the narrowest level it offers"
+        );
+
+        // Name it something this policy does not already front — one proxy
+        // fronting two GitHub accounts is what `as` is for — and fill in the
+        // one thing no profile can know.
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // as
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        type_in(&mut app, "gh");
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
+        type_in(&mut app, "env:AGENT_IAP_TEST_TOKEN");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(app.modal.is_none(), "a saved form closes");
+        app.refresh();
+
+        let config = app.state.config();
+        let upstream = config
+            .upstream("gh")
+            .expect("the profile writes an upstream, routable without a restart");
+        assert_eq!(upstream.base_url, "https://api.github.com");
+        assert!(
+            config.acl.iter().any(|rule| {
+                rule.name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("gh-"))
+            }),
+            "and its ACL rules, which is the whole reason to start from a profile"
+        );
+    }
+
+    /// An MCP profile is not an upstream. Offering one here would write an
+    /// `[[mcp_servers]]` entry from a form headed "add an upstream".
+    #[test]
+    fn the_upstream_picker_offers_only_the_services_an_upstream_can_be() {
+        let catalogue = crate::profiles::catalog();
+        let form = upstream_form(&catalogue, NO_PROFILE);
+        let form::Value::Choice { options, .. } = &form.fields[0].value else {
+            panic!("the picker is a choice")
+        };
+
+        for profile in &catalogue {
+            let offered = options.contains(&profile.id);
+            assert_eq!(
+                offered,
+                profile.service.kind() == "http",
+                "`{}` is {} and {} offered",
+                profile.id,
+                profile.service.kind(),
+                if offered { "is" } else { "is not" }
+            );
+        }
+        assert!(
+            catalogue.iter().any(|p| p.service.kind() == "mcp"),
+            "the assertion above is only worth making while MCP profiles exist"
+        );
     }
 
     /// The pane could add and remove and nothing else, so "this API moved" or
@@ -2745,6 +2951,17 @@ action = "ask"
         for c in text.chars() {
             app.handle(KeyEvent::from(KeyCode::Char(c))).unwrap();
         }
+    }
+
+    /// Fill a field by the key the submit handler reads it back by. Indices
+    /// move as a form grows fields; the key is the contract.
+    fn set(form: &mut Form, key: &str, value: &str) {
+        let field = form
+            .fields
+            .iter_mut()
+            .find(|field| field.key == key)
+            .unwrap_or_else(|| panic!("no `{key}` field on this form"));
+        field.value = form::Value::Text(value.into());
     }
 
     /// The regression this guards: the profile add form used to fold every

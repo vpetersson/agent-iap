@@ -79,11 +79,34 @@ impl Field {
         hint: impl Into<Cow<'static, str>>,
         options: &[&str],
     ) -> Self {
+        Field::choices(
+            key,
+            label,
+            hint,
+            options.iter().map(|o| o.to_string()).collect(),
+            0,
+        )
+    }
+
+    /// A `Choice` whose options are only known at runtime — the profile
+    /// catalogue — opened on one of them rather than on the first.
+    pub fn choices(
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+        hint: impl Into<Cow<'static, str>>,
+        options: Vec<String>,
+        selected: usize,
+    ) -> Self {
+        // Clamped rather than trusted: `rendered` indexes this, and a caller
+        // that looked a since-removed option up should get the first entry,
+        // not a panic in the middle of a draw.
+        let selected = if selected < options.len() {
+            selected
+        } else {
+            0
+        };
         Field {
-            value: Value::Choice {
-                options: options.iter().map(|o| o.to_string()).collect(),
-                selected: 0,
-            },
+            value: Value::Choice { options, selected },
             ..Field::text(key, label, hint)
         }
     }
@@ -107,7 +130,9 @@ impl Field {
     fn rendered(&self) -> String {
         match &self.value {
             Value::Text(text) => text.clone(),
-            Value::Choice { options, selected } => options[*selected].clone(),
+            Value::Choice { options, selected } => {
+                options.get(*selected).cloned().unwrap_or_default()
+            }
             Value::Flag(true) => "yes".into(),
             Value::Flag(false) => "no".into(),
         }
@@ -139,6 +164,11 @@ pub struct Form {
     pub fields: Vec<Field>,
     focus: usize,
     pub error: Option<String>,
+    /// This form opens on a profile picker, so moving that choice is not an
+    /// edit to a field — it is a different form. The console rebuilds it;
+    /// this module knows nothing about the catalogue, only that the first
+    /// field decides what the rest of them are.
+    pub picker: bool,
 }
 
 /// Which enrolment a filled-in form is.
@@ -164,9 +194,16 @@ impl Form {
             fields,
             focus: 0,
             error: None,
+            picker: false,
         };
         form.focus = form.visible().first().copied().unwrap_or(0);
         form
+    }
+
+    /// Say that the first field is a profile picker. See `picker`.
+    pub fn with_picker(mut self) -> Self {
+        self.picker = true;
+        self
     }
 
     /// Indices of the fields the current choices make relevant.
@@ -348,10 +385,10 @@ impl Form {
             }
             (KeyCode::Char(' '), Value::Flag(on)) => *on = !*on,
             (KeyCode::Left, Value::Flag(on)) | (KeyCode::Right, Value::Flag(on)) => *on = !*on,
-            (KeyCode::Right, Value::Choice { options, selected }) => {
+            (KeyCode::Right, Value::Choice { options, selected }) if !options.is_empty() => {
                 *selected = (*selected + 1) % options.len();
             }
-            (KeyCode::Left, Value::Choice { options, selected }) => {
+            (KeyCode::Left, Value::Choice { options, selected }) if !options.is_empty() => {
                 *selected = (*selected + options.len() - 1) % options.len();
             }
             _ => {}

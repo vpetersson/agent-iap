@@ -275,21 +275,56 @@ enum AgentCommand {
 #[derive(Subcommand)]
 enum UpstreamCommand {
     /// Add a service the proxy fronts, and the credential it attaches.
+    ///
+    /// Either start from a profile — `--profile github` brings the base URL,
+    /// the credential scheme and a reviewed set of ACL rules with it — or spell
+    /// the service out with `--base-url` and the credential flags.
+    /// `agent-iap profile list` shows every profile there is.
     Add {
         /// Routing prefix and policy name: agents call `/<name>/<path>`.
         name: String,
         #[command(flatten)]
         config: ConfigArg,
+        /// Start from a profile, from `agent-iap profile list`. Supplies the
+        /// base URL, the credential scheme and the ACL rules; the credential
+        /// itself is still yours to name with `--secret`.
+        #[arg(long, value_name = "ID")]
+        profile: Option<String>,
         /// Where the proxy forwards to, e.g. `https://api.anthropic.com`.
-        #[arg(long, value_name = "URL")]
-        base_url: String,
+        /// Not needed with `--profile`, which already knows.
+        #[arg(
+            long,
+            value_name = "URL",
+            required_unless_present = "profile",
+            conflicts_with = "profile"
+        )]
+        base_url: Option<String>,
         // Boxed only for its size: the credential flags dwarf every other
         // variant of this enum, `rm` most of all.
         #[command(flatten)]
         auth: Box<AuthFlags>,
+        /// With `--profile`: which bundle of scopes and rules to write.
+        /// Defaults to the narrowest the profile offers.
+        #[arg(long, value_name = "LEVEL", requires = "profile")]
+        access: Option<String>,
+        /// With `--profile`: a profile variable, `name=value`. Repeatable.
+        #[arg(long = "var", value_name = "NAME=VALUE", requires = "profile")]
+        vars: Vec<String>,
+        /// With `--profile`: scope the rules to one agent or glob. Defaults to
+        /// every agent.
+        #[arg(long, value_name = "ID", requires = "profile")]
+        agent: Option<String>,
+        /// With `--profile`: print the TOML that would be appended, and write
+        /// nothing.
+        #[arg(long, requires = "profile")]
+        dry_run: bool,
         /// Static header to send upstream, `Name=Value`. Repeatable. Never a
         /// credential — that is what `--secret` is for.
-        #[arg(long = "set-header", value_name = "NAME=VALUE")]
+        #[arg(
+            long = "set-header",
+            value_name = "NAME=VALUE",
+            conflicts_with = "profile"
+        )]
         set_headers: Vec<String>,
     },
     /// Remove a service, and stop injecting its credential.
@@ -459,6 +494,34 @@ struct AuthFlags {
 }
 
 impl AuthFlags {
+    /// Is `--secret` the only credential flag given?
+    ///
+    /// What `--profile` can live with: the profile already knows the scheme and
+    /// everything it reads, and the credential reference is the one thing it
+    /// cannot know. Spelled out field by field rather than derived from
+    /// `to_spec`, because the point is to catch a flag that would be *ignored*
+    /// — and an ignored `--header` is a credential attached the wrong way with
+    /// nothing on screen to say so.
+    fn only_secret(&self) -> bool {
+        matches!(self.auth, AuthArg::None)
+            && self.header.is_none()
+            && self.prefix.is_none()
+            && self.username.is_none()
+            && self.username_secret.is_none()
+            && self.param.is_none()
+            && self.key_file.is_none()
+            && self.private_key.is_none()
+            && self.issuer.is_none()
+            && self.key_id.is_none()
+            && self.token_url.is_none()
+            && self.audience.is_none()
+            && self.scopes.is_empty()
+            && self.subject.is_none()
+            && self.lifetime_secs.is_none()
+            && self.client_id.is_none()
+            && self.client_secret.is_none()
+    }
+
     /// Hand the flags to `enroll`, which owns the rule about which scheme needs
     /// which of them. The console's form builds the same struct, so the two
     /// front ends cannot disagree about what a credential needs.
@@ -744,14 +807,24 @@ fn main() -> Result<()> {
         Command::Upstream(UpstreamCommand::Add {
             name,
             config,
+            profile,
             base_url,
             auth,
+            access,
+            vars,
+            agent,
+            dry_run,
             set_headers,
         }) => add_upstream(AddUpstream {
             path: config.config,
             name,
+            profile,
             base_url,
             auth,
+            access,
+            vars,
+            agent,
+            dry_run,
             set_headers,
         }),
         Command::Upstream(UpstreamCommand::Rm {
@@ -1398,7 +1471,15 @@ fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
         println!(
             "Wrote {path}. No agents, no upstreams — the proxy starts and denies everything.\n"
         );
-        println!("Add what it should front:");
+        // A profile first, because it writes the ACL rules too — and the rules
+        // are the half of this that is easy to get wrong quietly.
+        println!("Add what it should front. From a profile, service and rules together:");
+        println!("  agent-iap profile list");
+        println!(
+            "  agent-iap upstream add anthropic --profile anthropic --secret env:ANTHROPIC_API_KEY"
+        );
+        println!("  agent-iap agent add claude-code --target anthropic\n");
+        println!("Or spell the service out, and say what it may do:");
         println!(
             "  agent-iap upstream add anthropic --base-url https://api.anthropic.com \\\n             \x20     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY"
         );
@@ -1557,8 +1638,13 @@ fn joined(rules: &[enroll::RuleRef]) -> String {
 struct AddUpstream {
     path: PathBuf,
     name: String,
-    base_url: String,
+    profile: Option<String>,
+    base_url: Option<String>,
     auth: Box<AuthFlags>,
+    access: Option<String>,
+    vars: Vec<String>,
+    agent: Option<String>,
+    dry_run: bool,
     set_headers: Vec<String>,
 }
 
@@ -1566,11 +1652,39 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     let AddUpstream {
         path,
         name,
+        profile,
         base_url,
         auth,
+        access,
+        vars,
+        agent,
+        dry_run,
         set_headers,
     } = options;
 
+    // A profile is the same enrolment with the vendor's half already answered,
+    // so it goes to the same place `profile add` does — including the ACL
+    // rules, which are the part of a service definition nobody enjoys writing
+    // and the part that decides what the agent can actually do.
+    if let Some(id) = profile {
+        return add_upstream_from_profile(
+            &path,
+            &name,
+            &id,
+            &auth,
+            profiles::AddOptions {
+                name: Some(name.clone()),
+                secret: auth.secret.clone(),
+                access,
+                vars,
+                agent,
+                dry_run,
+            },
+        );
+    }
+
+    // clap has already refused the case where neither is given.
+    let base_url = base_url.context("`--base-url` is required without `--profile`")?;
     let auth = auth.to_spec()?;
     let headers = parse_pairs(&set_headers, "--set-header")?;
 
@@ -1584,6 +1698,37 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `upstream add --profile <id>`: the profile's service and rules, under the
+/// name this command was given.
+///
+/// Refuses an MCP profile rather than quietly writing an `[[mcp_servers]]`
+/// entry from a command called `upstream add` — the two share one name space,
+/// so a silent swap would put a service where nothing looks for it.
+fn add_upstream_from_profile(
+    path: &Path,
+    name: &str,
+    id: &str,
+    flags: &AuthFlags,
+    options: profiles::AddOptions,
+) -> Result<()> {
+    let profile = profiles::get(id)?;
+    if profile.service.kind() != "http" {
+        bail!(
+            "profile `{id}` is an MCP server, not an upstream — add it with \
+             `agent-iap profile add {id} --as {name}`, which writes it to `[[mcp_servers]]`"
+        );
+    }
+    // The profile is the scheme. A `--header` next to it is an operator who
+    // believes they are configuring something that is not going to be read.
+    if !flags.only_secret() {
+        bail!(
+            "`--profile` supplies the credential scheme — `--secret` is the only credential flag \
+             it reads. Drop the others, or drop `--profile` and spell the service out"
+        );
+    }
+    add_from_profile(path, &profile, &options)
 }
 
 fn remove_upstream(path: &Path, name: &str, prune: bool) -> Result<()> {
@@ -2056,7 +2201,17 @@ fn show_profile(id: &str) -> Result<()> {
 
 fn add_profile(path: &Path, id: &str, options: profiles::AddOptions) -> Result<()> {
     let profile = profiles::get(id)?;
-    let added = profiles::add(path, &profile, &options)?;
+    add_from_profile(path, &profile, &options)
+}
+
+/// Write a profile out and say what landed. Shared with `upstream add
+/// --profile`, so the two doors to one enrolment report the same thing.
+fn add_from_profile(
+    path: &Path,
+    profile: &profiles::Profile,
+    options: &profiles::AddOptions,
+) -> Result<()> {
+    let added = profiles::add(path, profile, options)?;
 
     if let Some(plan) = &added.plan {
         println!("{plan}");
