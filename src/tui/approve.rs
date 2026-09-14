@@ -6,12 +6,20 @@
 //! made that dialogue work are the two axes here. Across the top, how long the
 //! answer holds; down the middle, how far it reaches.
 //!
-//! The three durations are three different mechanisms, and the dialogue says
-//! which: once is this request; until quit is remembered in this process and
-//! dies with it; from now on is a rule written into the policy file, in front
-//! of the `ask` that raised the question — appended after it, first-match-wins
-//! would leave the new rule unreachable and the same question coming back.
+//! The durations are four different mechanisms, and the dialogue says which:
+//! once is this request; a TTL and "from now on" are both rules written into
+//! the policy file, in front of the `ask` that raised the question — appended
+//! after it, first-match-wins would leave the new rule unreachable and the same
+//! question coming back — differing only in whether the rule carries a deadline;
+//! until quit is remembered in this process and dies with it.
+//!
+//! The TTLs are the interesting ones, and the reason the dialogue is worth
+//! having at all. Most of what an operator wants to say is not "yes" and not
+//! "no" but "yes, while I am doing this" — and a console that cannot spell that
+//! leaves them picking between a grant that outlives the reason for it and
+//! being asked again in thirty seconds. Both of those end the same way.
 
+use chrono::{TimeDelta, Utc};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -30,20 +38,48 @@ use super::form::centred;
 pub enum Duration {
     /// This request, and nothing after it.
     Once,
-    /// Everything the scope covers, until this proxy exits.
+    /// Everything the scope covers, until the deadline — a rule in the policy
+    /// file that carries its own expiry, so the grant survives a restart and
+    /// runs out whether or not anyone remembers it.
+    For(&'static str),
+    /// Everything the scope covers, until this proxy exits. The only answer
+    /// that writes nothing.
     UntilQuit,
-    /// Everything the scope covers, written into the policy file.
+    /// Everything the scope covers, written into the policy file to stay.
     Forever,
 }
 
 impl Duration {
-    pub const ALL: [Duration; 3] = [Duration::Once, Duration::UntilQuit, Duration::Forever];
+    /// Left to right, shortest first: the cursor starts on the left, so the
+    /// order is also a ranking of how much is being given away.
+    pub const ALL: [Duration; 6] = [
+        Duration::Once,
+        Duration::For("5m"),
+        Duration::For("1h"),
+        Duration::For("1d"),
+        Duration::UntilQuit,
+        Duration::Forever,
+    ];
 
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Duration::Once => "Once",
-            Duration::UntilQuit => "Until quit",
-            Duration::Forever => "From now on",
+            Duration::Once => "Once".into(),
+            Duration::For("5m") => "5 min".into(),
+            Duration::For("1h") => "1 hour".into(),
+            Duration::For("1d") => "1 day".into(),
+            Duration::For(ttl) => ttl.to_string(),
+            Duration::UntilQuit => "Until quit".into(),
+            Duration::Forever => "From now on".into(),
+        }
+    }
+
+    /// How long this grant lasts, for the ones that have an answer.
+    pub fn ttl(self) -> Option<TimeDelta> {
+        match self {
+            // Parsed rather than carried as a `TimeDelta` so the spelling on
+            // screen and the length of the grant are the same one string.
+            Duration::For(ttl) => crate::enroll::parse_ttl(ttl).ok(),
+            _ => None,
         }
     }
 }
@@ -216,21 +252,37 @@ impl Dialogue {
     /// "From now on", so the consequence is spelled out rather than inferred.
     fn consequence(&self) -> String {
         let reach = &self.reaches[self.reach];
-        match Duration::ALL[self.duration] {
+        let duration = Duration::ALL[self.duration];
+        match duration {
             Duration::Once => "answers this one request; the next identical call asks again".into(),
             Duration::UntilQuit => format!(
                 "remembered for `{}` until agent-iap exits — nothing is written to disk",
                 reach.label.trim_start_matches("→ ")
             ),
-            Duration::Forever => match &self.view.asked_by {
-                Some(rule) => format!(
-                    "writes an acl rule into the policy file at #{}, in front of `{}`",
-                    rule.index, rule.label
+            // The deadline as a wall-clock time, not as the length again: the
+            // segment already says "1 hour", and what an operator cannot work
+            // out from that is when they will be asked next.
+            Duration::For(_) => match duration.ttl() {
+                Some(ttl) => format!(
+                    "writes an acl rule {}, expiring {} — after that this asks again",
+                    self.in_front_of(),
+                    (Utc::now() + ttl).format("at %H:%M on %-d %b"),
                 ),
-                None => "appends an acl rule to the policy file — the default action asked, so \
-                         there is no rule to get in front of"
-                    .into(),
+                None => "writes an acl rule with a deadline".into(),
             },
+            Duration::Forever => format!(
+                "writes an acl rule {}, with no end — `x` on the acl pane is what undoes it",
+                self.in_front_of()
+            ),
+        }
+    }
+
+    /// Where a written rule lands, which is the whole of whether it works.
+    fn in_front_of(&self) -> String {
+        match &self.view.asked_by {
+            Some(rule) => format!("at #{}, in front of `{}`", rule.index, rule.label),
+            None => "at the end — the default action asked, so there is no rule to get in front of"
+                .into(),
         }
     }
 
@@ -244,7 +296,12 @@ impl Dialogue {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
-                .title(" an agent is asking ")
+                // Named, not "an agent": this dialogue can be one of several on
+                // a proxy fronting a fleet, and "who is asking" is the first
+                // half of the question being answered. A title that does not
+                // say it makes the operator read the body to find out what they
+                // are even looking at.
+                .title(format!(" {} is asking ", self.view.agent_name))
                 .title_bottom(format!(" waiting {}s ", self.view.waited_ms / 1000)),
             popup,
         );
@@ -290,12 +347,21 @@ impl Dialogue {
         };
 
         vec![
-            Line::from(Span::styled(
-                self.view.agent_name.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(vec![
+                Span::styled(
+                    self.view.agent_name.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                // The id as well as the name: the id is what every audit record
+                // and every ACL rule says, so it is what the operator will type
+                // if this turns into a rule they write by hand later.
+                Span::styled(
+                    format!("  ({})", request.agent),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
             Line::from(vec![
                 Span::raw("wants to "),
                 Span::styled(wants, Style::default().fg(Color::Yellow)),

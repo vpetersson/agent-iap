@@ -242,13 +242,19 @@ pub fn mcp_servers(inventory: &Inventory) -> Table {
 pub fn acl(inventory: &Inventory) -> Table {
     Table {
         headers: vec![
-            "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION",
+            "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION", "EXPIRES",
         ],
         rows: inventory
             .acl
             .iter()
             .flatten()
             .map(|rule| {
+                let expires = rule.expires_in.clone();
+                // A rule whose deadline has passed is still in the file and
+                // still numbered, because the numbering is what `x` takes — but
+                // it decides nothing, and colouring it as though it did is the
+                // console telling the operator something untrue.
+                let spent = expires.as_deref() == Some("expired");
                 Row::accented(
                     [
                         rule.index.to_string(),
@@ -259,8 +265,13 @@ pub fn acl(inventory: &Inventory) -> Table {
                         rule.methods.join(","),
                         rule.paths.join(","),
                         rule.action.to_string(),
+                        expires.unwrap_or_else(|| "—".into()),
                     ],
-                    action_colour(rule.action),
+                    if spent {
+                        Color::DarkGray
+                    } else {
+                        action_colour(rule.action)
+                    },
                 )
             })
             .collect(),

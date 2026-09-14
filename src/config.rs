@@ -6,6 +6,7 @@
 //! credentials, so it is safe to keep in a repository.
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -603,6 +604,24 @@ pub struct AclRuleConfig {
     #[serde(default = "doublestar_vec")]
     pub paths: Vec<String>,
     pub action: Action,
+    /// When this rule stops applying. Absent means never.
+    ///
+    /// A grant with a deadline written into it is the one an operator can give
+    /// out freely: "yes, for the next hour" is a different risk from "yes", and
+    /// before this the file could only spell the second. Past the deadline the
+    /// rule matches nothing and the request falls through to whatever is
+    /// behind it — which, for a rule written in front of an `ask`, is the `ask`
+    /// again. Expiry is checked against the clock on every request, so it
+    /// survives a restart; nothing sweeps the file, so the rule stays visible
+    /// as the record of a grant that was made and has run out.
+    #[serde(default)]
+    pub expires: Option<DateTime<Utc>>,
+}
+
+impl AclRuleConfig {
+    pub fn expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires.is_some_and(|at| now >= at)
+    }
 }
 
 fn star() -> String {

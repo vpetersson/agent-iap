@@ -22,6 +22,7 @@
 //! pane worth distrusting.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -290,37 +291,38 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             let agent = default_to(form.text("agent"), "*");
             let kind = form.text("kind");
             let action = form.text("action");
+            let expires = form
+                .opt("expires-in")
+                .map(|ttl| enroll::parse_ttl(&ttl).map(|delta| Utc::now() + delta))
+                .transpose()?;
+
+            let name = form.opt("name");
+            let spec = enroll::RuleSpec {
+                name: name.as_deref(),
+                agent: &agent,
+                kind: &kind,
+                target: &target,
+                methods: &methods,
+                paths: &paths,
+                action: &action,
+                expires,
+            };
 
             let landed = match form.opt("position") {
                 Some(position) => {
                     let index: usize = position
                         .parse()
                         .with_context(|| format!("`{position}` is not a rule number"))?;
-                    enroll::insert_rule(
-                        path,
-                        index,
-                        form.opt("name").as_deref(),
-                        &agent,
-                        &kind,
-                        &target,
-                        &methods,
-                        &paths,
-                        &action,
-                    )?
+                    enroll::insert_rule(path, index, &spec)?
                 }
-                None => enroll::add_rule(
-                    path,
-                    form.opt("name").as_deref(),
-                    &agent,
-                    &kind,
-                    &target,
-                    &methods,
-                    &paths,
-                    &action,
-                )?,
+                None => enroll::add_rule(path, &spec)?,
+            };
+            let until = match expires {
+                Some(at) => format!(", for {}", enroll::remaining(at, Utc::now())),
+                None => String::new(),
             };
             Ok(Effect::said(format!(
-                "rule #{landed}: {action} {} {} on `{target}` for `{agent}` — live now",
+                "rule #{landed}: {action} {} {} on `{target}` for `{agent}`{until} — live now",
                 methods.join(","),
                 paths.join(",")
             )))

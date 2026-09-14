@@ -6,6 +6,7 @@
 //! anything that matches nothing falls through to the default — which is `deny`.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -132,10 +133,21 @@ struct CompiledRule {
     methods: Vec<GlobMatcher>,
     paths: Vec<PathPattern>,
     action: Action,
+    /// When this rule stops applying, if it does. Checked against the clock
+    /// rather than swept by a timer, so a grant that ran out while the proxy
+    /// was stopped is already over when it comes back.
+    expires: Option<DateTime<Utc>>,
 }
 
 impl CompiledRule {
-    fn matches(&self, request: &AccessRequest) -> bool {
+    fn matches(&self, request: &AccessRequest, now: Option<DateTime<Utc>>) -> bool {
+        // Checked first and cheaply: an expired rule is not a rule, and the
+        // glob work below is wasted on it.
+        if let (Some(expires), Some(now)) = (self.expires, now) {
+            if now >= expires {
+                return false;
+            }
+        }
         if let Some(kind) = self.kind {
             if kind != request.kind {
                 return false;
@@ -158,6 +170,9 @@ impl CompiledRule {
 struct Compiled {
     rules: Vec<CompiledRule>,
     default: Action,
+    /// Whether any rule has a deadline at all. When none does — the ordinary
+    /// case — evaluating a request never has to ask what time it is.
+    any_expiring: bool,
 }
 
 /// The compiled rule list, behind a lock so the console can replace it.
@@ -189,8 +204,12 @@ impl Acl {
 
     pub fn evaluate(&self, request: &AccessRequest) -> Decision {
         let compiled = self.compiled.read();
+        // One clock reading for the whole rule list, so two rules in the same
+        // decision cannot disagree about whether the deadline between them has
+        // passed. Skipped entirely when nothing in the file expires.
+        let now = compiled.any_expiring.then(Utc::now);
         for (index, rule) in compiled.rules.iter().enumerate() {
-            if rule.matches(request) {
+            if rule.matches(request, now) {
                 return Decision {
                     action: rule.action,
                     rule: Some(rule.label.clone()),
@@ -207,6 +226,23 @@ impl Acl {
 
     pub fn rule_count(&self) -> usize {
         self.compiled.read().rules.len()
+    }
+
+    /// Rules whose deadline has passed. They are still in the file and still
+    /// listed — a grant that ran out is a thing to have a record of — but they
+    /// match nothing, and a count of them is what tells an operator why a call
+    /// that worked this morning is being asked about again.
+    pub fn expired_count(&self) -> usize {
+        let compiled = self.compiled.read();
+        if !compiled.any_expiring {
+            return 0;
+        }
+        let now = Utc::now();
+        compiled
+            .rules
+            .iter()
+            .filter(|rule| rule.expires.is_some_and(|at| now >= at))
+            .count()
     }
 
     /// How many rules could ever apply to a target. Used to catch a config that
@@ -269,9 +305,11 @@ fn compile_all(config: &Config) -> Result<Compiled> {
     for (index, rule) in config.acl.iter().enumerate() {
         rules.push(compile_rule(index, rule)?);
     }
+    let any_expiring = rules.iter().any(|rule| rule.expires.is_some());
     Ok(Compiled {
         rules,
         default: config.acl_default.action,
+        any_expiring,
     })
 }
 
@@ -301,6 +339,7 @@ fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {
             .collect::<Result<_>>()
             .with_context(|| format!("{label}: paths"))?,
         action: rule.action,
+        expires: rule.expires,
         label,
     })
 }
@@ -339,6 +378,7 @@ pub(crate) fn path_glob(pattern: &str) -> Result<PathPattern> {
 mod tests {
     use super::*;
     use crate::config::AclDefault;
+    use chrono::Utc;
 
     fn config_from(toml_text: &str) -> Config {
         let config: Config = toml::from_str(toml_text).unwrap();
@@ -526,6 +566,69 @@ action = "ask"
             action: Action::Ask,
         };
         assert_eq!(Acl::compile(&config).unwrap().default_action(), Action::Ask);
+    }
+
+    #[test]
+    fn a_rule_stops_deciding_once_its_deadline_has_passed() {
+        // The grant an operator can hand out without having to remember to
+        // take it back. Past the deadline the request falls through to
+        // whatever is behind it — here, the `ask` the grant was written over.
+        let past = (Utc::now() - chrono::TimeDelta::try_minutes(1).unwrap())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let future = (Utc::now() + chrono::TimeDelta::try_hours(1).unwrap())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let acl = acl(&format!(
+            r#"
+[[acl]]
+name = "ran-out"
+target = "gh"
+action = "allow"
+expires = "{past}"
+
+[[acl]]
+name = "still-good"
+target = "anthropic"
+action = "allow"
+expires = "{future}"
+
+[[acl]]
+name = "writes-need-a-human"
+target = "gh"
+action = "ask"
+"#
+        ));
+
+        let spent = acl.evaluate(&AccessRequest::http("a", "gh", "POST", "/x"));
+        assert_eq!(spent.action, Action::Ask);
+        assert_eq!(
+            spent.rule_label(),
+            "writes-need-a-human",
+            "an expired rule must not decide, and must not shadow the one behind it"
+        );
+
+        let live = acl.evaluate(&AccessRequest::http("a", "anthropic", "POST", "/x"));
+        assert_eq!(live.action, Action::Allow);
+        assert_eq!(live.rule_label(), "still-good");
+
+        assert_eq!(
+            acl.expired_count(),
+            1,
+            "and it is still in the file, counted"
+        );
+    }
+
+    #[test]
+    fn a_policy_with_no_deadlines_never_asks_what_time_it_is() {
+        // Not a behaviour test — a cost one. Every request reads this list, and
+        // a clock reading per decision for a feature nobody used is a tax.
+        let acl = acl(r#"
+[[acl]]
+target = "gh"
+action = "allow"
+"#);
+        assert!(!acl.compiled.read().any_expiring);
+        assert_eq!(acl.expired_count(), 0);
     }
 
     #[test]

@@ -425,6 +425,23 @@ agent-iap mcp-server add notes --command notes-mcp --arg --stdio \
     --env NOTES_TOKEN=op://Private/Notes/token
 ```
 
+A rule can be given a deadline, from the console's dialogue or from here:
+
+```bash
+# Access for the length of the job, and not a minute more.
+agent-iap acl add --name migration-window --agent claude-code \
+    --target github --methods POST --paths '/repos/acme/**' \
+    --action allow --expires-in 90m
+```
+
+`--expires-in` takes `30s`, `5m`, `1h`, `7d` — never a bare number, because
+"allow this for 5" is a question about units nobody should have to stop and ask,
+and being wrong by a factor of sixty only goes one way. The deadline is written
+into the rule as a UTC timestamp, checked against the clock on every request,
+and so survives a restart. Nothing sweeps expired rules out of the file: they
+stay visible, listed as `expired`, because a grant that was made and has run out
+is a thing to have a record of.
+
 `--username-secret` is for the APIs that put the credential in the user half of
 basic auth — Graylog's `<token>:token`, and its session-token variant. Spelling
 that with a plain `--username` would mean the token itself living in a file
@@ -548,37 +565,51 @@ timeout denies. It is Little Snitch's dialogue, and for Little Snitch's reason:
 is may this agent do this much, for how long.
 
 ```
-┌ an agent is asking ──────────────────────────────────────────┐
-│  Claude Code                                                 │
+┌ Claude Code is asking ───────────────────────────────────────┐
+│  Claude Code  (claude-code)                                  │
 │  wants to POST /repos/acme/api/issues on github              │
 │  agent-iap holds the credential and attaches it on the way   │
 │  out — allowing this does not hand it over.                  │
 │                                                              │
-│       Once   Until quit   From now on                        │
+│    Once   5 min   1 hour   1 day   Until quit   From now on  │
 │                                                              │
 │      ( ) any request from Claude Code                        │
 │      ( ) → anything on github                                │
 │      ( ) → POST on github                                    │
 │      (•) → POST /repos/acme/api/issues on github             │
 │                                                              │
-│  writes an acl rule into the policy file at #0, in front of  │
-│  `github-writes-need-a-human`                                │
+│  writes an acl rule at #0, in front of                       │
+│  `github-writes-need-a-human`, expiring at 10:41 on 14 Sep   │
+│  — after that this asks again                                │
 │                                                              │
 │       d  Deny     a  Allow     esc  leave it waiting         │
 └──────────────────────────────── waiting 4s ──────────────────┘
 ```
 
 `←`/`→` picks how long, `↑`/`↓` picks how far, and the line above the buttons
-says what the pair of them will actually do. The three durations are three
-different mechanisms:
+says what the pair of them will actually do. The durations are four different
+mechanisms:
 
 - **Once** answers this request. The next identical call asks again.
+- **5 min / 1 hour / 1 day** write an ACL rule that carries its own deadline.
+  Past it the rule matches nothing and the request falls through to whatever is
+  behind it — which, for a rule written in front of an `ask`, is the `ask`
+  again.
 - **Until quit** is remembered in this process, for everything the chosen row
-  covers, and dies with it. Nothing is written to disk.
-- **From now on** writes an ACL rule into the policy file — *in front of* the
-  `ask` rule that raised the question, because first match wins and an appended
-  rule would sit behind it and never be reached. The rule is live in this
-  process immediately.
+  covers, and dies with it. The only answer that writes nothing.
+- **From now on** writes the same rule without a deadline.
+
+Everything that writes a rule writes it *in front of* the `ask` that raised the
+question, because first match wins and an appended rule would sit behind it and
+never be reached. All of them are live in this process immediately.
+
+The TTLs are the ones worth having. Most of what an operator wants to say is
+not "yes" and not "no" but *yes, while I am doing this* — and a console that
+cannot spell that leaves them choosing between a grant that outlives the reason
+for it and being asked again in thirty seconds. Both of those end with somebody
+holding the key down. Because the deadline is in the file rather than in this
+process's memory, a restart in the middle does not hand the grant back, and
+nothing has to remember to take it away.
 
 The cursor starts on the narrowest row and on `Once`: a dialogue whose default
 hands out more than was asked for is a dialogue that hands out more than was
@@ -596,7 +627,7 @@ from a shell is a form here, over the same functions with the same validation:
 | agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
 | upstreams | base URL, scheme, credential reference | `n` `x` |
 | mcp | transport, command or URL, credential references | `n` `x` |
-| acl | every rule in match order, with its number | `n` `x` |
+| acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
 
@@ -1060,6 +1091,17 @@ target = "github"
 methods = ["GET"]
 paths = ["/repos/**"]
 action = "allow"
+
+# A grant with a deadline in it. Past `expires` this rule matches nothing and
+# whatever is behind it decides instead — so the access ends on the clock
+# rather than on somebody remembering to take it away.
+[[acl]]
+agent = "claude-code"
+target = "github"
+methods = ["POST"]
+paths = ["/repos/acme/**"]
+action = "allow"
+expires = "2026-09-15T09:00:00Z"
 ```
 
 Each agent has its own token; the file holds only hashes, and two agents sharing

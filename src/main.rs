@@ -485,6 +485,11 @@ enum AclCommand {
         /// `allow`, `deny`, or `ask` to prompt a human at the `run` console.
         #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
         action: ActionArg,
+        /// How long this rule lasts: `30s`, `5m`, `1h`, `7d`. Past it the rule
+        /// matches nothing and whatever is behind it decides instead. The
+        /// grant you can hand out without having to remember to take it back.
+        #[arg(long, value_name = "DURATION")]
+        expires_in: Option<String>,
     },
     /// Remove a rule by its number. Everything after it moves up one, so
     /// removing several means re-reading the list between them.
@@ -782,16 +787,18 @@ fn main() -> Result<()> {
             methods,
             paths,
             action,
-        }) => add_rule(
-            &config.config,
-            name.as_deref(),
-            &agent,
-            &kind,
-            &target,
-            &methods,
-            &paths,
+            expires_in,
+        }) => add_rule(AddRule {
+            path: config.config,
+            name,
+            agent,
+            kind,
+            target,
+            methods,
+            paths,
             action,
-        ),
+            expires_in,
+        }),
         Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
         Command::GenToken { id } => gen_token(&id),
         Command::HashToken { token } => {
@@ -1502,38 +1509,62 @@ fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_rule(
-    path: &Path,
-    name: Option<&str>,
-    agent: &str,
-    kind: &str,
-    target: &str,
-    methods: &[String],
-    paths: &[String],
+/// The flags of `agent-iap acl add`, carried together.
+struct AddRule {
+    path: PathBuf,
+    name: Option<String>,
+    agent: String,
+    kind: String,
+    target: String,
+    methods: Vec<String>,
+    paths: Vec<String>,
     action: ActionArg,
-) -> Result<()> {
+    expires_in: Option<String>,
+}
+
+fn add_rule(options: AddRule) -> Result<()> {
+    let expires = options
+        .expires_in
+        .as_deref()
+        .map(|ttl| enroll::parse_ttl(ttl).map(|delta| chrono::Utc::now() + delta))
+        .transpose()
+        .context("--expires-in")?;
+
     enroll::add_rule(
-        path,
-        name,
-        agent,
-        kind,
-        target,
-        methods,
-        paths,
-        action.as_str(),
+        &options.path,
+        &enroll::RuleSpec {
+            name: options.name.as_deref(),
+            agent: &options.agent,
+            kind: &options.kind,
+            target: &options.target,
+            methods: &options.methods,
+            paths: &options.paths,
+            action: options.action.as_str(),
+            expires,
+        },
     )?;
-    let count = enroll::rule_count(path)?;
+
+    let count = enroll::rule_count(&options.path)?;
     println!(
-        "Added rule {count} of {count} to {}: {} {} {} on `{target}` for `{agent}`.",
-        path.display(),
-        action.as_str(),
-        methods.join(","),
-        paths.join(","),
+        "Added rule {count} of {count} to {}: {} {} {} on `{}` for `{}`.",
+        options.path.display(),
+        options.action.as_str(),
+        options.methods.join(","),
+        options.paths.join(","),
+        options.target,
+        options.agent,
     );
     // Position is the whole semantics of an ACL, so say it rather than making
     // the operator infer it from the file.
     println!("Rules match in file order and the first match wins, so this one is checked last.");
+    if let Some(expires) = expires {
+        // A deadline nobody can see coming is a call that stops working for no
+        // visible reason, so print the wall-clock time rather than the length.
+        println!(
+            "It stops applying at {} — after that, whatever is behind it decides.",
+            expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+    }
     Ok(())
 }
 

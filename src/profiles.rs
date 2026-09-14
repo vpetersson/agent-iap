@@ -339,16 +339,7 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
     }
 
     for rule in &rules {
-        enroll::add_rule(
-            path,
-            Some(&rule.name),
-            &agent,
-            &rule.kind,
-            &name,
-            &rule.methods,
-            &rule.paths,
-            &rule.action,
-        )?;
+        enroll::add_rule(path, &planned_spec(rule, &agent, &name))?;
     }
 
     Ok(added)
@@ -365,18 +356,29 @@ fn render_plan(
     plan.push_str(&enroll::render_service(name, service_spec(service), auth));
     plan.push('\n');
     for rule in rules {
-        plan.push_str(&enroll::render_rule(
-            Some(&rule.name),
-            agent,
-            &rule.kind,
-            name,
-            &rule.methods,
-            &rule.paths,
-            &rule.action,
-        ));
+        plan.push_str(&enroll::render_rule(&planned_spec(rule, agent, name)));
         plan.push('\n');
     }
     plan
+}
+
+/// A profile's rule, in the shape `enroll` writes. Profiles grant standing
+/// access, so nothing here expires — a profile is the policy, not a loan.
+fn planned_spec<'a>(
+    rule: &'a PlannedRule,
+    agent: &'a str,
+    target: &'a str,
+) -> enroll::RuleSpec<'a> {
+    enroll::RuleSpec {
+        name: Some(&rule.name),
+        agent,
+        kind: &rule.kind,
+        target,
+        methods: &rule.methods,
+        paths: &rule.paths,
+        action: &rule.action,
+        expires: None,
+    }
 }
 
 fn service_spec(service: &Service) -> enroll::ServiceSpec<'_> {

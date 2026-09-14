@@ -771,18 +771,27 @@ impl App {
                     reach.label.trim_start_matches("→ ")
                 ));
             }
-            approve::Duration::Forever => {
-                // In front of the rule that asked, or appended when the default
-                // did the asking. Either way the request in hand is answered
-                // directly: the new rule governs the *next* call, and this one
-                // is already parked behind it.
+            // Both of these write a rule; the only difference is whether it
+            // carries a deadline. In front of the rule that asked, or appended
+            // when the default did the asking. Either way the request in hand
+            // is answered directly: the new rule governs the *next* call, and
+            // this one is already parked behind it.
+            approve::Duration::For(_) | approve::Duration::Forever => {
                 let at = view.asked_by.as_ref().map(|rule| rule.index);
-                match self.write_rule(&reach.rule, word, at) {
+                let ttl = duration.ttl();
+                match self.write_rule(&reach.rule, word, at, ttl) {
                     Ok(landed) => {
                         self.state.broker.decide_scoped(&view.id, verdict, None);
                         self.refresh();
+                        let until = match ttl {
+                            Some(ttl) => format!(
+                                "until {}",
+                                (chrono::Utc::now() + ttl).format("%H:%M on %-d %b")
+                            ),
+                            None => "from now on".to_string(),
+                        };
                         self.say(format!(
-                            "wrote rule #{landed} to {} — {word} {} from now on",
+                            "wrote rule #{landed} to {} — {word} {} {until}",
                             self.policy.path.display(),
                             reach.label.trim_start_matches("→ ")
                         ));
@@ -798,36 +807,35 @@ impl App {
         }
     }
 
+    /// Write the grant the dialogue just made into the policy file.
+    ///
+    /// `before` is where it has to land: in front of the `ask` rule that raised
+    /// the question, because first match wins. `ttl` is what turns "yes" into
+    /// "yes, for now" — the rule carries its own deadline, so the grant runs
+    /// out on the clock rather than on somebody remembering to take it back,
+    /// and it survives a restart in between.
     fn write_rule(
         &self,
         rule: &approve::RuleShape,
         action: &str,
         before: Option<usize>,
+        ttl: Option<chrono::TimeDelta>,
     ) -> Result<usize> {
         let name = format!("console-{action}-{}-{}", rule.agent, rule.target);
+        let spec = crate::enroll::RuleSpec {
+            name: Some(&name),
+            agent: &rule.agent,
+            kind: &rule.kind,
+            target: &rule.target,
+            methods: &rule.methods,
+            paths: &rule.paths,
+            action,
+            expires: ttl.map(|ttl| chrono::Utc::now() + ttl),
+        };
         let path = self.policy.path.as_path();
         match before {
-            Some(index) => crate::enroll::insert_rule(
-                path,
-                index,
-                Some(&name),
-                &rule.agent,
-                &rule.kind,
-                &rule.target,
-                &rule.methods,
-                &rule.paths,
-                action,
-            ),
-            None => crate::enroll::add_rule(
-                path,
-                Some(&name),
-                &rule.agent,
-                &rule.kind,
-                &rule.target,
-                &rule.methods,
-                &rule.paths,
-                action,
-            ),
+            Some(index) => crate::enroll::insert_rule(path, index, &spec),
+            None => crate::enroll::add_rule(path, &spec),
         }
     }
 
@@ -1744,6 +1752,147 @@ action = "ask"
         );
     }
 
+    /// The answer most questions actually deserve: yes, for now.
+    #[tokio::test]
+    async fn a_ttl_grant_writes_a_rule_that_expires_and_then_asks_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let view = waiting();
+
+        let hour = approve::Duration::For("1h");
+        let reach = approve::reaches(&view).pop().unwrap();
+        app.answer(&view, Verdict::Allow, hour, reach);
+
+        // Live now, in this process…
+        assert_eq!(
+            app.state.acl.evaluate(&view.request).action,
+            crate::config::Action::Allow
+        );
+
+        // …and written down with its own deadline, in front of the `ask`, so a
+        // restart in the meantime does not hand the grant back.
+        let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
+        assert!(written.contains("expires = "), "{written}");
+        assert!(
+            written.find("console-allow").unwrap()
+                < written.find("github-writes-need-a-human").unwrap(),
+            "{written}"
+        );
+
+        // Wind the deadline back past now, as the clock would. By line, not by
+        // searching for the timestamp: a tempdir path is random and the audit
+        // path is written above this, so anything matched by shape would
+        // sometimes match that instead.
+        let expired: Vec<String> = written
+            .lines()
+            .map(|line| match line.starts_with("expires = ") {
+                true => "expires = \"2020-01-01T00:00:00Z\"".to_string(),
+                false => line.to_string(),
+            })
+            .collect();
+        std::fs::write(dir.path().join("iap.toml"), expired.join("\n")).unwrap();
+        app.refresh();
+
+        assert_eq!(
+            app.state.acl.evaluate(&view.request).action,
+            crate::config::Action::Ask,
+            "a grant that has run out has to hand the question back, not keep answering it"
+        );
+        assert_eq!(app.state.acl.expired_count(), 1);
+
+        app.tab = Tab::Acl;
+        app.clamp_cursors();
+        let rendered = render(&mut app, 160, 30);
+        assert!(
+            rendered.contains("expired"),
+            "and the pane says so:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dialogue_names_the_agent_rather_than_calling_it_an_agent() {
+        // One proxy fronts a fleet. "An agent is asking" is the one thing the
+        // operator already knew.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.pending = vec![waiting()];
+        app.raise_dialogue();
+
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("Claude Code is asking"), "{rendered}");
+        assert!(
+            rendered.contains("(claude-code)"),
+            "and the id too, because that is what every rule and audit record says:\n{rendered}"
+        );
+        assert!(!rendered.contains("an agent is asking"), "{rendered}");
+    }
+
+    /// Every segment on the duration strip, carried out and then checked
+    /// against the mechanism it claims to be.
+    ///
+    /// A segment whose grant is not written where it says is a button that does
+    /// nothing, and the operator finds out by pressing it — a week later, when
+    /// the agent is still allowed or already is not.
+    #[tokio::test]
+    async fn every_duration_does_what_its_label_says() {
+        for duration in approve::Duration::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app_for_test(dir.path());
+            let view = waiting();
+            let reach = approve::reaches(&view).pop().unwrap();
+            let scope = reach.scope.clone();
+
+            app.answer(&view, Verdict::Allow, duration, reach);
+            assert!(
+                app.flash.as_ref().is_some_and(|flash| !flash.failed),
+                "{duration:?}: {:?}",
+                app.flash.as_ref().map(|flash| &flash.message)
+            );
+
+            let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
+            let on_disk = written.contains("console-allow");
+            let has_deadline = written.contains("expires = ");
+            let remembered = app
+                .state
+                .broker
+                .remembered()
+                .iter()
+                .any(|(scope, _)| scope.matches(&view.request));
+            let decides = app.state.acl.evaluate(&view.request).action;
+
+            match duration {
+                // Answers the one request and leaves no trace anywhere.
+                approve::Duration::Once => {
+                    assert!(!on_disk, "{duration:?} wrote to the policy file");
+                    assert!(!remembered, "{duration:?} left a standing answer");
+                    assert_eq!(decides, crate::config::Action::Ask);
+                }
+                // In memory, covering the whole scope, and nothing on disk.
+                approve::Duration::UntilQuit => {
+                    assert!(!on_disk, "{duration:?} wrote to the policy file");
+                    assert!(remembered, "{duration:?} remembered nothing");
+                    assert_eq!(scope, scope.clone());
+                    assert_eq!(decides, crate::config::Action::Ask);
+                }
+                // A rule, with a deadline on it.
+                approve::Duration::For(_) => {
+                    assert!(on_disk, "{duration:?} wrote no rule");
+                    assert!(has_deadline, "{duration:?} wrote a rule with no expiry");
+                    assert_eq!(decides, crate::config::Action::Allow);
+                }
+                // A rule, with none.
+                approve::Duration::Forever => {
+                    assert!(on_disk, "{duration:?} wrote no rule");
+                    assert!(
+                        !has_deadline,
+                        "{duration:?} put a deadline on `from now on`"
+                    );
+                    assert_eq!(decides, crate::config::Action::Allow);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn until_quit_remembers_the_scope_that_was_chosen_not_just_the_one_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -1925,13 +2074,16 @@ action = "ask"
         // What `agent-iap acl add` in the next terminal does.
         crate::enroll::add_rule(
             &dir.path().join("iap.toml"),
-            Some("added-from-a-shell"),
-            "*",
-            "http",
-            "github",
-            &["GET".into()],
-            &["/repos/**".into()],
-            "allow",
+            &crate::enroll::RuleSpec {
+                name: Some("added-from-a-shell"),
+                agent: "*",
+                kind: "http",
+                target: "github",
+                methods: &["GET".into()],
+                paths: &["/repos/**".into()],
+                action: "allow",
+                expires: None,
+            },
         )
         .unwrap();
 

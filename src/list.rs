@@ -118,6 +118,12 @@ pub struct AclRow {
     pub methods: Vec<String>,
     pub paths: Vec<String>,
     pub action: Action,
+    /// What is left of a time-limited grant, or `None` for one with no end.
+    /// Rendered as time remaining rather than as a timestamp: "47m" is the
+    /// thing being decided about, and a timestamp makes the reader do the
+    /// subtraction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<String>,
 }
 
 /// Everything the policy file exposes, in the sections that were asked for.
@@ -341,12 +347,13 @@ impl Inventory {
                         r.methods.join(","),
                         r.paths.join(","),
                         r.action.to_string(),
+                        r.expires_in.clone().unwrap_or_else(|| NONE.to_string()),
                     ]
                 })
                 .collect();
             let mut table = render_table(
                 &[
-                    "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION",
+                    "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION", "EXPIRES",
                 ],
                 &rows,
             );
@@ -520,6 +527,9 @@ fn acl_row(index: usize, rule: &crate::config::AclRuleConfig) -> AclRow {
         methods: rule.methods.clone(),
         paths: rule.paths.clone(),
         action: rule.action,
+        expires_in: rule
+            .expires
+            .map(|at| crate::enroll::remaining(at, chrono::Utc::now())),
     }
 }
 
