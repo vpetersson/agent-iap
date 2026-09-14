@@ -254,7 +254,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                     secret: form.opt("secret"),
                     access: form.opt("access"),
                     vars: form
-                        .pairs("var")?
+                        .prefixed("var:")
                         .into_iter()
                         .map(|(name, value)| format!("{name}={value}"))
                         .collect(),

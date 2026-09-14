@@ -14,6 +14,8 @@ use ratatui::Frame;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use std::borrow::Cow;
+
 use crate::enroll::{AuthInput, AUTH_SCHEMES};
 
 /// What a field holds.
@@ -31,9 +33,11 @@ pub enum Value {
 pub struct Field {
     /// Stable name the submit handler reads the value back by. Matches the
     /// CLI flag it stands in for, so the two are greppable against each other.
-    pub key: &'static str,
-    pub label: &'static str,
-    pub hint: &'static str,
+    /// Owned rather than `&'static`, so a form can grow a field for something
+    /// only known at runtime — one per a profile's variables, keyed by name.
+    pub key: Cow<'static, str>,
+    pub label: Cow<'static, str>,
+    pub hint: Cow<'static, str>,
     pub value: Value,
     /// Shown only when the `Choice` field named here is on one of these
     /// options. A credential form that asks for a token endpoint while you are
@@ -42,20 +46,24 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn text(key: &'static str, label: &'static str, hint: &'static str) -> Self {
+    pub fn text(
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+        hint: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Field {
-            key,
-            label,
-            hint,
+            key: key.into(),
+            label: label.into(),
+            hint: hint.into(),
             value: Value::Text(String::new()),
             shown_for: None,
         }
     }
 
     pub fn prefilled(
-        key: &'static str,
-        label: &'static str,
-        hint: &'static str,
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+        hint: impl Into<Cow<'static, str>>,
         value: &str,
     ) -> Self {
         Field {
@@ -65,9 +73,9 @@ impl Field {
     }
 
     pub fn choice(
-        key: &'static str,
-        label: &'static str,
-        hint: &'static str,
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+        hint: impl Into<Cow<'static, str>>,
         options: &[&str],
     ) -> Self {
         Field {
@@ -79,7 +87,11 @@ impl Field {
         }
     }
 
-    pub fn flag(key: &'static str, label: &'static str, hint: &'static str) -> Self {
+    pub fn flag(
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+        hint: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Field {
             value: Value::Flag(false),
             ..Field::text(key, label, hint)
@@ -170,7 +182,7 @@ impl Form {
     fn raw(&self, key: &str) -> Option<String> {
         self.fields
             .iter()
-            .find(|field| field.key == key)
+            .find(|field| field.key.as_ref() == key)
             .map(Field::rendered)
     }
 
@@ -190,7 +202,7 @@ impl Form {
         matches!(
             self.fields
                 .iter()
-                .find(|field| field.key == key)
+                .find(|field| field.key.as_ref() == key)
                 .map(|field| &field.value),
             Some(Value::Flag(true))
         )
@@ -221,6 +233,24 @@ impl Form {
                     .ok_or_else(|| {
                         anyhow::anyhow!("`{entry}` is not `NAME=VALUE` — {key} takes pairs")
                     })
+            })
+            .collect()
+    }
+
+    /// The `value` of every field keyed `<prefix><name>`, paired back with that
+    /// `name` and dropping the ones left blank. How a form that grew one field
+    /// per thing — a profile's variables, each its own labelled field — gathers
+    /// them back into the `name=value` list the enrolment takes.
+    pub fn prefixed(&self, prefix: &str) -> Vec<(String, String)> {
+        self.fields
+            .iter()
+            .filter_map(|field| {
+                let name = field.key.strip_prefix(prefix)?;
+                let Value::Text(value) = &field.value else {
+                    return None;
+                };
+                let value = value.trim();
+                (!value.is_empty()).then(|| (name.to_string(), value.to_string()))
             })
             .collect()
     }
@@ -427,7 +457,7 @@ impl Form {
         let hint = self
             .fields
             .get(self.focus)
-            .map(|field| field.hint)
+            .map(|field| field.hint.as_ref())
             .unwrap_or_default();
         let footer = match &self.error {
             Some(error) => Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red)),
@@ -486,7 +516,7 @@ pub fn auth_fields() -> Vec<Field> {
 
     for scheme in AUTH_SCHEMES {
         for key in AuthInput::fields_for(scheme) {
-            if fields.iter().any(|field| field.key == *key) {
+            if fields.iter().any(|field| field.key.as_ref() == *key) {
                 continue;
             }
             let schemes: Vec<&str> = AUTH_SCHEMES
@@ -495,7 +525,7 @@ pub fn auth_fields() -> Vec<Field> {
                 .filter(|other| AuthInput::fields_for(other).contains(key))
                 .collect();
             let (label, hint) = wording(key);
-            fields.push(Field::text(key, label, hint).when("auth", &schemes));
+            fields.push(Field::text(*key, label, hint).when("auth", &schemes));
         }
     }
 
@@ -562,7 +592,7 @@ mod tests {
             let mut shown: Vec<&str> = form
                 .visible()
                 .into_iter()
-                .map(|index| form.fields[index].key)
+                .map(|index| form.fields[index].key.as_ref())
                 .filter(|key| *key != "auth")
                 .collect();
             let mut wanted: Vec<&str> = AuthInput::fields_for(scheme).to_vec();

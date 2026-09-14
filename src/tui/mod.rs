@@ -1859,26 +1859,46 @@ fn profile_form(profile: &Profile) -> Form {
         .iter()
         .map(|level| level.name.as_str())
         .collect();
-    let vars = profile
-        .vars
-        .iter()
-        .map(|var| format!("{}={}", var.name, var.default.clone().unwrap_or_default()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut fields = vec![
+        Field::prefilled("id", "profile", "", &profile.id),
+        Field::prefilled("as", "name", "name it takes in the policy file — how one proxy fronts two accounts of the same service", &profile.default_name),
+        Field::text("secret", "secret", "credential reference: env:NAME, file:/path, op://vault/item/field"),
+        Field::choice("access", "access", "which bundle of scopes and rules to write", &levels),
+    ];
+
+    // One field per profile variable, keyed `var:<name>` and carrying the var's
+    // own label and description — so a required one like DataForSEO's `login`
+    // asks for the login by name instead of hiding, unexplained, inside a single
+    // `NAME=VALUE` line the reader has to know to complete.
+    for var in &profile.vars {
+        let key = format!("var:{}", var.name);
+        match &var.default {
+            Some(default) => fields.push(Field::prefilled(
+                key,
+                var.name.clone(),
+                var.about.clone(),
+                default,
+            )),
+            None => fields.push(Field::text(key, var.name.clone(), var.about.clone())),
+        }
+    }
+
+    fields.push(Field::text(
+        "agent",
+        "agent",
+        "scope the rules to one agent or glob. Blank means every agent.",
+    ));
+    fields.push(Field::flag(
+        "dry-run",
+        "dry run",
+        "show the TOML it would write, and write nothing",
+    ));
 
     Form::new(
         Intent::Profile,
         &format!("add `{}`", profile.id),
         &format!("{} — {}", profile.credential.about, profile.credential.url),
-        vec![
-            Field::prefilled("id", "profile", "", &profile.id),
-            Field::prefilled("as", "name", "name it takes in the policy file — how one proxy fronts two accounts of the same service", &profile.default_name),
-            Field::text("secret", "secret", "credential reference: env:NAME, file:/path, op://vault/item/field"),
-            Field::choice("access", "access", "which bundle of scopes and rules to write", &levels),
-            Field::prefilled("var", "vars", "profile variables, NAME=VALUE", &vars),
-            Field::text("agent", "agent", "scope the rules to one agent or glob. Blank means every agent."),
-            Field::flag("dry-run", "dry run", "show the TOML it would write, and write nothing"),
-        ],
+        fields,
     )
 }
 
@@ -2457,6 +2477,49 @@ action = "ask"
         for c in text.chars() {
             app.handle(KeyEvent::from(KeyCode::Char(c))).unwrap();
         }
+    }
+
+    /// The regression this guards: the profile add form used to fold every
+    /// variable into one unexplained `NAME=VALUE` line, so DataForSEO's required
+    /// `login` never actually asked for the email — and a form saved as-is wrote
+    /// an empty username that 401s. Each variable now gets its own labelled,
+    /// described field, and round-trips into the basic-auth username.
+    #[tokio::test]
+    async fn a_profile_form_asks_for_each_variable_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+
+        let profile = crate::profiles::get("dataforseo").unwrap();
+        let mut form = profile_form(&profile);
+
+        let login = form
+            .fields
+            .iter()
+            .find(|field| field.key.as_ref() == "var:login")
+            .expect("the login variable has a field of its own");
+        assert_eq!(login.label.as_ref(), "login");
+        assert!(
+            login.hint.contains("email"),
+            "the field says what to type: {}",
+            login.hint
+        );
+
+        // Fill it in as the operator would, plus the credential, and enrol.
+        for field in &mut form.fields {
+            match field.key.as_ref() {
+                "var:login" => field.value = form::Value::Text("me@example.com".into()),
+                "secret" => field.value = form::Value::Text("env:AGENT_IAP_TEST_TOKEN".into()),
+                _ => {}
+            }
+        }
+
+        actions::submit(&app.policy, &form).unwrap();
+
+        let written = std::fs::read_to_string(&app.policy.path).unwrap();
+        assert!(
+            written.contains(r#"username = "me@example.com""#),
+            "the login has to land in the basic-auth username, not a dropped var:\n{written}"
+        );
     }
 
     /// `run` is the console, so a terminal is all it should take to get one —
