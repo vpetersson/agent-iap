@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Agent IAP" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="Agent IAP" width="420">
+  </picture>
 </p>
 
 # agent-iap
