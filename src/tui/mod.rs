@@ -13,6 +13,10 @@
 //! Rules and agents take effect in this process the moment they are written;
 //! services need a restart, and the console says so rather than pretending.
 //!
+//! It is not the only author, either. The policy file is watched, so an edit
+//! made with the CLI in the next terminal — or in an editor — lands in the
+//! panes, and in the running proxy, without anyone pressing anything.
+//!
 //! No credential value is ever displayed. References are, and whether each one
 //! still resolves — which is the question the file cannot answer.
 
@@ -46,6 +50,13 @@ const FEED_CAPACITY: usize = 200;
 const TICK: Duration = Duration::from_millis(120);
 /// How long a result stays on the footer before the key hints come back.
 const FLASH_TTL: Duration = Duration::from_secs(8);
+/// How long the policy file has to stop changing before the console reads it.
+///
+/// A rewrite is a truncate followed by a write, so there is a moment when the
+/// file on disk is half a policy. Reading it then reports a broken file that is
+/// not broken — and the operator who just ran `agent-iap acl add` in the next
+/// terminal would be told their edit was rejected.
+const SETTLE: Duration = Duration::from_millis(250);
 
 /// What `run` does with the terminal it was started in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +222,9 @@ struct App {
     /// Requests the operator has looked at and left waiting, so the dialogue
     /// does not spring back the instant it is dismissed.
     dismissed: HashSet<String>,
+    /// When the policy file was first seen to differ from what is on screen.
+    /// `None` once it has been read, or while nothing has changed.
+    settling: Option<Instant>,
 }
 
 impl App {
@@ -227,6 +241,7 @@ impl App {
             modal: None,
             flash: None,
             dismissed: HashSet::new(),
+            settling: None,
         })
     }
 
@@ -244,6 +259,7 @@ impl App {
             self.pending = self.state.broker.list();
             self.dismissed
                 .retain(|id| self.pending.iter().any(|view| view.id == *id));
+            self.follow_the_file();
             self.raise_dialogue();
             self.clamp_cursors();
             if self
@@ -344,9 +360,66 @@ impl App {
 
     /// Re-read the policy file into the console and into the running proxy.
     fn refresh(&mut self) {
+        self.settling = None;
         if let Err(error) = self.policy.rebuild(&self.state) {
+            // Accepted even though it failed: the file is what it is, and
+            // re-reading the same broken bytes on the next frame would only put
+            // the same error on screen again.
+            self.policy.accept_on_disk();
             self.blame(&error);
         }
+    }
+
+    /// Pick up an edit somebody else made to the policy file.
+    ///
+    /// The console is not the only author: `agent-iap acl add` in the next
+    /// terminal, or an editor, writes the same file this is displaying, and a
+    /// pane showing a rule list that is no longer the rule list is worse than
+    /// no pane. So the file is watched rather than waited on — `r` stays, for
+    /// the impatient and for a filesystem whose timestamps lie.
+    fn follow_the_file(&mut self) {
+        if !self.policy.edited_on_disk() {
+            self.settling = None;
+            return;
+        }
+        // Let the writer finish before reading what it wrote.
+        if self.settling.get_or_insert_with(Instant::now).elapsed() < SETTLE {
+            return;
+        }
+
+        let restart_was_owed = !self.policy.restart_needed.is_empty();
+        self.refresh();
+        if self.flash.as_ref().is_some_and(|flash| flash.failed) {
+            return;
+        }
+
+        // Which of the two the operator gets is the whole point of saying
+        // anything: one of them means the proxy is now running what the file
+        // says, and the other means it is not.
+        let owed = &self.policy.restart_needed;
+        if owed.is_empty() {
+            self.say(format!(
+                "{} changed on disk — reloaded, {} agents and {} rules now live",
+                self.file_name(),
+                self.state.agents.len(),
+                self.state.acl.rule_count(),
+            ));
+        } else if !restart_was_owed {
+            self.say(format!(
+                "{} changed on disk — {} need a restart before this proxy serves them",
+                self.file_name(),
+                owed.join(" and "),
+            ));
+        }
+    }
+
+    fn file_name(&self) -> String {
+        self.policy
+            .path
+            .file_name()
+            .unwrap_or(self.policy.path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
     }
 
     // ---- keys -------------------------------------------------------------
@@ -376,7 +449,9 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Char('r') => {
                 self.refresh();
-                self.say("re-read the policy file");
+                if self.flash.as_ref().is_none_or(|flash| !flash.failed) {
+                    self.say("re-read the policy file");
+                }
             }
             code => self.handle_tab(code),
         }
@@ -1309,7 +1384,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("enter", "answer a request, or add the selected profile"),
         ("a / d", "allow or deny the selected request, once"),
         ("f", "forget every standing answer"),
-        ("r", "re-read the policy file from disk"),
+        ("r", "re-read the policy file now — it is watched anyway"),
         ("q", "quit — which stops the proxy"),
     ] {
         lines.push(Line::from(vec![
@@ -1797,6 +1872,151 @@ action = "ask"
                 }
             }
         }
+    }
+
+    /// Types a whole form in, the way an operator does, and looks at the pane.
+    ///
+    /// The form and the table are two views of the same file, and the moment
+    /// after a write is exactly when they can disagree.
+    #[tokio::test]
+    async fn a_service_added_in_the_console_is_in_the_pane_behind_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        type_in(&mut app, "linear");
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        type_in(&mut app, "https://api.linear.app");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(app.modal.is_none(), "a saved form closes");
+        app.clamp_cursors();
+        let rendered = render(&mut app, 140, 30);
+        assert!(rendered.contains("api.linear.app"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_rule_added_in_the_console_is_in_the_pane_behind_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Acl;
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        type_in(&mut app, "typed-in-the-console");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        app.clamp_cursors();
+        let rendered = render(&mut app, 140, 30);
+        assert!(rendered.contains("typed-in-the-console"), "{rendered}");
+        assert!(
+            rendered.contains("2 rules"),
+            "the header counts it too:\n{rendered}"
+        );
+    }
+
+    /// The console is not the only thing that writes this file.
+    #[tokio::test]
+    async fn an_edit_made_outside_the_console_is_picked_up_without_a_keystroke() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Acl;
+
+        // What `agent-iap acl add` in the next terminal does.
+        crate::enroll::add_rule(
+            &dir.path().join("iap.toml"),
+            Some("added-from-a-shell"),
+            "*",
+            "http",
+            "github",
+            &["GET".into()],
+            &["/repos/**".into()],
+            "allow",
+        )
+        .unwrap();
+
+        app.follow_the_file();
+        assert!(
+            app.settling.is_some(),
+            "a file still being written is waited on, not read mid-truncate"
+        );
+        let rendered = render(&mut app, 140, 30);
+        assert!(!rendered.contains("added-from-a-shell"), "{rendered}");
+
+        settle(&mut app);
+        app.follow_the_file();
+        app.clamp_cursors();
+
+        let rendered = render(&mut app, 140, 30);
+        assert!(rendered.contains("added-from-a-shell"), "{rendered}");
+        assert!(
+            rendered.contains("changed on disk"),
+            "and says so:\n{rendered}"
+        );
+        assert_eq!(
+            app.state.acl.rule_count(),
+            2,
+            "in the running proxy, not just on screen"
+        );
+    }
+
+    /// An upstream added from a shell shows in the pane, but the proxy cannot
+    /// serve it — and being told the wrong one of those is the whole risk.
+    #[tokio::test]
+    async fn an_edit_the_proxy_cannot_adopt_says_so_rather_than_reporting_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+
+        crate::enroll::add_upstream(
+            &dir.path().join("iap.toml"),
+            "linear",
+            "https://api.linear.app",
+            &crate::enroll::AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+
+        settle(&mut app);
+        app.follow_the_file();
+
+        let flash = app.flash.as_ref().expect("an edit is worth a word");
+        assert!(!flash.failed, "{}", flash.message);
+        assert!(flash.message.contains("restart"), "{}", flash.message);
+        assert_eq!(app.policy.restart_needed, vec!["upstreams"]);
+    }
+
+    #[tokio::test]
+    async fn a_file_edited_into_nonsense_is_reported_once_rather_than_every_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        std::fs::write(dir.path().join("iap.toml"), "this is not toml {{{").unwrap();
+
+        settle(&mut app);
+        app.follow_the_file();
+        assert!(app.flash.as_ref().is_some_and(|flash| flash.failed));
+
+        // The rule list the proxy is running is the one that still compiles.
+        assert_eq!(app.state.acl.rule_count(), 1);
+
+        app.flash = None;
+        settle(&mut app);
+        app.follow_the_file();
+        assert!(
+            app.flash.is_none(),
+            "the same broken bytes must not be re-read eight times a second"
+        );
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle(KeyEvent::from(KeyCode::Char(c))).unwrap();
+        }
+    }
+
+    /// Pretend the write finished a moment ago, rather than sleeping for it.
+    fn settle(app: &mut App) {
+        app.follow_the_file();
+        app.settling = Instant::now().checked_sub(SETTLE);
     }
 
     /// `run` is the console, so a terminal is all it should take to get one —

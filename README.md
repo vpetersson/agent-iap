@@ -466,12 +466,13 @@ number, so a rule matching nothing is something you were told about rather than
 something you find later. Only rules that name it *outright* are pruned:
 `agent = "ci-*"` covers a fleet, and one member leaving is not that rule ending.
 
-**From the CLI, none of it takes effect until the proxy restarts** — or until
-somebody presses `r` at the console, which re-reads the file and re-enrols the
-agents and recompiles the rules from it. So a rotated token is not yet a revoked
-one: every one of these commands says so, and the leaked token keeps working
-until one of those two things happens. Upstreams, MCP servers and server
-settings need the restart either way (§ Not built yet).
+**With a console attached, these land within a second** — it watches the policy
+file, re-enrols the agents and recompiles the rules from it. Without one,
+nothing is reading the file, and a rotated token is not yet a revoked one until
+the proxy restarts: every one of these commands says which you are getting,
+because a revocation that has not taken effect is worse than one you know is
+pending. Upstreams, MCP servers and server settings need the restart either way
+(§ Not built yet).
 
 ## What happens to a request
 
@@ -599,8 +600,13 @@ from a shell is a form here, over the same functions with the same validation:
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
 
-`r` re-reads the policy file, `?` lists the keys, and `q` quits the console and
-stops the proxy with it.
+`?` lists the keys, and `q` quits the console and stops the proxy with it. `r`
+re-reads the policy file, though it rarely has to: the file is watched, so an
+`agent-iap acl add` in the next terminal, or a hand edit in an editor, lands in
+the panes — and in the running proxy — on its own, and the footer says what
+changed. A file caught mid-rewrite is waited on rather than reported as broken,
+and a file edited into something that will not parse is reported once, with the
+proxy left running the last policy that did.
 
 A minted token is shown once, in a modal, and then only its sha256 exists. No
 credential *value* is ever displayed: the credentials pane shows references, and
@@ -1084,12 +1090,12 @@ What this does **not** do yet, and both matter more as the agent count grows:
   agent's in-flight request and MCP session with it. Adding an upstream or an
   MCP server costs the same.
 - **Changing the roster does not.** Enrolling an agent, revoking one, or
-  rotating a leaked token reloads into the running proxy: from the console it is
-  immediate, and from a shell it lands on the next `r` at the console. Without a
-  console attached there is nothing to re-read the file, and a restart is still
-  what applies it — which is what every `rm` and `rotate` says on the way out,
-  because a revocation that has not taken effect is worse than one you know is
-  pending.
+  rotating a leaked token reloads into the running proxy — immediately from the
+  console, and within a second from a shell, because the console watches the
+  policy file. Without a console attached there is nothing reading it, and a
+  restart is still what applies the change: which is what every `rm` and
+  `rotate` says on the way out, because a revocation that has not taken effect
+  is worse than one you know is pending.
 - **No per-agent limits.** No rate limit, no concurrency cap, no spend budget.
   The agents share one upstream credential and therefore one quota and one bill,
   and one runaway agent is felt by all of them — the audit log will tell you
@@ -1564,13 +1570,14 @@ every deployment that has not upgraded yet.
 
 Rate limits and spend caps per agent; the rest of hot config reload, which is
 also what a certificate renewal is waiting on. Agents and ACL rules do reload
-live — the console writes them and the running proxy picks them up, and `r`
-re-reads the file for edits made from a shell — but upstreams, MCP servers and
-server settings still need a restart, because a credential injector and a bound
-socket cannot be swapped under an open connection. Those are what a fleet
-sharing one proxy wants next, and § Multiple agents says what it costs until
-then. Also: a decoupled TUI that attaches to an already-running daemon over the
-control plane;
+live — the console watches the policy file and the running proxy picks up
+whatever it finds there, whichever terminal wrote it — but upstreams, MCP
+servers and server settings still need a restart, because a credential injector
+and a bound socket cannot be swapped under an open connection. Nor does a
+headless proxy watch the file at all: the watching lives in the console, so a
+`--no-tui` deployment reloads nothing. Those are what a fleet sharing one proxy
+wants next, and § Multiple agents says what it costs until then. Also: a
+decoupled TUI that attaches to an already-running daemon over the control plane;
 SSE streaming for the HTTP MCP transport (single JSON responses work, `data:`
 frames are parsed, long-lived streams are not); mTLS agent identity, which is
 the missing half of § Workload identity — the token proves what a run may do,

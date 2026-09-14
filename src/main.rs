@@ -1357,13 +1357,13 @@ fn restart_notice(consequence: &str) {
 
 /// Agents and rules are pure policy: a hash to compare against and a list to
 /// match in order, both re-derivable from the file at any moment. A console
-/// attached to the running proxy re-reads them on `r`, and writes its own the
-/// moment it makes them — but an operator who has just revoked a leaked token
-/// is exactly the person who must not assume a console is attached.
+/// attached to the running proxy watches this file and picks the edit up on
+/// its own — but an operator who has just revoked a leaked token is exactly the
+/// person who must not assume a console is attached.
 fn reload_notice(consequence: &str) {
     println!(
-        "\nThis takes effect at the next restart, or as soon as a console on the running \
-         proxy re-reads the file (`r`). Until then {consequence}."
+        "\nA console on the running proxy picks this up within a second. Without one, it \
+         takes effect at the next restart — until then {consequence}."
     );
 }
 

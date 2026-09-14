@@ -14,10 +14,17 @@
 //! work. Services and server settings cannot be swapped under an open
 //! connection, so those are named as needing a restart rather than silently
 //! not applying.
+//!
+//! The console is not the only thing that writes this file. `agent-iap acl add`
+//! in the next terminal over, or an editor, edits the same policy the console
+//! is displaying — so it watches the file rather than assuming it is the only
+//! author, and a pane showing a rule list that is no longer the rule list is a
+//! pane worth distrusting.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::config::Config;
 use crate::enroll::{self, McpTransportSpec};
@@ -45,6 +52,32 @@ pub struct Policy {
     /// Edits made since startup that this process cannot adopt without one.
     /// Empty is the normal state and says nothing on screen.
     pub restart_needed: Vec<String>,
+    /// The mark on the file the current view was read from. What the console
+    /// compares against to notice somebody else editing the policy.
+    seen: Option<Stamp>,
+}
+
+/// Enough of a file's identity to notice it changing, cheaply enough to ask
+/// every frame.
+///
+/// Not a hash: the console asks this question eight times a second, and reading
+/// and digesting the whole policy file to find out that nothing happened is a
+/// cost paid continuously for an event that happens twice a day. Length and
+/// modification time miss an edit only if it changed neither, which for a TOML
+/// file rewritten by hand or by `enroll` does not come up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+/// The file's current mark, or `None` if it cannot be stat'd at all.
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
 }
 
 impl Policy {
@@ -57,13 +90,37 @@ impl Policy {
             inventory: Inventory::default(),
             credentials: Vec::new(),
             restart_needed: Vec::new(),
+            seen: None,
         };
         policy.rebuild(state)?;
         Ok(policy)
     }
 
+    /// Has somebody else written to the policy file since the console read it?
+    pub fn edited_on_disk(&self) -> bool {
+        match stamp(&self.path) {
+            // Unreadable is not "changed": a file briefly absent mid-rename
+            // would otherwise be reported as an edit and then as an error.
+            None => false,
+            current => current != self.seen,
+        }
+    }
+
+    /// Stop reporting the file as edited, whatever it currently says.
+    ///
+    /// For the one case `rebuild` cannot cover: it refused to load, and asking
+    /// it again every frame would put the same error on screen eight times a
+    /// second. The next edit produces a new mark and is tried again.
+    pub fn accept_on_disk(&mut self) {
+        self.seen = stamp(&self.path);
+    }
+
     /// Re-read the file and push what can be pushed into the running proxy.
     pub fn rebuild(&mut self, state: &Arc<AppState>) -> Result<()> {
+        // Marked before the read rather than after. A write landing between the
+        // two would otherwise leave the console holding the old contents under
+        // the new file's mark, and never looking at the file again.
+        let stamp = stamp(&self.path);
         let config = Config::load(&self.path)?;
 
         // Compiled and enrolled before either is swapped: a file that no longer
@@ -81,6 +138,7 @@ impl Policy {
             .context("reading the policy file back")?;
         self.credentials = credential_statuses(&config, &self.credentials);
         self.config = config;
+        self.seen = stamp;
         Ok(())
     }
 
