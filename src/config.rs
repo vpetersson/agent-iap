@@ -6,6 +6,7 @@
 //! credentials, so it is safe to keep in a repository.
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -440,22 +441,34 @@ pub enum AuthConfig {
 impl AuthConfig {
     /// Every secret reference this scheme needs, for preloading and validation.
     pub fn secret_refs(&self) -> Vec<&str> {
+        self.secret_fields()
+            .into_iter()
+            .map(|(_, reference)| reference)
+            .collect()
+    }
+
+    /// The same references, each beside the field it fills.
+    ///
+    /// `secret_refs` answers "what has to resolve for this to start"; this
+    /// answers "and which one is it" — which is the question an operator
+    /// looking at a list of credentials is actually asking.
+    pub fn secret_fields(&self) -> Vec<(&'static str, &str)> {
         match self {
             AuthConfig::None => vec![],
             AuthConfig::Bearer { secret }
             | AuthConfig::Header { secret, .. }
-            | AuthConfig::Query { secret, .. } => vec![secret.as_str()],
+            | AuthConfig::Query { secret, .. } => vec![("auth.secret", secret.as_str())],
             AuthConfig::Basic {
                 username_secret,
                 secret,
                 ..
             } => username_secret
                 .iter()
-                .map(String::as_str)
-                .chain(std::iter::once(secret.as_str()))
+                .map(|reference| ("auth.username_secret", reference.as_str()))
+                .chain(std::iter::once(("auth.secret", secret.as_str())))
                 .collect(),
             AuthConfig::Oauth2ClientCredentials { client_secret, .. } => {
-                vec![client_secret.as_str()]
+                vec![("auth.client_secret", client_secret.as_str())]
             }
             AuthConfig::ServiceAccountJwt {
                 key_file,
@@ -463,8 +476,12 @@ impl AuthConfig {
                 ..
             } => key_file
                 .iter()
-                .chain(private_key.iter())
-                .map(String::as_str)
+                .map(|reference| ("auth.key_file", reference.as_str()))
+                .chain(
+                    private_key
+                        .iter()
+                        .map(|reference| ("auth.private_key", reference.as_str())),
+                )
                 .collect(),
         }
     }
@@ -587,6 +604,24 @@ pub struct AclRuleConfig {
     #[serde(default = "doublestar_vec")]
     pub paths: Vec<String>,
     pub action: Action,
+    /// When this rule stops applying. Absent means never.
+    ///
+    /// A grant with a deadline written into it is the one an operator can give
+    /// out freely: "yes, for the next hour" is a different risk from "yes", and
+    /// before this the file could only spell the second. Past the deadline the
+    /// rule matches nothing and the request falls through to whatever is
+    /// behind it — which, for a rule written in front of an `ask`, is the `ask`
+    /// again. Expiry is checked against the clock on every request, so it
+    /// survives a restart; nothing sweeps the file, so the rule stays visible
+    /// as the record of a grant that was made and has run out.
+    #[serde(default)]
+    pub expires: Option<DateTime<Utc>>,
+}
+
+impl AclRuleConfig {
+    pub fn expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires.is_some_and(|at| now >= at)
+    }
 }
 
 fn star() -> String {
@@ -611,6 +646,46 @@ impl Default for AclDefault {
         AclDefault {
             action: Action::Deny,
         }
+    }
+}
+
+/// Settings given on the command line rather than in the file.
+///
+/// They outlive every edit to the policy file, which is the whole reason this
+/// exists as a thing rather than as two lines in `main`: the file is re-read
+/// under a running proxy now, and a reload that dropped `--listen` would move
+/// the proxy off the address its agents are connected to — silently, on
+/// somebody else's unrelated edit.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub listen: Option<String>,
+    pub admin_listen: Option<String>,
+}
+
+impl Overrides {
+    pub fn any(&self) -> bool {
+        self.listen.is_some() || self.admin_listen.is_some()
+    }
+
+    /// Put them back on top of a freshly loaded config.
+    pub fn apply(&self, config: &mut Config) -> Result<()> {
+        if let Some(spec) = &self.listen {
+            config.server.override_listen(spec).context("--listen")?;
+        }
+        if let Some(spec) = &self.admin_listen {
+            config
+                .server
+                .override_admin_listen(spec)
+                .context("--admin-listen")?;
+        }
+        if self.any() {
+            // The file was validated on load; the addresses it was validated
+            // with are no longer the ones being bound.
+            config
+                .validate()
+                .context("after applying the listen overrides")?;
+        }
+        Ok(())
     }
 }
 

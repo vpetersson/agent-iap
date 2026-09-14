@@ -177,6 +177,11 @@ async fn proxy(
         .with_record(record)
     })?;
 
+    // One snapshot for the whole request. A call routed by one version of the
+    // policy file and size-limited by the next would be obeying a policy that
+    // was never written down.
+    let config = state.config();
+
     let mut record = AuditRecord::new("http", "request");
     record.agent = agent.id.clone();
     record.agent_name = Some(agent.display_name().to_string());
@@ -196,7 +201,7 @@ async fn proxy(
         ));
     }
 
-    let upstream: &UpstreamConfig = state.config.upstream(&upstream_name).ok_or_else(|| {
+    let upstream: &UpstreamConfig = config.upstream(&upstream_name).ok_or_else(|| {
         let mut record = record.clone();
         record.decision = Some("deny".into());
         record.rule = Some("<unknown-upstream>".into());
@@ -228,7 +233,7 @@ async fn proxy(
     }
 
     // 4. Allowed. Buffer the request body, then swap in the real credential.
-    let body_bytes = axum::body::to_bytes(body, state.config.server.max_body_bytes)
+    let body_bytes = axum::body::to_bytes(body, config.server.max_body_bytes)
         .await
         .map_err(|_| {
             let mut record = record.clone();
@@ -238,7 +243,7 @@ async fn proxy(
                 "body_too_large",
                 format!(
                     "request body exceeds max_body_bytes ({})",
-                    state.config.server.max_body_bytes
+                    config.server.max_body_bytes
                 ),
             )
             .with_record(record)
@@ -278,7 +283,7 @@ async fn proxy(
             .with_record(record)
         })?;
 
-    let response = state.http.execute(outbound).await.map_err(|error| {
+    let response = state.http().execute(outbound).await.map_err(|error| {
         let mut record = record.clone();
         record.error = Some(describe_upstream_error(&error));
         record.duration_ms = Some(started.elapsed().as_millis() as u64);

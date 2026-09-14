@@ -37,6 +37,8 @@ use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::config::{AclRuleConfig, Config};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+
 use crate::identity;
 use crate::secrets::SecretRef;
 
@@ -104,6 +106,191 @@ pub enum AuthSpec {
         subject: Option<String>,
         lifetime_secs: Option<u64>,
     },
+}
+
+/// Every credential scheme there is, spelled as the CLI's `--auth` takes them.
+///
+/// The console offers the same list from the same constant: a scheme the CLI
+/// can enrol and the console cannot is a reason to keep a terminal open beside
+/// the terminal, which is what the console exists to stop.
+pub const AUTH_SCHEMES: &[&str] = &[
+    "none",
+    "bearer",
+    "header",
+    "basic",
+    "query",
+    "oauth2-client-credentials",
+    "service-account-jwt",
+];
+
+/// Everything the credential schemes take, in the shape a human supplies it —
+/// a flag on the command line, a field in the console's form.
+///
+/// One struct for both because each scheme needs a different subset, and the
+/// rule about which subset is the difference between a credential that is
+/// injected and one that silently is not. Two copies of that rule would be two
+/// chances to get it wrong.
+#[derive(Debug, Clone, Default)]
+pub struct AuthInput {
+    /// One of `AUTH_SCHEMES`. `-` and `_` are interchangeable.
+    pub scheme: String,
+    pub secret: Option<String>,
+    pub header: Option<String>,
+    pub prefix: Option<String>,
+    pub username: Option<String>,
+    pub username_secret: Option<String>,
+    pub param: Option<String>,
+    pub key_file: Option<String>,
+    pub private_key: Option<String>,
+    pub issuer: Option<String>,
+    pub key_id: Option<String>,
+    pub token_url: Option<String>,
+    pub audience: Option<String>,
+    pub scopes: Vec<String>,
+    pub subject: Option<String>,
+    pub lifetime_secs: Option<u64>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+impl AuthInput {
+    /// Which fields this scheme reads. The console shows these and hides the
+    /// rest, so a form for `bearer` does not ask for a token endpoint.
+    pub fn fields_for(scheme: &str) -> &'static [&'static str] {
+        match normalise_scheme(scheme) {
+            "none" => &[],
+            "bearer" => &["secret"],
+            "header" => &["header", "secret", "prefix"],
+            "basic" => &["username", "username-secret", "secret"],
+            "query" => &["param", "secret"],
+            "oauth2-client-credentials" => &[
+                "token-url",
+                "client-id",
+                "client-secret",
+                "scope",
+                "audience",
+            ],
+            "service-account-jwt" => &[
+                "key-file",
+                "private-key",
+                "issuer",
+                "key-id",
+                "token-url",
+                "audience",
+                "scope",
+                "subject",
+                "lifetime-secs",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Each scheme needs a different subset of the fields, and silently ignoring
+    /// one that was supplied is how a credential ends up not being sent.
+    pub fn to_spec(&self) -> Result<AuthSpec> {
+        let need_secret = || -> Result<String> {
+            self.secret.clone().context(
+                "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
+            )
+        };
+        let spec = match normalise_scheme(&self.scheme) {
+            "none" => AuthSpec::None,
+            "bearer" => AuthSpec::Bearer {
+                secret: need_secret()?,
+            },
+            "header" => AuthSpec::Header {
+                header: self.header.clone().context(
+                    "`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`",
+                )?,
+                secret: need_secret()?,
+                prefix: self.prefix.clone(),
+            },
+            "basic" => {
+                if self.username.is_none() && self.username_secret.is_none() {
+                    bail!(
+                        "`--auth basic` needs `--username <NAME>`, or `--username-secret <REF>` \
+                         for an API like Graylog whose user field is the credential"
+                    );
+                }
+                if self.username.is_some() && self.username_secret.is_some() {
+                    bail!("`--username` and `--username-secret` are two spellings of the same field — pass one");
+                }
+                AuthSpec::Basic {
+                    username: self.username.clone(),
+                    username_secret: self.username_secret.clone(),
+                    secret: need_secret()?,
+                }
+            }
+            "query" => AuthSpec::Query {
+                param: self
+                    .param
+                    .clone()
+                    .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
+                secret: need_secret()?,
+            },
+            "oauth2-client-credentials" => AuthSpec::Oauth2ClientCredentials {
+                token_url: self
+                    .token_url
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--token-url <URL>`")?,
+                client_id: self
+                    .client_id
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--client-id <ID>`")?,
+                client_secret: self
+                    .client_secret
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--client-secret <REF>`")?,
+                // One space-delimited `scope` parameter, which is how the grant
+                // spells a list; the flag is repeatable so the caller does not
+                // have to know that.
+                scope: (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
+                audience: self.audience.clone(),
+            },
+            "service-account-jwt" => {
+                if self.key_file.is_none() && self.private_key.is_none() {
+                    bail!(
+                        "`--auth service-account-jwt` needs `--key-file <REF>` (the JSON key \
+                         Google issues) or `--private-key <REF>` with `--issuer` and `--token-url`"
+                    );
+                }
+                if self.key_file.is_some() && self.private_key.is_some() {
+                    bail!("`--key-file` already carries the private key — pass one or the other");
+                }
+                AuthSpec::ServiceAccountJwt {
+                    key_file: self.key_file.clone(),
+                    issuer: self.issuer.clone(),
+                    private_key: self.private_key.clone(),
+                    key_id: self.key_id.clone(),
+                    token_url: self.token_url.clone(),
+                    audience: self.audience.clone(),
+                    scopes: self.scopes.clone(),
+                    subject: self.subject.clone(),
+                    lifetime_secs: self.lifetime_secs,
+                }
+            }
+            other => bail!(
+                "`{other}` is not a credential scheme — it is one of {}",
+                AUTH_SCHEMES.join(", ")
+            ),
+        };
+        if matches!(spec, AuthSpec::None) && self.secret.is_some() {
+            bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
+        }
+        Ok(spec)
+    }
+}
+
+/// `service_account_jwt` as the config file spells it and `service-account-jwt`
+/// as the flag does are the same scheme, and an operator reading one and typing
+/// the other should not be told it does not exist.
+fn normalise_scheme(scheme: &str) -> &str {
+    match scheme.trim() {
+        "oauth2_client_credentials" => "oauth2-client-credentials",
+        "service_account_jwt" => "service-account-jwt",
+        "" => "none",
+        other => other,
+    }
 }
 
 /// Add `[[agents]]`, minting the token and writing only its hash.
@@ -399,46 +586,149 @@ pub fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<Removal
     remove_service(path, name, prune, ServiceKind::McpServer)
 }
 
-/// Add `[[acl]]`. Appended last, because first match wins and an earlier rule
-/// would silently take precedence over everything already in the file.
-#[allow(clippy::too_many_arguments)]
-pub fn add_rule(
-    path: &Path,
-    name: Option<&str>,
-    agent: &str,
-    kind: &str,
-    target: &str,
-    methods: &[String],
-    paths: &[String],
-    action: &str,
-) -> Result<()> {
-    let mut document = read(path)?;
-    let entry = rule_entry(name, agent, kind, target, methods, paths, action);
-    append(&mut document, "acl", entry);
-    save(path, document)
+/// One ACL rule, as a caller spells it out.
+///
+/// A struct rather than eight positional arguments: they are all strings and
+/// string lists, four of them default to `*`, and the difference between a rule
+/// that grants what was meant and one that grants everything is which order
+/// they went in.
+#[derive(Debug, Clone, Default)]
+pub struct RuleSpec<'a> {
+    pub name: Option<&'a str>,
+    pub agent: &'a str,
+    pub kind: &'a str,
+    pub target: &'a str,
+    pub methods: &'a [String],
+    pub paths: &'a [String],
+    pub action: &'a str,
+    /// When the rule stops applying. `None` is the grant with no end.
+    pub expires: Option<DateTime<Utc>>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rule_entry(
-    name: Option<&str>,
-    agent: &str,
-    kind: &str,
-    target: &str,
-    methods: &[String],
-    paths: &[String],
-    action: &str,
-) -> Table {
+/// Add `[[acl]]`. Appended last, because first match wins and an earlier rule
+/// would silently take precedence over everything already in the file.
+pub fn add_rule(path: &Path, spec: &RuleSpec<'_>) -> Result<usize> {
+    let mut document = read(path)?;
+    append(&mut document, "acl", rule_entry(spec));
+    let landed = document_config(&document)?.acl.len().saturating_sub(1);
+    save(path, document)?;
+    Ok(landed)
+}
+
+/// Put a rule *before* the one at `index`, rather than after everything.
+///
+/// The one edit `add_rule` cannot express, and the one the approval console
+/// needs: an operator answering "allow this from now on" is overriding the
+/// `ask` rule that just stopped them, and first match wins — appended after it,
+/// the new rule would never be reached and the same question would come back on
+/// the next call. An `index` past the end appends, which is what a decision
+/// taken by the *default* action means.
+pub fn insert_rule(path: &Path, index: usize, spec: &RuleSpec<'_>) -> Result<usize> {
+    let mut document = read(path)?;
+    let entry = rule_entry(spec);
+
+    let existing = document_config(&document)?.acl.len();
+    if index >= existing {
+        append(&mut document, "acl", entry);
+        save(path, document)?;
+        return Ok(existing);
+    }
+
+    array_of_tables(&mut document, "acl", path)?.insert(index, entry);
+    save(path, document)?;
+    Ok(index)
+}
+
+/// How long a grant lasts, as an operator types it: `30s`, `5m`, `1h`, `7d`.
+///
+/// Deliberately not a bare number. "Allow this for 5" is a question about units
+/// that an operator answering a security prompt should not have to stop and
+/// ask, and getting it wrong by a factor of sixty is the direction that hurts.
+pub fn parse_ttl(text: &str) -> Result<TimeDelta> {
+    let text = text.trim();
+    let (count, unit) = text.split_at(
+        text.find(|c: char| !c.is_ascii_digit())
+            .with_context(|| format!("`{text}` has no unit — try `30s`, `5m`, `1h` or `7d`"))?,
+    );
+    let count: i64 = count
+        .parse()
+        .with_context(|| format!("`{text}` does not start with a number of them"))?;
+
+    let delta = match unit {
+        "s" | "sec" | "secs" => TimeDelta::try_seconds(count),
+        "m" | "min" | "mins" => TimeDelta::try_minutes(count),
+        "h" | "hr" | "hrs" | "hour" | "hours" => TimeDelta::try_hours(count),
+        "d" | "day" | "days" => TimeDelta::try_days(count),
+        "w" | "week" | "weeks" => TimeDelta::try_weeks(count),
+        other => bail!("`{other}` is not a unit of time — use s, m, h, d or w"),
+    }
+    .with_context(|| format!("`{text}` is longer than a duration can be"))?;
+
+    if delta <= TimeDelta::zero() {
+        bail!("`{text}` is not a length of time — a grant that has already run out grants nothing");
+    }
+    Ok(delta)
+}
+
+/// How much of a grant is left, in the words a human reads it back in.
+pub fn remaining(expires: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let left = expires - now;
+    if left <= TimeDelta::zero() {
+        return "expired".to_string();
+    }
+    let seconds = left.num_seconds();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", left.num_minutes())
+    } else if seconds < 86_400 {
+        format!("{}h{}m", left.num_hours(), left.num_minutes() % 60)
+    } else {
+        format!("{}d{}h", left.num_days(), left.num_hours() % 24)
+    }
+}
+
+fn rule_entry(spec: &RuleSpec<'_>) -> Table {
     let mut entry = Table::new();
-    if let Some(name) = name {
+    if let Some(name) = spec.name {
         entry["name"] = toml_edit::value(name);
     }
-    entry["agent"] = toml_edit::value(agent);
-    entry["kind"] = toml_edit::value(kind);
-    entry["target"] = toml_edit::value(target);
-    entry["methods"] = toml_edit::value(string_array(methods));
-    entry["paths"] = toml_edit::value(string_array(paths));
-    entry["action"] = toml_edit::value(action);
+    entry["agent"] = toml_edit::value(spec.agent);
+    entry["kind"] = toml_edit::value(spec.kind);
+    entry["target"] = toml_edit::value(spec.target);
+    entry["methods"] = toml_edit::value(string_array(spec.methods));
+    entry["paths"] = toml_edit::value(string_array(spec.paths));
+    entry["action"] = toml_edit::value(spec.action);
+    if let Some(expires) = spec.expires {
+        // Seconds and UTC: a deadline is evidence, and evidence a reader has to
+        // convert out of a local timezone to compare is evidence they will get
+        // wrong at least once.
+        entry["expires"] = toml_edit::value(expires.to_rfc3339_opts(SecondsFormat::Secs, true));
+    }
     entry
+}
+
+/// The positional spelling of a rule, for tests that do not care about expiry.
+#[cfg(test)]
+fn rule<'a>(
+    name: Option<&'a str>,
+    agent: &'a str,
+    kind: &'a str,
+    target: &'a str,
+    methods: &'a [String],
+    paths: &'a [String],
+    action: &'a str,
+) -> RuleSpec<'a> {
+    RuleSpec {
+        name,
+        agent,
+        kind,
+        target,
+        methods,
+        paths,
+        action,
+        expires: None,
+    }
 }
 
 /// What `remove_rule` took out, and what the list looks like afterwards.
@@ -536,19 +826,8 @@ pub fn render_service(name: &str, spec: ServiceSpec<'_>, auth: &AuthSpec) -> Str
 
 /// The exact TOML `add_rule` would append.
 #[allow(clippy::too_many_arguments)]
-pub fn render_rule(
-    name: Option<&str>,
-    agent: &str,
-    kind: &str,
-    target: &str,
-    methods: &[String],
-    paths: &[String],
-    action: &str,
-) -> String {
-    render(
-        "acl",
-        rule_entry(name, agent, kind, target, methods, paths, action),
-    )
+pub fn render_rule(spec: &RuleSpec<'_>) -> String {
+    render("acl", rule_entry(spec))
 }
 
 fn render(key: &str, entry: Table) -> String {
@@ -1127,13 +1406,15 @@ mod tests {
         .unwrap();
         add_rule(
             &path,
-            Some("inference"),
-            "*",
-            "http",
-            "anthropic",
-            &["POST".to_string()],
-            &["/v1/messages".to_string()],
-            "allow",
+            &rule(
+                Some("inference"),
+                "*",
+                "http",
+                "anthropic",
+                &["POST".to_string()],
+                &["/v1/messages".to_string()],
+                "allow",
+            ),
         )
         .unwrap();
         let agent = add_agent(&path, "claude-code", None, &["anthropic".to_string()]).unwrap();
@@ -1296,24 +1577,28 @@ mod tests {
         .unwrap();
         add_rule(
             &path,
-            Some("first"),
-            "*",
-            "http",
-            "github",
-            &["GET".into()],
-            &["/**".into()],
-            "deny",
+            &rule(
+                Some("first"),
+                "*",
+                "http",
+                "github",
+                &["GET".into()],
+                &["/**".into()],
+                "deny",
+            ),
         )
         .unwrap();
         add_rule(
             &path,
-            Some("second"),
-            "*",
-            "http",
-            "github",
-            &["GET".into()],
-            &["/**".into()],
-            "allow",
+            &rule(
+                Some("second"),
+                "*",
+                "http",
+                "github",
+                &["GET".into()],
+                &["/**".into()],
+                "allow",
+            ),
         )
         .unwrap();
 
@@ -1542,6 +1827,133 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_can_be_put_in_front_of_the_one_it_overrides() {
+        // The approval console's "from now on": an `ask` rule already matches,
+        // so an allow appended after it would never be reached and the operator
+        // would be asked the same question forever.
+        let (_dir, path) = empty_policy();
+        add_rule(
+            &path,
+            &rule(
+                Some("writes-need-a-human"),
+                "*",
+                "http",
+                "github",
+                &["POST".into()],
+                &["**".into()],
+                "ask",
+            ),
+        )
+        .unwrap();
+
+        let landed = insert_rule(
+            &path,
+            0,
+            &rule(
+                Some("console-allow"),
+                "claude",
+                "http",
+                "github",
+                &["POST".into()],
+                &["/repos/acme/api/issues".into()],
+                "allow",
+            ),
+        )
+        .unwrap();
+        assert_eq!(landed, 0);
+
+        let config = document_config(&read(&path).unwrap()).unwrap();
+        assert_eq!(config.acl[0].name.as_deref(), Some("console-allow"));
+        assert_eq!(config.acl[1].name.as_deref(), Some("writes-need-a-human"));
+    }
+
+    #[test]
+    fn a_grant_can_be_written_with_a_deadline_on_it() {
+        let (_dir, path) = empty_policy();
+        let expires = Utc::now() + parse_ttl("1h").unwrap();
+        add_rule(
+            &path,
+            &RuleSpec {
+                name: Some("for-the-migration"),
+                agent: "claude",
+                kind: "http",
+                target: "github",
+                methods: &["POST".into()],
+                paths: &["/repos/**".into()],
+                action: "allow",
+                expires: Some(expires),
+            },
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        // UTC and to the second: a deadline a reader has to convert out of a
+        // local timezone is one they will read wrong at least once.
+        assert!(written.contains("expires = \""), "{written}");
+        assert!(written.contains('Z'), "{written}");
+
+        let config = document_config(&read(&path).unwrap()).unwrap();
+        assert!(!config.acl[0].expired_at(Utc::now()));
+        assert!(config.acl[0].expired_at(expires + TimeDelta::try_seconds(1).unwrap()));
+    }
+
+    #[test]
+    fn a_duration_needs_its_unit_spelled_out() {
+        assert_eq!(
+            parse_ttl("30s").unwrap(),
+            TimeDelta::try_seconds(30).unwrap()
+        );
+        assert_eq!(parse_ttl("5m").unwrap(), TimeDelta::try_minutes(5).unwrap());
+        assert_eq!(parse_ttl(" 1h ").unwrap(), TimeDelta::try_hours(1).unwrap());
+        assert_eq!(parse_ttl("7d").unwrap(), TimeDelta::try_days(7).unwrap());
+
+        // "Allow this for 5" is a question about units that an operator
+        // answering a security prompt should not have to stop and ask, and
+        // being wrong by a factor of sixty is the direction that hurts.
+        let error = parse_ttl("5").unwrap_err().to_string();
+        assert!(error.contains("no unit"), "{error}");
+        assert!(parse_ttl("5y").is_err(), "years are not offered");
+        assert!(parse_ttl("0h").is_err(), "a grant that has already run out");
+        assert!(parse_ttl("-1h").is_err());
+    }
+
+    #[test]
+    fn time_left_reads_as_time_left() {
+        let now = Utc::now();
+        let left = |delta: TimeDelta| remaining(now + delta, now);
+        assert_eq!(left(TimeDelta::try_seconds(45).unwrap()), "45s");
+        assert_eq!(left(TimeDelta::try_minutes(47).unwrap()), "47m");
+        assert_eq!(left(TimeDelta::try_minutes(90).unwrap()), "1h30m");
+        assert_eq!(left(TimeDelta::try_hours(30).unwrap()), "1d6h");
+        assert_eq!(left(-TimeDelta::try_seconds(1).unwrap()), "expired");
+    }
+
+    #[test]
+    fn inserting_past_the_end_appends_rather_than_failing() {
+        // The default action did the asking, so there is no rule to get in
+        // front of — and "nowhere to insert" must not be an error path the
+        // console has to have a second answer for.
+        let (_dir, path) = empty_policy();
+        let landed = insert_rule(
+            &path,
+            7,
+            &rule(
+                Some("only-rule"),
+                "*",
+                "*",
+                "*",
+                &["*".into()],
+                &["**".into()],
+                "deny",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(landed, 0);
+        assert_eq!(rule_count(&path).unwrap(), 1);
+    }
+
+    #[test]
     fn the_dry_run_renderer_matches_what_would_be_written() {
         // If these drift, `--dry-run` becomes a promise the write does not keep.
         let (_dir, path) = empty_policy();
@@ -1592,35 +2004,41 @@ mod tests {
         // glob over a fleet. Only the first is orphaned by removing `ci`.
         add_rule(
             &path,
-            Some("gh-read"),
-            "ci",
-            "http",
-            "github",
-            &["GET".into()],
-            &["/repos/**".into()],
-            "allow",
+            &rule(
+                Some("gh-read"),
+                "ci",
+                "http",
+                "github",
+                &["GET".into()],
+                &["/repos/**".into()],
+                "allow",
+            ),
         )
         .unwrap();
         add_rule(
             &path,
-            None,
-            "*",
-            "http",
-            "anthropic",
-            &["POST".into()],
-            &["/v1/messages".into()],
-            "allow",
+            &rule(
+                None,
+                "*",
+                "http",
+                "anthropic",
+                &["POST".into()],
+                &["/v1/messages".into()],
+                "allow",
+            ),
         )
         .unwrap();
         add_rule(
             &path,
-            Some("gh-write"),
-            "ci-*",
-            "http",
-            "github",
-            &["POST".into()],
-            &["/repos/**".into()],
-            "ask",
+            &rule(
+                Some("gh-write"),
+                "ci-*",
+                "http",
+                "github",
+                &["POST".into()],
+                &["/repos/**".into()],
+                "ask",
+            ),
         )
         .unwrap();
         add_agent(&path, "ci", None, &["github".into(), "anthropic".into()]).unwrap();
@@ -1815,13 +2233,15 @@ mod tests {
         .unwrap();
         add_rule(
             &path,
-            None,
-            "*",
-            "mcp",
-            "notes",
-            &["tools/call".into()],
-            &["get_*".into()],
-            "allow",
+            &rule(
+                None,
+                "*",
+                "mcp",
+                "notes",
+                &["tools/call".into()],
+                &["get_*".into()],
+                "allow",
+            ),
         )
         .unwrap();
 
@@ -1928,13 +2348,15 @@ mod tests {
         .unwrap();
         add_rule(
             &path,
-            None,
-            "*",
-            "http",
-            "github",
-            &["GET".into()],
-            &["/**".into()],
-            "allow",
+            &rule(
+                None,
+                "*",
+                "http",
+                "github",
+                &["GET".into()],
+                &["/**".into()],
+                "allow",
+            ),
         )
         .unwrap();
         add_agent(&path, "ci", None, &["github".to_string()]).unwrap();

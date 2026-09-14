@@ -14,7 +14,7 @@
 use http::StatusCode;
 
 use crate::acl::{AccessRequest, Kind};
-use crate::approval::Verdict;
+use crate::approval::{AskingRule, Verdict};
 use crate::config::Action;
 use crate::identity::{agent_may_address, Caller};
 use crate::state::AppState;
@@ -105,7 +105,10 @@ pub async fn clear(
         Action::Ask => {
             // Park the request in front of a human. Anything but an explicit
             // "allow" — timeout, no approver, an explicit no — denies.
-            let outcome = state.broker.ask(access, agent.display_name()).await;
+            let outcome = state
+                .broker
+                .ask(access, agent.display_name(), AskingRule::of(&decision))
+                .await;
             if outcome.verdict() == Verdict::Deny {
                 return Err(Refusal::new(
                     StatusCode::FORBIDDEN,

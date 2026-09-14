@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -133,49 +133,24 @@ impl AuditEvent {
 pub struct AuditLog {
     inner: Mutex<Writer>,
     events: broadcast::Sender<AuditEvent>,
+    /// What to redact and how much to keep, replaceable while running. The
+    /// file this is written to is replaceable too — see `reopen`.
+    settings: RwLock<Settings>,
+    stderr: bool,
+}
+
+struct Settings {
+    path: PathBuf,
     redact: HashSet<String>,
     max_logged_body_bytes: usize,
     log_bodies: bool,
     log_mcp_params: bool,
-    stderr: bool,
 }
 
-struct Writer {
-    file: BufWriter<File>,
-    seq: u64,
-    prev_hash: String,
-}
-
-impl AuditLog {
-    pub fn open(config: &crate::config::AuditConfig, stderr: bool) -> Result<Self> {
-        if let Some(parent) = config.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating audit directory `{}`", parent.display()))?;
-            }
-        }
-
-        // Resume the existing chain so restarts do not break verification.
-        let (seq, prev_hash) = match read_tail(&config.path)? {
-            Some(last) => (last.seq + 1, last.hash),
-            None => (0, GENESIS_HASH.to_string()),
-        };
-
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.path)
-            .with_context(|| format!("opening audit log `{}`", config.path.display()))?;
-
-        let (events, _) = broadcast::channel(512);
-
-        Ok(AuditLog {
-            inner: Mutex::new(Writer {
-                file: BufWriter::new(file),
-                seq,
-                prev_hash,
-            }),
-            events,
+impl Settings {
+    fn from(config: &crate::config::AuditConfig) -> Self {
+        Settings {
+            path: config.path.clone(),
             redact: config
                 .redact_headers
                 .iter()
@@ -184,8 +159,84 @@ impl AuditLog {
             max_logged_body_bytes: config.max_logged_body_bytes,
             log_bodies: config.log_bodies,
             log_mcp_params: config.log_mcp_params,
+        }
+    }
+}
+
+struct Writer {
+    file: BufWriter<File>,
+    seq: u64,
+    prev_hash: String,
+}
+
+/// Open the log at `config.path`, picking up whatever chain is already there.
+///
+/// Resuming rather than restarting is what lets `agent-iap audit verify` span a
+/// restart: the first record after one is the next link, not a new genesis.
+fn open_chain(config: &crate::config::AuditConfig) -> Result<Writer> {
+    if let Some(parent) = config.path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating audit directory `{}`", parent.display()))?;
+        }
+    }
+
+    let (seq, prev_hash) = match read_tail(&config.path)? {
+        Some(last) => (last.seq + 1, last.hash),
+        None => (0, GENESIS_HASH.to_string()),
+    };
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.path)
+        .with_context(|| format!("opening audit log `{}`", config.path.display()))?;
+
+    Ok(Writer {
+        file: BufWriter::new(file),
+        seq,
+        prev_hash,
+    })
+}
+
+impl AuditLog {
+    pub fn open(config: &crate::config::AuditConfig, stderr: bool) -> Result<Self> {
+        let (events, _) = broadcast::channel(512);
+
+        Ok(AuditLog {
+            inner: Mutex::new(open_chain(config)?),
+            events,
+            settings: RwLock::new(Settings::from(config)),
             stderr,
         })
+    }
+
+    /// Adopt an edited `[audit]` section without restarting.
+    ///
+    /// A changed `path` is the interesting case: the old file is flushed and
+    /// closed, and the new one picks up *its* chain rather than continuing the
+    /// old one — two files sharing a sequence would each look tampered with to
+    /// `agent-iap audit verify`, which is the tool that has to stay believable.
+    /// A record is never written to both.
+    pub fn reopen(&self, config: &crate::config::AuditConfig) -> Result<()> {
+        let moving = self.settings.read().path != config.path;
+        if !moving {
+            *self.settings.write() = Settings::from(config);
+            return Ok(());
+        }
+
+        let opened = open_chain(config)?;
+        // Both under one lock, in this order: a record landing between them
+        // would otherwise be written to the old file under the new file's
+        // sequence, or to the new file under the old one's.
+        let mut writer = self.inner.lock();
+        let mut settings = self.settings.write();
+        if let Err(error) = writer.file.flush() {
+            tracing::error!(?error, "flushing the audit log before moving it");
+        }
+        *writer = opened;
+        *settings = Settings::from(config);
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AuditEvent> {
@@ -193,11 +244,16 @@ impl AuditLog {
     }
 
     pub fn log_bodies(&self) -> bool {
-        self.log_bodies
+        self.settings.read().log_bodies
     }
 
     pub fn log_mcp_params(&self) -> bool {
-        self.log_mcp_params
+        self.settings.read().log_mcp_params
+    }
+
+    /// Where records are going right now.
+    pub fn path(&self) -> PathBuf {
+        self.settings.read().path.clone()
     }
 
     /// Append a record and return the sequenced event.
@@ -257,7 +313,7 @@ impl AuditLog {
         let mut map = serde_json::Map::new();
         for (name, value) in headers {
             let key = name.as_str().to_ascii_lowercase();
-            let rendered = if self.redact.contains(&key) {
+            let rendered = if self.settings.read().redact.contains(&key) {
                 "***".to_string()
             } else {
                 value.to_str().unwrap_or("<binary>").to_string()
@@ -270,10 +326,11 @@ impl AuditLog {
     /// Truncate a body to the configured cap, marking that it was cut.
     pub fn clip_body(&self, body: &[u8]) -> serde_json::Value {
         let text = String::from_utf8_lossy(body);
-        if text.len() <= self.max_logged_body_bytes {
+        let max_logged_body_bytes = self.settings.read().max_logged_body_bytes;
+        if text.len() <= max_logged_body_bytes {
             serde_json::Value::String(text.into_owned())
         } else {
-            let mut end = self.max_logged_body_bytes;
+            let mut end = max_logged_body_bytes;
             while end > 0 && !text.is_char_boundary(end) {
                 end -= 1;
             }

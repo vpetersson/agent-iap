@@ -12,9 +12,10 @@ use agent_iap::init::{self, InitOptions, Template};
 use agent_iap::list::{Inventory, ListOptions, What};
 use agent_iap::mcp;
 use agent_iap::profiles;
+use agent_iap::reload::Watcher;
 use agent_iap::state::AppState;
 use agent_iap::stdio;
-use agent_iap::tls::{self, ServerTls};
+use agent_iap::tls::{self, Listener, ServerTls};
 use agent_iap::tui::{self, Console};
 
 #[derive(Parser)]
@@ -166,6 +167,7 @@ enum WhatArg {
     Upstreams,
     Mcp,
     Acl,
+    Credentials,
 }
 
 impl From<WhatArg> for What {
@@ -175,6 +177,7 @@ impl From<WhatArg> for What {
             WhatArg::Upstreams => What::Upstreams,
             WhatArg::Mcp => What::Mcp,
             WhatArg::Acl => What::Acl,
+            WhatArg::Credentials => What::Credentials,
         }
     }
 }
@@ -427,89 +430,31 @@ struct AuthFlags {
 }
 
 impl AuthFlags {
-    /// Each scheme needs a different subset of the flags, and silently ignoring
-    /// one that was passed is how a credential ends up not being sent.
+    /// Hand the flags to `enroll`, which owns the rule about which scheme needs
+    /// which of them. The console's form builds the same struct, so the two
+    /// front ends cannot disagree about what a credential needs.
     fn to_spec(&self) -> Result<enroll::AuthSpec> {
-        let need_secret = || -> Result<String> {
-            self.secret.clone().context(
-                "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
-            )
-        };
-        let spec = match self.auth {
-            AuthArg::None => enroll::AuthSpec::None,
-            AuthArg::Bearer => enroll::AuthSpec::Bearer {
-                secret: need_secret()?,
-            },
-            AuthArg::Header => enroll::AuthSpec::Header {
-                header: self.header.clone().context(
-                    "`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`",
-                )?,
-                secret: need_secret()?,
-                prefix: self.prefix.clone(),
-            },
-            AuthArg::Basic => {
-                if self.username.is_none() && self.username_secret.is_none() {
-                    bail!(
-                        "`--auth basic` needs `--username <NAME>`, or `--username-secret <REF>` \
-                         for an API like Graylog whose user field is the credential"
-                    );
-                }
-                enroll::AuthSpec::Basic {
-                    username: self.username.clone(),
-                    username_secret: self.username_secret.clone(),
-                    secret: need_secret()?,
-                }
-            }
-            AuthArg::Query => enroll::AuthSpec::Query {
-                param: self
-                    .param
-                    .clone()
-                    .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
-                secret: need_secret()?,
-            },
-            AuthArg::Oauth2ClientCredentials => enroll::AuthSpec::Oauth2ClientCredentials {
-                token_url: self
-                    .token_url
-                    .clone()
-                    .context("`--auth oauth2-client-credentials` needs `--token-url <URL>`")?,
-                client_id: self
-                    .client_id
-                    .clone()
-                    .context("`--auth oauth2-client-credentials` needs `--client-id <ID>`")?,
-                client_secret: self
-                    .client_secret
-                    .clone()
-                    .context("`--auth oauth2-client-credentials` needs `--client-secret <REF>`")?,
-                // One space-delimited `scope` parameter, which is how the grant
-                // spells a list; `--scope` is repeatable so the caller does not
-                // have to know that.
-                scope: (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
-                audience: self.audience.clone(),
-            },
-            AuthArg::ServiceAccountJwt => {
-                if self.key_file.is_none() && self.private_key.is_none() {
-                    bail!(
-                        "`--auth service-account-jwt` needs `--key-file <REF>` (the JSON key \
-                         Google issues) or `--private-key <REF>` with `--issuer` and `--token-url`"
-                    );
-                }
-                enroll::AuthSpec::ServiceAccountJwt {
-                    key_file: self.key_file.clone(),
-                    issuer: self.issuer.clone(),
-                    private_key: self.private_key.clone(),
-                    key_id: self.key_id.clone(),
-                    token_url: self.token_url.clone(),
-                    audience: self.audience.clone(),
-                    scopes: self.scopes.clone(),
-                    subject: self.subject.clone(),
-                    lifetime_secs: self.lifetime_secs,
-                }
-            }
-        };
-        if matches!(spec, enroll::AuthSpec::None) && self.secret.is_some() {
-            bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
+        enroll::AuthInput {
+            scheme: self.auth.as_str().to_string(),
+            secret: self.secret.clone(),
+            header: self.header.clone(),
+            prefix: self.prefix.clone(),
+            username: self.username.clone(),
+            username_secret: self.username_secret.clone(),
+            param: self.param.clone(),
+            key_file: self.key_file.clone(),
+            private_key: self.private_key.clone(),
+            issuer: self.issuer.clone(),
+            key_id: self.key_id.clone(),
+            token_url: self.token_url.clone(),
+            audience: self.audience.clone(),
+            scopes: self.scopes.clone(),
+            subject: self.subject.clone(),
+            lifetime_secs: self.lifetime_secs,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
         }
-        Ok(spec)
+        .to_spec()
     }
 }
 
@@ -541,6 +486,11 @@ enum AclCommand {
         /// `allow`, `deny`, or `ask` to prompt a human at the `run` console.
         #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
         action: ActionArg,
+        /// How long this rule lasts: `30s`, `5m`, `1h`, `7d`. Past it the rule
+        /// matches nothing and whatever is behind it decides instead. The
+        /// grant you can hand out without having to remember to take it back.
+        #[arg(long, value_name = "DURATION")]
+        expires_in: Option<String>,
     },
     /// Remove a rule by its number. Everything after it moves up one, so
     /// removing several means re-reading the list between them.
@@ -562,6 +512,20 @@ enum AuthArg {
     Query,
     Oauth2ClientCredentials,
     ServiceAccountJwt,
+}
+
+impl AuthArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthArg::None => "none",
+            AuthArg::Bearer => "bearer",
+            AuthArg::Header => "header",
+            AuthArg::Basic => "basic",
+            AuthArg::Query => "query",
+            AuthArg::Oauth2ClientCredentials => "oauth2-client-credentials",
+            AuthArg::ServiceAccountJwt => "service-account-jwt",
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -641,25 +605,18 @@ fn main() -> Result<()> {
             tui,
             no_tui,
         } => {
-            let mut config = Config::load(&config.config)?;
-
-            let overridden = listen.is_some() || admin_listen.is_some();
-            if let Some(spec) = &listen {
-                config.server.override_listen(spec).context("--listen")?;
-            }
-            if let Some(spec) = &admin_listen {
-                config
-                    .server
-                    .override_admin_listen(spec)
-                    .context("--admin-listen")?;
-            }
-            if overridden {
-                // The file was validated on load; the addresses it was
-                // validated with are no longer the ones being bound.
-                config
-                    .validate()
-                    .context("after applying the listen overrides")?;
-            }
+            let config_path = config.config.clone();
+            // Held rather than applied once: the file is re-read under a
+            // running proxy, and the watcher puts these back on top of every
+            // read. Otherwise somebody else's unrelated edit would move the
+            // proxy off the address `--listen` put it on.
+            let overrides = agent_iap::config::Overrides {
+                listen: listen.clone(),
+                admin_listen: admin_listen.clone(),
+            };
+            let overridden = overrides.any();
+            let watcher = Arc::new(Watcher::new(&config_path, overrides));
+            let config = watcher.read()?;
 
             let console = tui::choose(tui, no_tui, tui::at_a_terminal());
             init_tracing(console, &config)?;
@@ -671,7 +628,7 @@ fn main() -> Result<()> {
                     "listen addresses overridden outside the config file"
                 );
             }
-            tokio_runtime()?.block_on(run(config, console))
+            tokio_runtime()?.block_on(run(config, console, watcher))
         }
         Command::Mcp {
             config,
@@ -822,16 +779,18 @@ fn main() -> Result<()> {
             methods,
             paths,
             action,
-        }) => add_rule(
-            &config.config,
-            name.as_deref(),
-            &agent,
-            &kind,
-            &target,
-            &methods,
-            &paths,
+            expires_in,
+        }) => add_rule(AddRule {
+            path: config.config,
+            name,
+            agent,
+            kind,
+            target,
+            methods,
+            paths,
             action,
-        ),
+            expires_in,
+        }),
         Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
         Command::GenToken { id } => gen_token(&id),
         Command::HashToken { token } => {
@@ -912,7 +871,7 @@ fn init_tracing(console: Console, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run(config: Config, console: Console) -> Result<()> {
+async fn run(config: Config, console: Console, watcher: Arc<Watcher>) -> Result<()> {
     let listen = config.server.listen;
     let admin_listen = config.server.admin_listen;
     let audit_path = config.audit.path.clone();
@@ -923,7 +882,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
     // Before anything binds. The secrets are already warm from `AppState`; this
     // is where a malformed certificate, or a key that belongs to a different
     // one, stops the process instead of becoming a failed handshake later.
-    let tls = ServerTls::load(&state.config.server, &state.resolver)?;
+    let tls = ServerTls::load(&state.config().server, &state.resolver)?;
     let (proxy_scheme, admin_scheme) = (tls.proxy_scheme(), tls.admin_scheme());
 
     state.log_startup()?;
@@ -932,18 +891,21 @@ async fn run(config: Config, console: Console) -> Result<()> {
     // `ask`. Without either, `ask` denies rather than hanging.
     state.broker.set_has_approver(console.draws());
 
-    let proxy_listener = std::net::TcpListener::bind(listen)
-        .with_context(|| format!("binding the proxy to {listen}"))?;
-    let proxy = tls::serve(
-        proxy_listener,
+    let mut proxy = Listener::bind(
+        listen,
         agent_iap::proxy::router(Arc::clone(&state)),
         tls.proxy,
-    )?;
+    )
+    .context("binding the proxy")?;
 
-    let admin = match admin_listen {
+    let mut admin = match admin_listen {
         Some(addr) => {
-            let listener = std::net::TcpListener::bind(addr)
-                .with_context(|| format!("binding the control plane to {addr}"))?;
+            let listener = Listener::bind(
+                addr,
+                agent_iap::admin::router(Arc::clone(&state)),
+                tls.admin,
+            )
+            .context("binding the control plane")?;
             let token_path = write_admin_token(&audit_path, &state.admin_token)?;
             if !console.draws() {
                 eprintln!(
@@ -952,11 +914,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
                     token_path.display()
                 );
             }
-            Some(tls::serve(
-                listener,
-                agent_iap::admin::router(Arc::clone(&state)),
-                tls.admin,
-            )?)
+            Some(listener)
         }
         None => None,
     };
@@ -983,34 +941,145 @@ async fn run(config: Config, console: Console) -> Result<()> {
         }
     }
 
-    let drawing = console.draws().then(|| {
-        let state = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || agent_iap::tui::run(state))
-    });
+    // Running whether or not anything is drawn. This is what makes a `--no-tui`
+    // unit file reload rather than restart — the deployment least able to take
+    // a restart is exactly the one with nobody at a keyboard.
+    tokio::spawn(Arc::clone(&watcher).run(Arc::clone(&state)));
 
-    match (admin, drawing) {
-        (Some(admin), Some(drawing)) => tokio::select! {
-            result = proxy => result?,
-            result = admin => result?,
-            result = drawing => result??,
-            _ = tokio::signal::ctrl_c() => {}
-        },
-        (Some(admin), None) => tokio::select! {
-            result = proxy => result?,
-            result = admin => result?,
-            _ = tokio::signal::ctrl_c() => {}
-        },
-        (None, Some(drawing)) => tokio::select! {
-            result = proxy => result?,
-            result = drawing => result??,
-            _ = tokio::signal::ctrl_c() => {}
-        },
-        (None, None) => tokio::select! {
-            result = proxy => result?,
-            _ = tokio::signal::ctrl_c() => {}
-        },
+    if !console.draws() {
+        eprintln!(
+            "watching {} — edit it, or send SIGHUP, and this picks it up without a restart",
+            watcher.path().display()
+        );
     }
 
+    let mut drawing = console.draws().then(|| {
+        let state = Arc::clone(&state);
+        // The console shares the watcher rather than keeping its own, so `r`
+        // and a form it just submitted do not look like somebody else's edit.
+        let watcher = Arc::clone(&watcher);
+        tokio::task::spawn_blocking(move || agent_iap::tui::run(state, watcher))
+    });
+
+    // The listeners are the one part of the proxy a lock cannot replace: a
+    // socket is bound to an address, and a certificate is negotiated per
+    // connection. So they are supervised instead. Everything else a reload
+    // touches is already live by the time this hears about it.
+    let mut reloads = state.subscribe_reloads();
+
+    loop {
+        tokio::select! {
+            result = proxy.serving() => return Ok(result?),
+            result = serving(&mut admin) => return Ok(result?),
+            result = drawn(&mut drawing) => return result,
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            Ok(config) = reloads.recv() => {
+                if let Err(error) = adopt(&state, &config, &mut proxy, &mut admin).await {
+                    // The policy itself is already in force; only the sockets
+                    // did not follow. Loud, and not fatal — killing a proxy
+                    // that is serving correctly because it could not move to a
+                    // new port is worse than not moving to the new port.
+                    tracing::error!(?error, "the listeners could not follow the edited config");
+                }
+            }
+        }
+    }
+}
+
+/// Await an optional listener, or never — so `select!` has an arm either way.
+async fn serving(listener: &mut Option<Listener>) -> std::io::Result<()> {
+    match listener {
+        Some(listener) => listener.serving().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn drawn(drawing: &mut Option<tokio::task::JoinHandle<Result<()>>>) -> Result<()> {
+    match drawing {
+        Some(handle) => handle.await?,
+        None => std::future::pending().await,
+    }
+}
+
+/// Move the listeners onto an edited config.
+///
+/// A changed certificate is served from the next handshake and costs nothing. A
+/// changed address means a new socket: the new one is bound *first*, so a port
+/// already taken leaves the old listener exactly where it was rather than
+/// leaving the proxy listening on nothing at all.
+async fn adopt(
+    state: &Arc<AppState>,
+    config: &Config,
+    proxy: &mut Listener,
+    admin: &mut Option<Listener>,
+) -> Result<()> {
+    // Re-read rather than reuse: a certificate is the one credential in the
+    // file expected to be replaced under a running process.
+    let tls = ServerTls::reload(&config.server, &state.resolver)?;
+
+    rebind(
+        proxy,
+        config.server.listen,
+        tls.proxy,
+        || agent_iap::proxy::router(Arc::clone(state)),
+        "proxy",
+    )
+    .await?;
+
+    match (config.server.admin_listen, admin.take()) {
+        (Some(addr), Some(mut listening)) => {
+            rebind(
+                &mut listening,
+                addr,
+                tls.admin,
+                || agent_iap::admin::router(Arc::clone(state)),
+                "control plane",
+            )
+            .await?;
+            *admin = Some(listening);
+        }
+        // Turned on while running.
+        (Some(addr), None) => {
+            *admin = Some(
+                Listener::bind(addr, agent_iap::admin::router(Arc::clone(state)), tls.admin)
+                    .context("binding the control plane")?,
+            );
+            tracing::info!(%addr, "control plane opened");
+        }
+        // Turned off while running.
+        (None, Some(listening)) => {
+            tracing::info!(addr = %listening.addr, "control plane closed");
+            listening.stop().await;
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+async fn rebind(
+    listener: &mut Listener,
+    addr: std::net::SocketAddr,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    router: impl Fn() -> axum::Router,
+    what: &str,
+) -> Result<()> {
+    let same_address = listener.addr == addr;
+    let same_mode = listener.tls == tls.is_some();
+
+    if same_address && same_mode {
+        if let Some(tls) = tls {
+            listener.serve_certificate(tls);
+        }
+        return Ok(());
+    }
+
+    // Bound before the old one is told to stop, so a port that is taken is a
+    // failed reload rather than a proxy serving nothing.
+    let fresh = Listener::bind(addr, router(), tls)
+        .with_context(|| format!("moving the {what} to {addr}"))?;
+    let retired = std::mem::replace(listener, fresh);
+    tracing::info!(from = %retired.addr, to = %addr, "{what} moved");
+    retired.stop().await;
     Ok(())
 }
 
@@ -1339,7 +1408,7 @@ fn remove_agent(path: &Path, id: &str, prune: bool) -> Result<()> {
     println!("Removed agent `{id}` from {}.", path.display());
     println!("Its token authenticates nothing now, and no upstream credential rotated.");
     report_removal(&removal, id);
-    restart_notice("the running proxy still accepts the old token");
+    reload_notice("the running proxy still accepts the old token");
     Ok(())
 }
 
@@ -1353,7 +1422,7 @@ fn rotate_agent(path: &Path, id: &str) -> Result<()> {
     println!("  {}\n", rotated.token);
     println!("The old hash is gone from the file. Hand this to the agent before you restart,");
     println!("so the two changes land together rather than as an outage in between.");
-    restart_notice("the running proxy still accepts the old token and rejects this one");
+    reload_notice("the running proxy still accepts the old token and rejects this one");
     Ok(())
 }
 
@@ -1385,13 +1454,16 @@ fn report_removal(removal: &enroll::Removal, subject: &str) {
     }
 }
 
-/// The policy file is read once, at startup. Every removal edits a file the
-/// running proxy stopped looking at, and an operator who has just revoked a
-/// leaked token is exactly the person who must not assume otherwise.
-fn restart_notice(consequence: &str) {
+/// What an edit made from a shell costs before it is in force.
+///
+/// A console attached to the running proxy watches the policy file and adopts
+/// the whole of it — rules, agents, services, credentials, the listeners. With
+/// no console there is nothing reading the file, and an operator who has just
+/// revoked a leaked token is exactly the person who must not assume otherwise.
+fn reload_notice(consequence: &str) {
     println!(
-        "\nThis takes effect at the next restart — there is no hot reload, so until then \
-         {consequence}."
+        "\nA console on the running proxy picks this up within a second. Without one, it \
+         takes effect at the next restart — until then {consequence}."
     );
 }
 
@@ -1449,7 +1521,7 @@ fn remove_upstream(path: &Path, name: &str, prune: bool) -> Result<()> {
     println!("Removed upstream `{name}` from {}.", path.display());
     println!("`/{name}/…` routes nowhere now, and its credential is no longer resolved.");
     report_removal(&removal, name);
-    restart_notice("the running proxy still fronts it with the credential it already resolved");
+    reload_notice("the running proxy still fronts it with the credential it already resolved");
     Ok(())
 }
 
@@ -1526,42 +1598,66 @@ fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<()> {
     println!("Removed MCP server `{name}` from {}.", path.display());
     println!("`agent-iap mcp --server {name}` has nothing to bridge now.");
     report_removal(&removal, name);
-    restart_notice("the running proxy still relays to it, and a live stdio child keeps running");
+    reload_notice("the running proxy still relays to it");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_rule(
-    path: &Path,
-    name: Option<&str>,
-    agent: &str,
-    kind: &str,
-    target: &str,
-    methods: &[String],
-    paths: &[String],
+/// The flags of `agent-iap acl add`, carried together.
+struct AddRule {
+    path: PathBuf,
+    name: Option<String>,
+    agent: String,
+    kind: String,
+    target: String,
+    methods: Vec<String>,
+    paths: Vec<String>,
     action: ActionArg,
-) -> Result<()> {
+    expires_in: Option<String>,
+}
+
+fn add_rule(options: AddRule) -> Result<()> {
+    let expires = options
+        .expires_in
+        .as_deref()
+        .map(|ttl| enroll::parse_ttl(ttl).map(|delta| chrono::Utc::now() + delta))
+        .transpose()
+        .context("--expires-in")?;
+
     enroll::add_rule(
-        path,
-        name,
-        agent,
-        kind,
-        target,
-        methods,
-        paths,
-        action.as_str(),
+        &options.path,
+        &enroll::RuleSpec {
+            name: options.name.as_deref(),
+            agent: &options.agent,
+            kind: &options.kind,
+            target: &options.target,
+            methods: &options.methods,
+            paths: &options.paths,
+            action: options.action.as_str(),
+            expires,
+        },
     )?;
-    let count = enroll::rule_count(path)?;
+
+    let count = enroll::rule_count(&options.path)?;
     println!(
-        "Added rule {count} of {count} to {}: {} {} {} on `{target}` for `{agent}`.",
-        path.display(),
-        action.as_str(),
-        methods.join(","),
-        paths.join(","),
+        "Added rule {count} of {count} to {}: {} {} {} on `{}` for `{}`.",
+        options.path.display(),
+        options.action.as_str(),
+        options.methods.join(","),
+        options.paths.join(","),
+        options.target,
+        options.agent,
     );
     // Position is the whole semantics of an ACL, so say it rather than making
     // the operator infer it from the file.
     println!("Rules match in file order and the first match wins, so this one is checked last.");
+    if let Some(expires) = expires {
+        // A deadline nobody can see coming is a call that stops working for no
+        // visible reason, so print the wall-clock time rather than the length.
+        println!(
+            "It stops applying at {} — after that, whatever is behind it decides.",
+            expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+    }
     Ok(())
 }
 
@@ -1595,7 +1691,7 @@ fn remove_rule(path: &Path, index: usize) -> Result<()> {
             plural(removed.remaining, "rule")
         );
     }
-    restart_notice("the running proxy still decides by the old rule");
+    reload_notice("the running proxy still decides by the old rule");
     Ok(())
 }
 
@@ -1887,11 +1983,11 @@ fn show_profile(id: &str) -> Result<()> {
 
 fn add_profile(path: &Path, id: &str, options: profiles::AddOptions) -> Result<()> {
     let profile = profiles::get(id)?;
-    let dry_run = options.dry_run;
     let added = profiles::add(path, &profile, &options)?;
 
-    if dry_run {
-        println!("\n# nothing was written — drop `--dry-run` to apply this.");
+    if let Some(plan) = &added.plan {
+        println!("{plan}");
+        println!("# nothing was written — drop `--dry-run` to apply this.");
         return Ok(());
     }
 

@@ -38,15 +38,28 @@ impl ServerTls {
     /// file, a locked vault, a malformed PEM, or a key that does not belong to
     /// the certificate.
     pub fn load(server: &ServerConfig, resolver: &SecretResolver) -> Result<Self> {
+        Self::read(server, resolver, false)
+    }
+
+    /// The same, re-reading the material rather than trusting what was cached.
+    ///
+    /// What a reload uses. A certificate is the one credential in the file that
+    /// is *expected* to be replaced under a running process, so a renewal has
+    /// to be visible to a proxy that already resolved the old one.
+    pub fn reload(server: &ServerConfig, resolver: &SecretResolver) -> Result<Self> {
+        Self::read(server, resolver, true)
+    }
+
+    fn read(server: &ServerConfig, resolver: &SecretResolver, fresh: bool) -> Result<Self> {
         let proxy = match &server.tls {
-            Some(tls) => Some(load_one(tls, resolver).context("server.tls")?),
+            Some(tls) => Some(load_one(tls, resolver, fresh).context("server.tls")?),
             None => None,
         };
         // `admin_tls_material` already decided that an unnamed control plane
         // inherits the proxy's certificate; reuse the parsed one rather than
         // resolving the same reference twice.
         let admin = match (&server.admin_tls, &proxy) {
-            (Some(tls), _) => Some(load_one(tls, resolver).context("server.admin_tls")?),
+            (Some(tls), _) => Some(load_one(tls, resolver, fresh).context("server.admin_tls")?),
             (None, Some(shared)) => Some(Arc::clone(shared)),
             (None, None) => None,
         };
@@ -82,9 +95,17 @@ pub fn scheme(tls: bool) -> &'static str {
     }
 }
 
-fn load_one(tls: &TlsConfig, resolver: &SecretResolver) -> Result<Arc<rustls::ServerConfig>> {
-    let cert = resolver.resolve(&tls.cert).context("cert")?;
-    let key = resolver.resolve(&tls.key).context("key")?;
+fn load_one(
+    tls: &TlsConfig,
+    resolver: &SecretResolver,
+    fresh: bool,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let read = |reference: &str| match fresh {
+        true => resolver.refresh(reference),
+        false => resolver.resolve(reference),
+    };
+    let cert = read(&tls.cert).context("cert")?;
+    let key = read(&tls.key).context("key")?;
     // The listener never uses `ca` — the bridge does, in a different process
     // started at a different time. Prove it anyway, here, where a human is
     // watching the daemon come up: a CA reference that does not resolve is a
@@ -158,39 +179,128 @@ pub fn build(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::ServerConfig>>
     Ok(Arc::new(config))
 }
 
-/// Serve `router` on an already-bound listener, over TLS when one was loaded.
+/// A bound, serving listener.
 ///
-/// The listener is bound by the caller so the address it actually got — `:0` in
-/// the tests — is known before anything is served, and so a bind failure is
-/// still a startup failure rather than a task that dies later.
-///
-/// The TLS arm hands the accept loop to `axum-server`, which completes each
-/// handshake on its own task and abandons it after ten seconds. Doing it inline
-/// would let one client that opens a connection and then says nothing stall
-/// every other agent's accept.
-pub fn serve(
-    listener: std::net::TcpListener,
-    router: Router,
-    tls: Option<Arc<rustls::ServerConfig>>,
-) -> Result<Serving> {
-    listener
-        .set_nonblocking(true)
-        .context("putting the listener in non-blocking mode")?;
-    let service = router.into_make_service_with_connect_info::<SocketAddr>();
+/// Kept rather than awaited so the policy file can change under it. A
+/// certificate can be replaced without dropping a connection; an address cannot
+/// — a socket is bound to one — so that case binds the new one and lets the old
+/// one finish what it is already carrying.
+pub struct Listener {
+    pub addr: SocketAddr,
+    /// The material this was bound with, so a reload can tell "the certificate
+    /// changed" from "the listener stopped serving TLS altogether".
+    pub tls: bool,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    stop: Stop,
+    /// Present only on the TLS arm — what makes a renewal free.
+    certificates: Option<axum_server::tls_rustls::RustlsConfig>,
+}
 
-    Ok(match tls {
-        Some(config) => {
-            let config = axum_server::tls_rustls::RustlsConfig::from_config(config);
-            Box::pin(axum_server::from_tcp_rustls(listener, config)?.serve(service))
+enum Stop {
+    /// `axum-server`'s own, for the TLS arm.
+    Handle(axum_server::Handle<SocketAddr>),
+    /// A channel the plain arm's graceful shutdown future is waiting on.
+    Signal(tokio::sync::oneshot::Sender<()>),
+}
+
+/// How long an old listener gets to finish what it is already carrying before
+/// it is dropped. Long enough for a request in flight, short enough that an
+/// address change is not a hang.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Listener {
+    /// Bind and start serving. Binding here rather than inside the task means
+    /// an address already in use is an error the caller gets, not one that
+    /// disappears into a task nobody is awaiting.
+    pub fn bind(
+        addr: SocketAddr,
+        router: Router,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<Self> {
+        let listener =
+            std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+        let addr = listener
+            .local_addr()
+            .context("asking the listener what address it got")?;
+        listener
+            .set_nonblocking(true)
+            .context("putting the listener in non-blocking mode")?;
+        let service = router.into_make_service_with_connect_info::<SocketAddr>();
+
+        Ok(match tls {
+            // The TLS arm hands the accept loop to `axum-server`, which
+            // completes each handshake on its own task and abandons it after
+            // ten seconds. Doing it inline would let one client that opens a
+            // connection and then says nothing stall every other agent's
+            // accept.
+            Some(config) => {
+                let certificates = axum_server::tls_rustls::RustlsConfig::from_config(config);
+                let handle = axum_server::Handle::<SocketAddr>::new();
+                let server = axum_server::from_tcp_rustls(listener, certificates.clone())?
+                    .handle(handle.clone());
+                Listener {
+                    addr,
+                    tls: true,
+                    task: tokio::spawn(server.serve(service)),
+                    stop: Stop::Handle(handle),
+                    certificates: Some(certificates),
+                }
+            }
+            None => {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .context("handing the listener to the async runtime")?;
+                let (stop, stopped) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    axum::serve(listener, service)
+                        .with_graceful_shutdown(async move {
+                            let _ = stopped.await;
+                        })
+                        .await
+                });
+                Listener {
+                    addr,
+                    tls: false,
+                    task,
+                    stop: Stop::Signal(stop),
+                    certificates: None,
+                }
+            }
+        })
+    }
+
+    /// Serve a new certificate from the next handshake on. Connections already
+    /// established keep the one they negotiated, which is how TLS works.
+    pub fn serve_certificate(&self, config: Arc<rustls::ServerConfig>) {
+        if let Some(certificates) = &self.certificates {
+            certificates.reload_from_config(config);
         }
-        None => {
-            let listener = tokio::net::TcpListener::from_std(listener)
-                .context("handing the listener to the async runtime")?;
-            Box::pin(std::future::IntoFuture::into_future(axum::serve(
-                listener, service,
-            )))
+    }
+
+    /// Wait for this listener to stop on its own — which, absent an error, it
+    /// does not.
+    pub async fn serving(&mut self) -> std::io::Result<()> {
+        match (&mut self.task).await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(std::io::Error::other(error)),
         }
-    })
+    }
+
+    /// Stop accepting, and give what is in flight a moment to finish.
+    pub async fn stop(self) {
+        match self.stop {
+            Stop::Handle(handle) => handle.graceful_shutdown(Some(DRAIN)),
+            Stop::Signal(signal) => {
+                let _ = signal.send(());
+            }
+        }
+        match tokio::time::timeout(DRAIN + std::time::Duration::from_secs(1), self.task).await {
+            Ok(_) => {}
+            // It had ten seconds. Something is holding a connection open past
+            // the point where waiting for it helps anyone.
+            Err(_) => tracing::warn!(addr = %self.addr, "a retired listener would not drain"),
+        }
+    }
 }
 
 /// An HTTP client that trusts whatever signed the control plane's certificate.

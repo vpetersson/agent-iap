@@ -124,6 +124,18 @@ impl SecretResolver {
         self.cache.lock().insert(raw.to_string(), value);
     }
 
+    /// Resolve a reference, ignoring and replacing anything already cached.
+    ///
+    /// The cache exists so twenty upstreams sharing a vault item cost one `op`
+    /// call. That is right for a credential, whose value does not change under
+    /// a running proxy — and wrong for a certificate, whose whole lifecycle is
+    /// being replaced on disk every ninety days. A reload re-reads TLS material
+    /// through here, which is what lets a renewal land without a restart.
+    pub fn refresh(&self, raw: &str) -> Result<Secret> {
+        self.cache.lock().remove(raw);
+        self.resolve(raw)
+    }
+
     /// Resolve a raw reference string. Blocking: 1Password shells out to `op`.
     pub fn resolve(&self, raw: &str) -> Result<Secret> {
         if let Some(hit) = self.cache.lock().get(raw) {

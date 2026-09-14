@@ -27,6 +27,7 @@ pub enum What {
     Upstreams,
     Mcp,
     Acl,
+    Credentials,
 }
 
 impl What {
@@ -89,6 +90,22 @@ pub struct McpRow {
     pub rules: Option<usize>,
 }
 
+/// One credential reference the policy file names, and what reads it.
+///
+/// The proxy exists so that nobody has to know these values; this is the other
+/// half of that bargain — an operator can see *which* credentials the proxy is
+/// holding, and where each one comes from, without any of them being shown.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialRow {
+    /// What holds it: `upstream github`, `mcp sentry`, `agent claude-code`.
+    pub owner: String,
+    /// The field it fills: `auth.secret`, `env.GITHUB_TOKEN`, `token_ref`.
+    pub field: String,
+    /// The reference, never the value. A `literal:` reference *is* the value,
+    /// so it is the one thing masked here.
+    pub reference: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AclRow {
     /// Position in the file. First match wins, so this ordering is the policy —
@@ -101,6 +118,12 @@ pub struct AclRow {
     pub methods: Vec<String>,
     pub paths: Vec<String>,
     pub action: Action,
+    /// What is left of a time-limited grant, or `None` for one with no end.
+    /// Rendered as time remaining rather than as a timestamp: "47m" is the
+    /// thing being decided about, and a timestamp makes the reader do the
+    /// subtraction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<String>,
 }
 
 /// Everything the policy file exposes, in the sections that were asked for.
@@ -117,6 +140,8 @@ pub struct Inventory {
     pub mcp_servers: Option<Vec<McpRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acl: Option<Vec<AclRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Vec<CredentialRow>>,
     /// What happens when no rule matches. Only meaningful beside the rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acl_default: Option<Action>,
@@ -181,6 +206,13 @@ impl Inventory {
                     .map(|server| mcp_row(server, scope.as_ref()))
                     .collect(),
             );
+        }
+
+        if options.what.shows(What::Credentials) {
+            // Scoped to what the agent can address, like every other section:
+            // `list credentials --agent x` is "which credentials would a call
+            // from x ever reach", which is the answer a review wants.
+            inventory.credentials = Some(credential_rows(config, scope.as_ref()));
         }
 
         if options.what.shows(What::Acl) {
@@ -290,6 +322,18 @@ impl Inventory {
             section("MCP SERVERS", render_table(&headers, &rows));
         }
 
+        if let Some(credentials) = &self.credentials {
+            let rows: Vec<Vec<String>> = credentials
+                .iter()
+                .map(|c| vec![c.owner.clone(), c.field.clone(), c.reference.clone()])
+                .collect();
+            let mut table = render_table(&["HOLDER", "FIELD", "REFERENCE"], &rows);
+            table.push_str(
+                "\nreferences only — the proxy resolves these, and never prints a value\n",
+            );
+            section("CREDENTIALS", table);
+        }
+
         if let Some(acl) = &self.acl {
             let rows: Vec<Vec<String>> = acl
                 .iter()
@@ -303,12 +347,13 @@ impl Inventory {
                         r.methods.join(","),
                         r.paths.join(","),
                         r.action.to_string(),
+                        r.expires_in.clone().unwrap_or_else(|| NONE.to_string()),
                     ]
                 })
                 .collect();
             let mut table = render_table(
                 &[
-                    "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION",
+                    "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION", "EXPIRES",
                 ],
                 &rows,
             );
@@ -401,6 +446,75 @@ fn mcp_row(server: &McpServerConfig, scope: Option<&Scope>) -> McpRow {
     }
 }
 
+/// Every credential reference in the file, in the order an operator would
+/// look for them: the proxy's own, then the agents, then the services.
+fn credential_rows(config: &Config, scope: Option<&Scope>) -> Vec<CredentialRow> {
+    let mut rows = Vec::new();
+    let mut push = |owner: String, field: &str, reference: &str| {
+        rows.push(CredentialRow {
+            owner,
+            field: field.to_string(),
+            reference: display_ref(reference),
+        });
+    };
+
+    // The proxy's own credentials are credentials too, and the ones most
+    // easily forgotten: a control plane whose token lives in a file is a
+    // thing to know about before it is a thing to find out about.
+    if scope.is_none() {
+        if let Some(reference) = &config.server.admin_token {
+            push("server".into(), "admin_token", reference);
+        }
+        for (label, tls) in [
+            ("tls", &config.server.tls),
+            ("admin_tls", &config.server.admin_tls),
+        ] {
+            let Some(tls) = tls else { continue };
+            push("server".into(), &format!("{label}.cert"), &tls.cert);
+            push("server".into(), &format!("{label}.key"), &tls.key);
+            if let Some(ca) = &tls.ca {
+                push("server".into(), &format!("{label}.ca"), ca);
+            }
+        }
+    }
+
+    for agent in &config.agents {
+        if scope.is_some_and(|s| s.agent.id != agent.id) {
+            continue;
+        }
+        if let Some(reference) = &agent.token_ref {
+            push(format!("agent {}", agent.id), "token_ref", reference);
+        }
+    }
+
+    for upstream in &config.upstreams {
+        if scope.is_some_and(|s| !s.may_address(&upstream.name)) {
+            continue;
+        }
+        for (field, reference) in upstream.auth.secret_fields() {
+            push(format!("upstream {}", upstream.name), field, reference);
+        }
+    }
+
+    for server in &config.mcp_servers {
+        if scope.is_some_and(|s| !s.may_address(&server.name)) {
+            continue;
+        }
+        for (field, reference) in server.auth.secret_fields() {
+            push(format!("mcp {}", server.name), field, reference);
+        }
+        for (key, reference) in &server.env {
+            push(
+                format!("mcp {}", server.name),
+                &format!("env.{key}"),
+                reference,
+            );
+        }
+    }
+
+    rows
+}
+
 fn acl_row(index: usize, rule: &crate::config::AclRuleConfig) -> AclRow {
     AclRow {
         index,
@@ -413,6 +527,9 @@ fn acl_row(index: usize, rule: &crate::config::AclRuleConfig) -> AclRow {
         methods: rule.methods.clone(),
         paths: rule.paths.clone(),
         action: rule.action,
+        expires_in: rule
+            .expires
+            .map(|at| crate::enroll::remaining(at, chrono::Utc::now())),
     }
 }
 

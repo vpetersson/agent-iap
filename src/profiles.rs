@@ -223,6 +223,10 @@ pub struct Added {
     pub rules: Vec<String>,
     pub scopes: Vec<String>,
     pub note: Option<String>,
+    /// The TOML a `dry_run` would have written. Returned rather than printed
+    /// so the approval console can show the same preview the CLI does — a
+    /// `println!` into a drawn terminal is a corrupted screen.
+    pub plan: Option<String>,
 }
 
 pub fn get(id: &str) -> Result<Profile> {
@@ -297,11 +301,14 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
         rules: rules.iter().map(|rule| rule.name.clone()).collect(),
         scopes: access.scopes.clone(),
         note: profile.note.clone(),
+        plan: None,
     };
 
     if options.dry_run {
-        print_dry_run(&name, &service, &auth, &rules, &agent);
-        return Ok(added);
+        return Ok(Added {
+            plan: Some(render_plan(&name, &service, &auth, &rules, &agent)),
+            ..added
+        });
     }
 
     match &service {
@@ -332,46 +339,45 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
     }
 
     for rule in &rules {
-        enroll::add_rule(
-            path,
-            Some(&rule.name),
-            &agent,
-            &rule.kind,
-            &name,
-            &rule.methods,
-            &rule.paths,
-            &rule.action,
-        )?;
+        enroll::add_rule(path, &planned_spec(rule, &agent, &name))?;
     }
 
     Ok(added)
 }
 
-fn print_dry_run(
+fn render_plan(
     name: &str,
     service: &Service,
     auth: &AuthSpec,
     rules: &[PlannedRule],
     agent: &str,
-) {
-    println!("# would append to the policy file:");
-    println!(
-        "{}",
-        enroll::render_service(name, service_spec(service), auth)
-    );
+) -> String {
+    let mut plan = String::from("# would append to the policy file:\n");
+    plan.push_str(&enroll::render_service(name, service_spec(service), auth));
+    plan.push('\n');
     for rule in rules {
-        println!(
-            "{}",
-            enroll::render_rule(
-                Some(&rule.name),
-                agent,
-                &rule.kind,
-                name,
-                &rule.methods,
-                &rule.paths,
-                &rule.action,
-            )
-        );
+        plan.push_str(&enroll::render_rule(&planned_spec(rule, agent, name)));
+        plan.push('\n');
+    }
+    plan
+}
+
+/// A profile's rule, in the shape `enroll` writes. Profiles grant standing
+/// access, so nothing here expires — a profile is the policy, not a loan.
+fn planned_spec<'a>(
+    rule: &'a PlannedRule,
+    agent: &'a str,
+    target: &'a str,
+) -> enroll::RuleSpec<'a> {
+    enroll::RuleSpec {
+        name: Some(&rule.name),
+        agent,
+        kind: &rule.kind,
+        target,
+        methods: &rule.methods,
+        paths: &rule.paths,
+        action: &rule.action,
+        expires: None,
     }
 }
 

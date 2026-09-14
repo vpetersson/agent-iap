@@ -104,16 +104,17 @@ pub fn find(state: &AppState, agent: &AgentConfig, wanted: &str) -> Option<Skill
 /// "Could" is the `targets` list plus the existence of a rule that can name the
 /// target. A target no rule ever mentions falls through to a default that
 /// denies, so listing it would advertise a call that cannot succeed.
-fn reachable_upstreams<'a>(
-    state: &'a AppState,
+fn reachable_upstreams(
+    state: &AppState,
     agent: &AgentConfig,
-) -> Vec<&'a crate::config::UpstreamConfig> {
+) -> Vec<crate::config::UpstreamConfig> {
     state
-        .config
+        .config()
         .upstreams
         .iter()
         .filter(|upstream| crate::identity::agent_may_address(agent, &upstream.name))
         .filter(|upstream| state.acl.rules_for(&agent.id, Kind::Http, &upstream.name) > 0)
+        .cloned()
         .collect()
 }
 
@@ -203,7 +204,8 @@ fn skill_name_for(upstream: &str) -> String {
 
 /// One upstream, as its policy actually reads for this agent.
 fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
-    let upstream = state.config.upstream(name);
+    let config = state.config();
+    let upstream = config.upstream(name);
     let mut text = format!("# `{name}`\n\n");
 
     match upstream {
@@ -248,7 +250,7 @@ fn rules_table(state: &AppState, agent: &AgentConfig, target: &str) -> String {
     let mut any = false;
 
     for index in state.acl.rule_indices_for_agent(&agent.id) {
-        let Some(rule) = state.config.acl.get(index) else {
+        let Some(rule) = state.config().acl.get(index).cloned() else {
             continue;
         };
         // `kind = "any"` covers both surfaces; an `mcp` rule has nothing to say
@@ -452,7 +454,7 @@ action = "allow"
         let state = state();
         // A policy-file agent with a `targets` list naming an upstream that no
         // rule covers: the honest answer is "nothing", not an empty list.
-        let mut config = (*state.config.agent("claude").unwrap()).clone();
+        let mut config = (*state.config().agent("claude").unwrap()).clone();
         config.id = "walled".into();
         config.targets = vec!["unmentioned".into()];
         let text = instructions(&state, &config);

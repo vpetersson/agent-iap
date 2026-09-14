@@ -161,6 +161,12 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "op://Private/GitHub/token" }
 # --- policy ----------------------------------------------------------------
 # First matching rule wins. Anything unmatched falls through to acl_default.
 # `paths` are URL paths for http and tool / resource names for mcp.
+#
+# Any rule may carry `expires = "<RFC 3339>"`. Past it the rule matches nothing
+# and whatever is behind it decides instead, so a grant ends on the clock rather
+# than on somebody remembering to take it away. Checked on every request, so it
+# survives a restart; `agent-iap acl add --expires-in 90m` writes one, and so
+# does the approval console's dialogue. See the last rule in this file.
 
 [[acl]]
 name = "anthropic-inference"
@@ -223,3 +229,16 @@ action = "ask"
 
 [acl_default]
 action = "deny"
+
+# A grant with a deadline on it. This one has long since run out, which is what
+# an expired rule looks like when you find it: still numbered, still listed, and
+# deciding nothing. `agent-iap list acl` shows it as `expired`.
+# [[acl]]
+# name = "migration-window"
+# agent = "claude-code"
+# kind = "http"
+# target = "github"
+# methods = ["POST"]
+# paths = ["/repos/acme/**"]
+# action = "allow"
+# expires = "2026-01-01T09:00:00Z"

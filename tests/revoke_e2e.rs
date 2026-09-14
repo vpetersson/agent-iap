@@ -65,13 +65,16 @@ fn policy(dir: &Path, upstream: SocketAddr) -> (PathBuf, String) {
     // nothing else — a 401 here can only be the identity check.
     enroll::add_rule(
         &path,
-        Some("reads"),
-        "*",
-        "http",
-        "echo",
-        &["GET".into()],
-        &["/v1/models".into()],
-        "allow",
+        &enroll::RuleSpec {
+            name: Some("reads"),
+            agent: "*",
+            kind: "http",
+            target: "echo",
+            methods: &["GET".into()],
+            paths: &["/v1/models".into()],
+            action: "allow",
+            expires: None,
+        },
     )
     .unwrap();
     let agent = enroll::add_agent(&path, "ci", None, &["echo".into()]).unwrap();

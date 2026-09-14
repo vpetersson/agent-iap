@@ -214,6 +214,25 @@ impl CredentialInjector {
         }
     }
 
+    /// Drop the minted tokens of every target not in `keep`.
+    ///
+    /// A reload's tidying-up. An upstream removed from the policy file, or
+    /// repointed at a different account, must not keep being served from the
+    /// token this process minted for what it used to be — that token outlives
+    /// the grant that justified it, which is the thing this whole proxy exists
+    /// to stop.
+    pub fn retain_targets<'a>(&self, keep: impl Iterator<Item = &'a str>) {
+        let keep: std::collections::HashSet<&str> = keep.collect();
+        let mut cache = self.token_cache.lock();
+        cache.retain(|target, _| {
+            let kept = keep.contains(target.as_str());
+            if !kept {
+                tracing::info!(target, "dropped a minted token; its target is gone");
+            }
+            kept
+        });
+    }
+
     fn cached_token(&self, target: &str) -> Option<Secret> {
         let cache = self.token_cache.lock();
         let (token, expires_at) = cache.get(target)?;

@@ -30,6 +30,16 @@ ExecStartPre=/usr/local/bin/agent-iap check
 # plane) or it denies. A rule set that is all `allow`/`deny` needs no answerer.
 ExecStart=/usr/local/bin/agent-iap run --no-tui
 
+# `systemctl reload` rather than `restart`: the proxy re-reads the whole policy
+# file in place — rules, agents, upstreams, credentials, certificates, even the
+# addresses it listens on — without dropping an agent's connection or its MCP
+# session. It refuses anything it cannot serve and carries on with the policy it
+# already had, so this is safe to wire into whatever writes the file.
+#
+# The file is watched anyway, so this is for the impatient and for the tool that
+# has just finished writing and does not want to wait to be noticed.
+ExecReload=/bin/kill -HUP $MAINPID
+
 # /var/lib/agent-iap, created owner-only on first start. The audit log and the
 # `admin-token` written beside it live here, and it is the only path the proxy
 # writes to.

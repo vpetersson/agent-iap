@@ -414,7 +414,7 @@ fn catalog_result(state: &AppState, caller: &Caller) -> Value {
         let Some(name) = skill.name.strip_prefix("upstream/") else {
             continue;
         };
-        let Some(upstream) = state.config.upstream(name) else {
+        let Some(upstream) = state.config().upstream(name).cloned() else {
             continue;
         };
         text.push_str(&format!(
@@ -515,7 +515,7 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
         return Err(reason.to_string());
     }
 
-    let Some(upstream) = state.config.upstream(&upstream_name).cloned() else {
+    let Some(upstream) = state.config().upstream(&upstream_name).cloned() else {
         record.event = "denied".into();
         record.decision = Some("deny".into());
         record.rule = Some("<unknown-upstream>".into());
@@ -578,7 +578,7 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
             format!("could not resolve the credential for `{}`", upstream.name)
         })?;
 
-    let response = state.http.execute(outbound).await.map_err(|error| {
+    let response = state.http().execute(outbound).await.map_err(|error| {
         let mut record = record.clone();
         record.event = "error".into();
         record.error = Some(crate::proxy::describe_upstream_error(&error));
@@ -597,7 +597,7 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
     }
 
     let headers = readable_headers(response.headers());
-    let (bytes, truncated) = read_capped(response, state.config.server.max_body_bytes).await?;
+    let (bytes, truncated) = read_capped(response, state.config().server.max_body_bytes).await?;
 
     record.status = Some(status.as_u16());
     record.duration_ms = Some(started.elapsed().as_millis() as u64);

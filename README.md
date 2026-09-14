@@ -428,6 +428,23 @@ agent-iap mcp-server add notes --command notes-mcp --arg --stdio \
     --env NOTES_TOKEN=op://Private/Notes/token
 ```
 
+A rule can be given a deadline, from the console's dialogue or from here:
+
+```bash
+# Access for the length of the job, and not a minute more.
+agent-iap acl add --name migration-window --agent claude-code \
+    --target github --methods POST --paths '/repos/acme/**' \
+    --action allow --expires-in 90m
+```
+
+`--expires-in` takes `30s`, `5m`, `1h`, `7d` — never a bare number, because
+"allow this for 5" is a question about units nobody should have to stop and ask,
+and being wrong by a factor of sixty only goes one way. The deadline is written
+into the rule as a UTC timestamp, checked against the clock on every request,
+and so survives a restart. Nothing sweeps expired rules out of the file: they
+stay visible, listed as `expired`, because a grant that was made and has run out
+is a thing to have a record of.
+
 `--username-secret` is for the APIs that put the credential in the user half of
 basic auth — Graylog's `<token>:token`, and its session-token variant. Spelling
 that with a plain `--username` would mean the token itself living in a file
@@ -469,10 +486,11 @@ number, so a rule matching nothing is something you were told about rather than
 something you find later. Only rules that name it *outright* are pruned:
 `agent = "ci-*"` covers a fleet, and one member leaving is not that rule ending.
 
-**None of it takes effect until the proxy restarts.** There is no hot reload
-(§ Multiple agents), so a rotated token is not yet a revoked one — every one of
-these commands says so, and the leaked token keeps working until the process
-comes back.
+**With a console attached, these land within a second** — it watches the policy
+file and puts the whole of it in charge. Without one, nothing is reading the
+file, and a rotated token is not yet a revoked one until the proxy restarts:
+every one of these commands says which you are getting, because a revocation
+that has not taken effect is worse than one you know is pending.
 
 ## What happens to a request
 
@@ -538,9 +556,166 @@ banner says which of the two you are getting.
 The console owns the terminal, so diagnostics go to `agent-iap.log` beside the
 audit log instead of to stdout, and the bottom pane is a live tail of the audit
 log — what the agent has been doing while you decide what to allow next.
-`↑`/`↓` moves, `a`/`d` answers, `A`/`D` answers and remembers it for this
-session, `f` forgets what was remembered, and `q` quits the console and stops
-the proxy with it.
+
+#### The dialogue
+
+A parked request raises a dialogue of its own, unprompted, because a request
+sitting behind a pane nobody happens to be looking at will time out and a
+timeout denies. It is Little Snitch's dialogue, and for Little Snitch's reason:
+"may this connect" is unanswerable on its own, and what an operator *can* answer
+is may this agent do this much, for how long.
+
+```
+┌ Claude Code is asking ───────────────────────────────────────┐
+│  Claude Code  (claude-code)                                  │
+│  wants to POST /repos/acme/api/issues on github              │
+│  agent-iap holds the credential and attaches it on the way   │
+│  out — allowing this does not hand it over.                  │
+│                                                              │
+│    Once   5 min   1 hour   1 day   Until quit   From now on  │
+│                                                              │
+│      ( ) any request from Claude Code                        │
+│      ( ) → anything on github                                │
+│      ( ) → POST on github                                    │
+│      (•) → POST /repos/acme/api/issues on github             │
+│                                                              │
+│  writes an acl rule at #0, in front of                       │
+│  `github-writes-need-a-human`, expiring at 10:41 on 14 Sep   │
+│  — after that this asks again                                │
+│                                                              │
+│       d  Deny     a  Allow     esc  leave it waiting         │
+└──────────────────────────────── waiting 4s ──────────────────┘
+```
+
+`←`/`→` picks how long, `↑`/`↓` picks how far, and the line above the buttons
+says what the pair of them will actually do. All of it is clickable — the
+segments, the radio rows, and Deny and Allow — which is how the dialogue this
+copies was always driven. The durations are four different
+mechanisms:
+
+- **Once** answers this request. The next identical call asks again.
+- **5 min / 1 hour / 1 day** write an ACL rule that carries its own deadline.
+  Past it the rule matches nothing and the request falls through to whatever is
+  behind it — which, for a rule written in front of an `ask`, is the `ask`
+  again.
+- **Until quit** is remembered in this process, for everything the chosen row
+  covers, and dies with it. The only answer that writes nothing.
+- **From now on** writes the same rule without a deadline.
+
+Everything that writes a rule writes it *in front of* the `ask` that raised the
+question, because first match wins and an appended rule would sit behind it and
+never be reached. All of them are live in this process immediately.
+
+The TTLs are the ones worth having. Most of what an operator wants to say is
+not "yes" and not "no" but *yes, while I am doing this* — and a console that
+cannot spell that leaves them choosing between a grant that outlives the reason
+for it and being asked again in thirty seconds. Both of those end with somebody
+holding the key down. Because the deadline is in the file rather than in this
+process's memory, a restart in the middle does not hand the grant back, and
+nothing has to remember to take it away.
+
+The cursor starts on the narrowest row and on `Once`: a dialogue whose default
+hands out more than was asked for is a dialogue that hands out more than was
+asked for. `a`/`d` on the queue itself answer once, at that narrowest scope,
+without opening anything.
+
+#### The other panes
+
+`1`…`7` or `tab` move between them, and everything the enrolment commands do
+from a shell is a form here, over the same functions with the same validation:
+
+| Pane | What it shows | Keys |
+| --- | --- | --- |
+| approvals | the queue, and the request in full | `enter` `a` `d` `f` |
+| agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
+| upstreams | base URL, scheme, credential reference | `n` `x` |
+| mcp | transport, command or URL, credential references | `n` `x` |
+| acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
+| credentials | every reference the file names, and whether it still resolves | `c` re-check |
+| profiles | the ready-made service definitions | `enter` add |
+
+It answers the mouse, too. Click a tab to change pane, a row to select it,
+twice to open it — the same thing `enter` does there. The wheel scrolls the
+pane, and the scope list when the dialogue is up. The footer's key hints are
+buttons: if it names a key, clicking it presses that key. Every one of these
+ends in the handler the keyboard uses, because a click that could grant
+something a keystroke could not would be a second policy surface on the one
+screen that cannot afford one.
+
+Reporting the pointer is what stops the terminal's own text selection working,
+and the thing most worth selecting off this screen is a token. So `m` turns it
+off and back on, and most terminals will also let you hold ⇧ to select through
+it.
+
+`?` lists the keys, and `q` quits the console and stops the proxy with it. `r`
+re-reads the policy file, though it rarely has to: the file is watched, so an
+`agent-iap acl add` in the next terminal, or a hand edit in an editor, lands in
+the panes — and in the running proxy — on its own, and the footer says what
+changed. A file caught mid-rewrite is waited on rather than reported as broken,
+and a file edited into something that will not parse is reported once, with the
+proxy left running the last policy that did (§ Reloading).
+
+A minted token is shown once, in a modal, and then only its sha256 exists. No
+credential *value* is ever displayed: the credentials pane shows references, and
+resolves them on `c` to answer the one question the file cannot — whether the
+vault is still unlocked and the variable still set.
+
+Everything written here is in force before you look away. Not just the rules and
+the roster: upstreams, MCP servers, credentials, timeouts, the audit log, and the
+address this proxy listens on. There is nothing the console can write that waits
+for a restart — see § Reloading.
+
+## Reloading
+
+The policy file is edited while the proxy is running — from the console, from
+`agent-iap acl add` in the next terminal, from an editor. So nothing here is
+read once and owned forever. A reload replaces the lot:
+
+| Edited | What happens |
+| --- | --- |
+| `[[acl]]`, `[[agents]]` | recompiled and re-enrolled; the next request is judged by the new list |
+| `[[upstreams]]`, `[[mcp_servers]]` | routable immediately, credential and all |
+| a credential reference | re-resolved; a minted token for a target that went away is dropped |
+| `[server.tls]`, `[server.admin_tls]` | re-read from source and served from the next handshake; connections already up keep the certificate they negotiated |
+| `server.listen`, `server.admin_listen` | the new address is bound, then the old listener drains for ten seconds |
+| timeouts, `max_body_bytes`, `approval_timeout_secs`, workload settings | in force for the next request; anything already in flight keeps what it started with |
+| `[audit]` | redaction and body limits immediately; a changed `path` closes the old file and picks up the new file's hash chain |
+
+**All of it, or none of it.** Every step that can fail happens first, against
+scratch copies: the secrets resolve, the rules compile, the agents enrol, the
+credential schemes parse, the client builds, the new socket binds. Only then is
+anything installed, and installing cannot fail. So an edit that would not have
+*started* this process does not stop it either — it is refused, the reason goes
+on the console's footer, and the proxy carries on serving the policy it already
+had. A proxy running half of one policy and half of another is running a policy
+nobody wrote.
+
+### What triggers one
+
+The policy file is watched by the daemon, not by the console, so this is the
+same wherever it runs — a terminal, a unit file, a container with nobody
+attached:
+
+```bash
+agent-iap acl add --name migration-window …   # the file changed; picked up
+$EDITOR /etc/agent-iap/iap.toml               # same
+systemctl reload agent-iap                    # SIGHUP, for the impatient
+kill -HUP "$MAINPID"                          # and what that actually sends
+```
+
+A changed file has to hold still for 250ms before it is read, because a rewrite
+is a truncate and then a write and there is a moment in between when the file is
+half a policy. `SIGHUP` skips the wait, which is what makes it the right trigger
+for a config-management tool that has just finished writing. The console's `r`
+is the same call again.
+
+Every reload is logged, and written to the audit log as a `reload` record naming
+which of the three caused it and what the policy became — a rule appearing ten
+seconds before a call it allowed is a thing the log should be able to show you.
+
+One thing this does not do: the signing key behind § Workload identity is not
+rotated, because that would invalidate every token already handed out — a
+fleet-wide outage rather than a config change.
 
 ## The policy file
 
@@ -719,7 +894,13 @@ and verification is never turned off in either case. Which is why the
 certificate the control plane serves has to name the address it is reached at;
 see below.
 
-Renewal still means a restart; there is no reload yet. Client certificates are
+Renewal does not mean a restart. A reload re-reads `cert` and `key` from source
+— past the cache, because a certificate is the one credential in this file that
+is *expected* to be replaced under a running process — and serves the new one
+from the next handshake; connections already up keep what they negotiated. What
+it needs is something to *trigger* the reload, and the trigger is the policy
+file changing or a `SIGHUP`, not the certificate file itself: so pair the
+renewal with `systemctl reload agent-iap` (§ Reloading). Client certificates are
 not an identity here either — agents are still the bearer token.
 
 #### Where the certificate comes from
@@ -793,8 +974,8 @@ reason to be accepting connections on an interface whose callers it cannot even
 serve.
 
 The certificate lasts 90 days. Re-running the same `tailscale cert` command
-renews it, and since the proxy reads both files once at startup, the renewal and
-the restart belong in one unit:
+renews it; the renewal and whatever makes the proxy pick it up belong in one
+unit. Headless, that is a restart:
 
 ```bash
 tailscale cert --cert-file /etc/agent-iap/fullchain.pem \
@@ -802,6 +983,9 @@ tailscale cert --cert-file /etc/agent-iap/fullchain.pem \
                iap.tailnet-name.ts.net \
   && systemctl restart agent-iap
 ```
+
+Or `systemctl reload agent-iap` instead of `restart`: the new certificate is
+served from the next handshake and nothing in flight is dropped (§ Reloading).
 
 #### Small Step
 
@@ -861,12 +1045,12 @@ so ship the root with the agent's image or its config, and treat a verification
 failure as a deployment bug rather than a flag to add.
 
 `step-ca` issues short certificates on purpose — 24 hours by default, and the
-provisioner caps what you may ask for. That is a virtue everywhere except here,
-where a renewal costs a restart. `step ca renew` can own both ends of it:
+provisioner caps what you may ask for. At that rate you want a reload rather
+than a restart, and `step ca renew` can own both ends of it:
 
 ```bash
 step ca renew --daemon \
-  --exec "systemctl restart agent-iap" \
+  --exec "systemctl reload agent-iap" \
   /etc/agent-iap/fullchain.pem /etc/agent-iap/key.pem
 ```
 
@@ -915,9 +1099,20 @@ gcs        https://storage.googleapis.com  service_account_jwt  op://Private/GCP
 github     https://api.github.com          bearer               op://Private/GitHub/token
 ```
 
-`agent-iap list` alone prints every section; `agents`, `upstreams`, `mcp` and `acl`
-narrow it to one. ACL rules keep their position in the file, because first match
-wins and that order *is* the policy.
+`agent-iap list` alone prints every section; `agents`, `upstreams`, `mcp`, `acl`
+and `credentials` narrow it to one. ACL rules keep their position in the file,
+because first match wins and that order *is* the policy. `credentials` is the
+inventory of references — every credential the proxy holds, and which field of
+which service reads it, with never a value:
+
+```console
+$ agent-iap list credentials
+HOLDER             FIELD            REFERENCE
+server             admin_token      file:audit/admin-token
+upstream anthropic auth.secret      op://Private/Anthropic API/credential
+upstream gcs       auth.key_file    op://Private/GCP Service Account/credential
+mcp notes          env.NOTES_TOKEN  op://Private/Notes/token
+```
 
 The question that actually matters once there is more than one agent is what a
 single one of them can reach — `targets` and the ACL intersected:
@@ -973,6 +1168,17 @@ target = "github"
 methods = ["GET"]
 paths = ["/repos/**"]
 action = "allow"
+
+# A grant with a deadline in it. Past `expires` this rule matches nothing and
+# whatever is behind it decides instead — so the access ends on the clock
+# rather than on somebody remembering to take it away.
+[[acl]]
+agent = "claude-code"
+target = "github"
+methods = ["POST"]
+paths = ["/repos/acme/**"]
+action = "allow"
+expires = "2026-09-15T09:00:00Z"
 ```
 
 Each agent has its own token; the file holds only hashes, and two agents sharing
@@ -989,23 +1195,22 @@ agent-iap audit tail --agent ci-runner --target github
 agent-iap audit tail -f --agent ci-runner
 ```
 
-Approvals are per agent too: a "remember for this session" answer is keyed by
-the agent *and* the exact request, so releasing a call for one agent never
-releases the same call for another.
+Approvals are per agent too. A standing answer — "until quit" in the dialogue —
+always names the agent that prompted it, however wide the rest of the scope is
+set, so releasing a call for one agent never releases the same call for another.
 
 Agents off this host need `[server.tls]`; without it their tokens are on the
 wire in cleartext, and this is the process holding every upstream credential.
 
-What this does **not** do yet, and all three matter more as the agent count grows:
+What this does **not** do yet:
 
-- **A renewed certificate means a restart.** `[server.tls]` is read once, at
-  startup — see § TLS — so every renewal costs the same outage the next bullet
-  describes.
-- **Changing the roster means a restart.** There is no reload: adding an agent,
-  or revoking a leaked token, restarts the process and takes every other agent's
-  in-flight request and MCP session with it. At one agent that is free. At
-  twenty it is an outage. Every `rm` and `rotate` says so on the way out, because
-  a revocation that has not taken effect yet is worse than one you know is
+- **Nothing here needs a restart.** Enrolling an agent, revoking one, rotating
+  a leaked token, adding an upstream, renewing a certificate — all of it reloads
+  into the running proxy: immediately from the console, and within a second from
+  a shell, because the console watches the policy file (§ Reloading). Without a
+  console attached there is nothing reading it, and a restart is still what
+  applies the change: which is what every `rm` and `rotate` says on the way out,
+  because a revocation that has not taken effect is worse than one you know is
   pending.
 - **No per-agent limits.** No rate limit, no concurrency cap, no spend budget.
   The agents share one upstream credential and therefore one quota and one bill,
@@ -1387,7 +1592,9 @@ Two things worth knowing before the first restart:
   restarts, and `agent-iap audit verify` spans them.
 
 There is no console: `--no-tui` logs to the journal and an `ask` is answered
-over the control plane (§ Control plane) or denied. A rule set that is entirely
+over the control plane (§ Control plane) or denied. Reloading is not affected —
+the daemon watches its own policy file and answers `SIGHUP` either way
+(§ Reloading), so `systemctl reload` is a reload and not a restart. A rule set that is entirely
 `allow`/`deny` needs no answerer; one that uses `ask` needs something watching,
 or those calls fail closed.
 
@@ -1479,9 +1686,8 @@ every deployment that has not upgraded yet.
 
 ## Not built yet
 
-Rate limits and spend caps per agent; hot config reload, which is also what a
-certificate renewal is waiting on — those two are what a fleet sharing one proxy
-wants next, and § Multiple agents says what each one costs until then. Also: a
+Rate limits and spend caps per agent — that is what a fleet sharing one proxy
+wants next, and § Multiple agents says what it costs until then. Also: a
 decoupled TUI that attaches to an already-running daemon over the control plane;
 SSE streaming for the HTTP MCP transport (single JSON responses work, `data:`
 frames are parsed, long-lived streams are not); mTLS agent identity, which is

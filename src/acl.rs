@@ -6,7 +6,9 @@
 //! anything that matches nothing falls through to the default — which is `deny`.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AclRuleConfig, Action, Config};
@@ -89,6 +91,10 @@ pub struct Decision {
     pub action: Action,
     /// Which rule decided, for the audit log. `None` means the default applied.
     pub rule: Option<String>,
+    /// Where that rule sits in the file. First match wins, so a rule written to
+    /// override this decision has to land *before* this position — which is the
+    /// one thing the label alone cannot say.
+    pub index: Option<usize>,
 }
 
 impl Decision {
@@ -127,10 +133,21 @@ struct CompiledRule {
     methods: Vec<GlobMatcher>,
     paths: Vec<PathPattern>,
     action: Action,
+    /// When this rule stops applying, if it does. Checked against the clock
+    /// rather than swept by a timer, so a grant that ran out while the proxy
+    /// was stopped is already over when it comes back.
+    expires: Option<DateTime<Utc>>,
 }
 
 impl CompiledRule {
-    fn matches(&self, request: &AccessRequest) -> bool {
+    fn matches(&self, request: &AccessRequest, now: Option<DateTime<Utc>>) -> bool {
+        // Checked first and cheaply: an expired rule is not a rule, and the
+        // glob work below is wasted on it.
+        if let (Some(expires), Some(now)) = (self.expires, now) {
+            if now >= expires {
+                return false;
+            }
+        }
         if let Some(kind) = self.kind {
             if kind != request.kind {
                 return false;
@@ -147,46 +164,106 @@ impl CompiledRule {
     }
 }
 
-pub struct Acl {
+/// The rule list as one unit, so a reload swaps the rules and the default
+/// together. Two locks would let a request be weighed against the new rules and
+/// the old default, which is a policy that was never written down anywhere.
+struct Compiled {
     rules: Vec<CompiledRule>,
     default: Action,
+    /// Whether any rule has a deadline at all. When none does — the ordinary
+    /// case — evaluating a request never has to ask what time it is.
+    any_expiring: bool,
+}
+
+/// A rule list that has compiled, waiting to be put in charge.
+pub struct Prepared(Compiled);
+
+/// The compiled rule list, behind a lock so the console can replace it.
+///
+/// Every read is a whole decision taken under one guard: the point of an ACL is
+/// that a request is weighed against one policy, not against the first half of
+/// one and the second half of another.
+pub struct Acl {
+    compiled: RwLock<Compiled>,
 }
 
 impl Acl {
     pub fn compile(config: &Config) -> Result<Self> {
-        let mut rules = Vec::with_capacity(config.acl.len());
-        for (index, rule) in config.acl.iter().enumerate() {
-            rules.push(compile_rule(index, rule)?);
-        }
         Ok(Acl {
-            rules,
-            default: config.acl_default.action,
+            compiled: RwLock::new(compile_all(config)?),
         })
     }
 
+    /// Compile a config's rules without installing them.
+    ///
+    /// The half of a reload that can fail, separated from the half that cannot,
+    /// so a caller swapping several things at once can find out that all of
+    /// them compile before any of them is live. A proxy running half of one
+    /// policy and half of another is running a policy nobody wrote.
+    pub fn prepare(config: &Config) -> Result<Prepared> {
+        Ok(Prepared(compile_all(config)?))
+    }
+
+    /// Put prepared rules in charge. Infallible, and the whole list at once.
+    pub fn install(&self, prepared: Prepared) {
+        *self.compiled.write() = prepared.0;
+    }
+
+    /// Prepare and install in one go, for callers with nothing else to swap.
+    pub fn reload(&self, config: &Config) -> Result<()> {
+        self.install(Acl::prepare(config)?);
+        Ok(())
+    }
+
     pub fn evaluate(&self, request: &AccessRequest) -> Decision {
-        for rule in &self.rules {
-            if rule.matches(request) {
+        let compiled = self.compiled.read();
+        // One clock reading for the whole rule list, so two rules in the same
+        // decision cannot disagree about whether the deadline between them has
+        // passed. Skipped entirely when nothing in the file expires.
+        let now = compiled.any_expiring.then(Utc::now);
+        for (index, rule) in compiled.rules.iter().enumerate() {
+            if rule.matches(request, now) {
                 return Decision {
                     action: rule.action,
                     rule: Some(rule.label.clone()),
+                    index: Some(index),
                 };
             }
         }
         Decision {
-            action: self.default,
+            action: compiled.default,
             rule: None,
+            index: None,
         }
     }
 
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.compiled.read().rules.len()
+    }
+
+    /// Rules whose deadline has passed. They are still in the file and still
+    /// listed — a grant that ran out is a thing to have a record of — but they
+    /// match nothing, and a count of them is what tells an operator why a call
+    /// that worked this morning is being asked about again.
+    pub fn expired_count(&self) -> usize {
+        let compiled = self.compiled.read();
+        if !compiled.any_expiring {
+            return 0;
+        }
+        let now = Utc::now();
+        compiled
+            .rules
+            .iter()
+            .filter(|rule| rule.expires.is_some_and(|at| now >= at))
+            .count()
     }
 
     /// How many rules could ever apply to a target. Used to catch a config that
     /// grants an agent an upstream the policy never mentions, which denies.
     pub fn rules_mentioning(&self, target: &str) -> usize {
-        self.rules
+        self.compiled
+            .read()
+            .rules
             .iter()
             .filter(|rule| rule.target.is_match(target))
             .count()
@@ -196,7 +273,9 @@ impl Acl {
     /// match order, and therefore the policy. Used by `agent-iap list --agent` to
     /// show one agent's slice of the rule list without renumbering it.
     pub fn rule_indices_for_agent(&self, agent: &str) -> Vec<usize> {
-        self.rules
+        self.compiled
+            .read()
+            .rules
             .iter()
             .enumerate()
             .filter(|(_, rule)| rule.agent.is_match(agent))
@@ -209,7 +288,9 @@ impl Acl {
     /// Zero is the answer worth seeing: a target an agent is allowed to address
     /// but that no rule ever names falls through to the default, which denies.
     pub fn rules_for(&self, agent: &str, kind: Kind, target: &str) -> usize {
-        self.rules
+        self.compiled
+            .read()
+            .rules
             .iter()
             .filter(|rule| {
                 rule.kind.is_none_or(|k| k == kind)
@@ -220,14 +301,29 @@ impl Acl {
     }
 
     pub fn default_action(&self) -> Action {
-        self.default
+        self.compiled.read().default
     }
 
     /// Can this policy ever stop a request on a human? A proxy running without
     /// the console loses nothing if it cannot, and silently denies if it can.
     pub fn can_ask(&self) -> bool {
-        self.default == Action::Ask || self.rules.iter().any(|rule| rule.action == Action::Ask)
+        let compiled = self.compiled.read();
+        compiled.default == Action::Ask
+            || compiled.rules.iter().any(|rule| rule.action == Action::Ask)
     }
+}
+
+fn compile_all(config: &Config) -> Result<Compiled> {
+    let mut rules = Vec::with_capacity(config.acl.len());
+    for (index, rule) in config.acl.iter().enumerate() {
+        rules.push(compile_rule(index, rule)?);
+    }
+    let any_expiring = rules.iter().any(|rule| rule.expires.is_some());
+    Ok(Compiled {
+        rules,
+        default: config.acl_default.action,
+        any_expiring,
+    })
 }
 
 fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {
@@ -256,6 +352,7 @@ fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {
             .collect::<Result<_>>()
             .with_context(|| format!("{label}: paths"))?,
         action: rule.action,
+        expires: rule.expires,
         label,
     })
 }
@@ -294,6 +391,7 @@ pub(crate) fn path_glob(pattern: &str) -> Result<PathPattern> {
 mod tests {
     use super::*;
     use crate::config::AclDefault;
+    use chrono::Utc;
 
     fn config_from(toml_text: &str) -> Config {
         let config: Config = toml::from_str(toml_text).unwrap();
@@ -481,6 +579,69 @@ action = "ask"
             action: Action::Ask,
         };
         assert_eq!(Acl::compile(&config).unwrap().default_action(), Action::Ask);
+    }
+
+    #[test]
+    fn a_rule_stops_deciding_once_its_deadline_has_passed() {
+        // The grant an operator can hand out without having to remember to
+        // take it back. Past the deadline the request falls through to
+        // whatever is behind it — here, the `ask` the grant was written over.
+        let past = (Utc::now() - chrono::TimeDelta::try_minutes(1).unwrap())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let future = (Utc::now() + chrono::TimeDelta::try_hours(1).unwrap())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let acl = acl(&format!(
+            r#"
+[[acl]]
+name = "ran-out"
+target = "gh"
+action = "allow"
+expires = "{past}"
+
+[[acl]]
+name = "still-good"
+target = "anthropic"
+action = "allow"
+expires = "{future}"
+
+[[acl]]
+name = "writes-need-a-human"
+target = "gh"
+action = "ask"
+"#
+        ));
+
+        let spent = acl.evaluate(&AccessRequest::http("a", "gh", "POST", "/x"));
+        assert_eq!(spent.action, Action::Ask);
+        assert_eq!(
+            spent.rule_label(),
+            "writes-need-a-human",
+            "an expired rule must not decide, and must not shadow the one behind it"
+        );
+
+        let live = acl.evaluate(&AccessRequest::http("a", "anthropic", "POST", "/x"));
+        assert_eq!(live.action, Action::Allow);
+        assert_eq!(live.rule_label(), "still-good");
+
+        assert_eq!(
+            acl.expired_count(),
+            1,
+            "and it is still in the file, counted"
+        );
+    }
+
+    #[test]
+    fn a_policy_with_no_deadlines_never_asks_what_time_it_is() {
+        // Not a behaviour test — a cost one. Every request reads this list, and
+        // a clock reading per decision for a feature nobody used is a tax.
+        let acl = acl(r#"
+[[acl]]
+target = "gh"
+action = "allow"
+"#);
+        assert!(!acl.compiled.read().any_expiring);
+        assert_eq!(acl.expired_count(), 0);
     }
 
     #[test]
