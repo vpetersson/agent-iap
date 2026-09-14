@@ -68,16 +68,22 @@ fn timeouts_changed(current: &Config, edited: &Config) -> bool {
             != edited.server.upstream_connect_timeout_secs
 }
 
-/// Resolve every reference the policy file names, before anything binds a port.
+/// Re-read every reference the policy file names, before anything binds a port.
 ///
 /// Reports all of the failures rather than the first: a proxy fronting twenty
 /// upstreams should not need twenty restarts to discover that three of its
 /// references are wrong.
+///
+/// `refresh` rather than `resolve`, so this both warms the cache at startup and
+/// re-reads it on reload — a credential rotated behind an unchanged reference
+/// takes effect the moment the file is reloaded, not only on a full restart.
+/// A reference that no longer resolves fails the reload, which leaves the proxy
+/// on the policy it already had (`AppState::reload` resolves before it swaps).
 fn preload_secrets(config: &Config, resolver: &SecretResolver) -> Result<()> {
     let references = config.secret_refs();
     let mut failures = Vec::new();
     for reference in &references {
-        if let Err(error) = resolver.resolve(reference) {
+        if let Err(error) = resolver.refresh(reference) {
             failures.push((reference.clone(), format!("{error:#}")));
         }
     }
@@ -458,6 +464,58 @@ action = "allow"
                 ))
                 .action,
             crate::config::Action::Allow
+        );
+    }
+
+    /// A credential whose *value* moved behind an unchanged reference is
+    /// re-read on reload. This used to take a full restart: the resolver cached
+    /// the first read for the life of the process, so a rotated secret behind
+    /// `file:`/`op://` kept serving the old value until the proxy was bounced.
+    #[tokio::test]
+    async fn a_reload_re_reads_a_rotated_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "old-token").unwrap();
+
+        let policy = || -> Config {
+            toml::from_str(&format!(
+                r#"
+[audit]
+path = "{}"
+stderr = false
+
+[[agents]]
+id = "claude"
+token_sha256 = "{}"
+
+[[upstreams]]
+name = "gh"
+base_url = "https://api.github.com"
+auth = {{ type = "bearer", secret = "file:{}" }}
+"#,
+                dir.path().join("audit.jsonl").display(),
+                crate::identity::token_hash("iap_test"),
+                token.display(),
+            ))
+            .unwrap()
+        };
+
+        let state = AppState::build(policy(), false).unwrap();
+
+        // Rotate the credential behind the same reference, then reload.
+        std::fs::write(&token, "new-token").unwrap();
+        state.reload_for_test(policy()).unwrap();
+
+        let mut req = reqwest::Request::new(
+            http::Method::GET,
+            "https://api.github.com/user".parse().unwrap(),
+        );
+        let auth = state.config().upstream("gh").unwrap().auth.clone();
+        state.injector.apply("gh", &auth, &mut req).await.unwrap();
+        assert_eq!(
+            req.headers()["authorization"],
+            "Bearer new-token",
+            "the reload re-read the rotated secret, no restart needed"
         );
     }
 

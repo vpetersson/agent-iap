@@ -124,25 +124,41 @@ impl SecretResolver {
         self.cache.lock().insert(raw.to_string(), value);
     }
 
-    /// Resolve a reference, ignoring and replacing anything already cached.
+    /// Re-read a reference from its source and replace the cached value with
+    /// what comes back.
     ///
     /// The cache exists so twenty upstreams sharing a vault item cost one `op`
-    /// call. That is right for a credential, whose value does not change under
-    /// a running proxy — and wrong for a certificate, whose whole lifecycle is
-    /// being replaced on disk every ninety days. A reload re-reads TLS material
-    /// through here, which is what lets a renewal land without a restart.
+    /// call — the right default for a value that stays put under a running
+    /// proxy. `refresh` is how a value that *did* move takes effect without a
+    /// restart: a renewed certificate, replaced on disk every ninety days, and
+    /// a rotated credential, whose reference string is unchanged but whose
+    /// secret behind it is new. A reload re-reads both through here.
+    ///
+    /// The old value is replaced only if the re-read succeeds. A refresh that
+    /// cannot reach the source — a locked vault, a half-written file — returns
+    /// the error and leaves the last good value in the cache, so a reload that
+    /// refuses does not also evict a credential the proxy is still serving.
     pub fn refresh(&self, raw: &str) -> Result<Secret> {
-        self.cache.lock().remove(raw);
-        self.resolve(raw)
+        let secret = self.read(raw)?;
+        self.cache.lock().insert(raw.to_string(), secret.clone());
+        Ok(secret)
     }
 
-    /// Resolve a raw reference string. Blocking: 1Password shells out to `op`.
+    /// Resolve a raw reference string, returning a cached value when there is
+    /// one. Blocking: 1Password shells out to `op`.
     pub fn resolve(&self, raw: &str) -> Result<Secret> {
         if let Some(hit) = self.cache.lock().get(raw) {
             return Ok(hit.clone());
         }
+        let secret = self.read(raw)?;
+        self.cache.lock().insert(raw.to_string(), secret.clone());
+        Ok(secret)
+    }
 
-        let secret = match SecretRef::parse(raw)? {
+    /// Read a reference straight from its source, touching no cache on either
+    /// side. The shared body of `resolve` and `refresh`.
+    fn read(&self, raw: &str) -> Result<Secret> {
+        Ok(match SecretRef::parse(raw)? {
             SecretRef::Env(name) => {
                 let value = std::env::var(&name).with_context(|| {
                     format!("environment variable `{name}` is not set (from `env:{name}`)")
@@ -156,10 +172,7 @@ impl SecretResolver {
             }
             SecretRef::OnePassword(reference) => self.resolve_onepassword(&reference)?,
             SecretRef::Literal(value) => Secret::new(value),
-        };
-
-        self.cache.lock().insert(raw.to_string(), secret.clone());
-        Ok(secret)
+        })
     }
 
     fn resolve_onepassword(&self, reference: &str) -> Result<Secret> {
@@ -277,6 +290,57 @@ mod tests {
                 .unwrap()
                 .expose(),
             "from-env"
+        );
+    }
+
+    #[test]
+    fn refresh_picks_up_a_rotated_source_that_resolve_still_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "v1\n").unwrap();
+        let reference = format!("file:{}", path.display());
+
+        let resolver = SecretResolver::new("op");
+        assert_eq!(resolver.resolve(&reference).unwrap().expose(), "v1");
+
+        // The value behind the reference changes; the reference string does not.
+        std::fs::write(&path, "v2\n").unwrap();
+        assert_eq!(
+            resolver.resolve(&reference).unwrap().expose(),
+            "v1",
+            "resolve keeps serving the cached value"
+        );
+        assert_eq!(
+            resolver.refresh(&reference).unwrap().expose(),
+            "v2",
+            "refresh re-reads the source"
+        );
+        assert_eq!(
+            resolver.resolve(&reference).unwrap().expose(),
+            "v2",
+            "and the fresh value is what the cache now holds"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "v1\n").unwrap();
+        let reference = format!("file:{}", path.display());
+
+        let resolver = SecretResolver::new("op");
+        assert_eq!(resolver.resolve(&reference).unwrap().expose(), "v1");
+
+        // The source is gone: a refresh cannot read it…
+        std::fs::remove_file(&path).unwrap();
+        assert!(resolver.refresh(&reference).is_err());
+
+        // …and must not have evicted the value the proxy is still serving.
+        assert_eq!(
+            resolver.resolve(&reference).unwrap().expose(),
+            "v1",
+            "a failed refresh leaves the last good value in place"
         );
     }
 }
