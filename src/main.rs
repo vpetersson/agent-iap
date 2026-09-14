@@ -166,6 +166,7 @@ enum WhatArg {
     Upstreams,
     Mcp,
     Acl,
+    Credentials,
 }
 
 impl From<WhatArg> for What {
@@ -175,6 +176,7 @@ impl From<WhatArg> for What {
             WhatArg::Upstreams => What::Upstreams,
             WhatArg::Mcp => What::Mcp,
             WhatArg::Acl => What::Acl,
+            WhatArg::Credentials => What::Credentials,
         }
     }
 }
@@ -427,89 +429,31 @@ struct AuthFlags {
 }
 
 impl AuthFlags {
-    /// Each scheme needs a different subset of the flags, and silently ignoring
-    /// one that was passed is how a credential ends up not being sent.
+    /// Hand the flags to `enroll`, which owns the rule about which scheme needs
+    /// which of them. The console's form builds the same struct, so the two
+    /// front ends cannot disagree about what a credential needs.
     fn to_spec(&self) -> Result<enroll::AuthSpec> {
-        let need_secret = || -> Result<String> {
-            self.secret.clone().context(
-                "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
-            )
-        };
-        let spec = match self.auth {
-            AuthArg::None => enroll::AuthSpec::None,
-            AuthArg::Bearer => enroll::AuthSpec::Bearer {
-                secret: need_secret()?,
-            },
-            AuthArg::Header => enroll::AuthSpec::Header {
-                header: self.header.clone().context(
-                    "`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`",
-                )?,
-                secret: need_secret()?,
-                prefix: self.prefix.clone(),
-            },
-            AuthArg::Basic => {
-                if self.username.is_none() && self.username_secret.is_none() {
-                    bail!(
-                        "`--auth basic` needs `--username <NAME>`, or `--username-secret <REF>` \
-                         for an API like Graylog whose user field is the credential"
-                    );
-                }
-                enroll::AuthSpec::Basic {
-                    username: self.username.clone(),
-                    username_secret: self.username_secret.clone(),
-                    secret: need_secret()?,
-                }
-            }
-            AuthArg::Query => enroll::AuthSpec::Query {
-                param: self
-                    .param
-                    .clone()
-                    .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
-                secret: need_secret()?,
-            },
-            AuthArg::Oauth2ClientCredentials => enroll::AuthSpec::Oauth2ClientCredentials {
-                token_url: self
-                    .token_url
-                    .clone()
-                    .context("`--auth oauth2-client-credentials` needs `--token-url <URL>`")?,
-                client_id: self
-                    .client_id
-                    .clone()
-                    .context("`--auth oauth2-client-credentials` needs `--client-id <ID>`")?,
-                client_secret: self
-                    .client_secret
-                    .clone()
-                    .context("`--auth oauth2-client-credentials` needs `--client-secret <REF>`")?,
-                // One space-delimited `scope` parameter, which is how the grant
-                // spells a list; `--scope` is repeatable so the caller does not
-                // have to know that.
-                scope: (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
-                audience: self.audience.clone(),
-            },
-            AuthArg::ServiceAccountJwt => {
-                if self.key_file.is_none() && self.private_key.is_none() {
-                    bail!(
-                        "`--auth service-account-jwt` needs `--key-file <REF>` (the JSON key \
-                         Google issues) or `--private-key <REF>` with `--issuer` and `--token-url`"
-                    );
-                }
-                enroll::AuthSpec::ServiceAccountJwt {
-                    key_file: self.key_file.clone(),
-                    issuer: self.issuer.clone(),
-                    private_key: self.private_key.clone(),
-                    key_id: self.key_id.clone(),
-                    token_url: self.token_url.clone(),
-                    audience: self.audience.clone(),
-                    scopes: self.scopes.clone(),
-                    subject: self.subject.clone(),
-                    lifetime_secs: self.lifetime_secs,
-                }
-            }
-        };
-        if matches!(spec, enroll::AuthSpec::None) && self.secret.is_some() {
-            bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
+        enroll::AuthInput {
+            scheme: self.auth.as_str().to_string(),
+            secret: self.secret.clone(),
+            header: self.header.clone(),
+            prefix: self.prefix.clone(),
+            username: self.username.clone(),
+            username_secret: self.username_secret.clone(),
+            param: self.param.clone(),
+            key_file: self.key_file.clone(),
+            private_key: self.private_key.clone(),
+            issuer: self.issuer.clone(),
+            key_id: self.key_id.clone(),
+            token_url: self.token_url.clone(),
+            audience: self.audience.clone(),
+            scopes: self.scopes.clone(),
+            subject: self.subject.clone(),
+            lifetime_secs: self.lifetime_secs,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
         }
-        Ok(spec)
+        .to_spec()
     }
 }
 
@@ -562,6 +506,20 @@ enum AuthArg {
     Query,
     Oauth2ClientCredentials,
     ServiceAccountJwt,
+}
+
+impl AuthArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthArg::None => "none",
+            AuthArg::Bearer => "bearer",
+            AuthArg::Header => "header",
+            AuthArg::Basic => "basic",
+            AuthArg::Query => "query",
+            AuthArg::Oauth2ClientCredentials => "oauth2-client-credentials",
+            AuthArg::ServiceAccountJwt => "service-account-jwt",
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -641,7 +599,8 @@ fn main() -> Result<()> {
             tui,
             no_tui,
         } => {
-            let mut config = Config::load(&config.config)?;
+            let config_path = config.config.clone();
+            let mut config = Config::load(&config_path)?;
 
             let overridden = listen.is_some() || admin_listen.is_some();
             if let Some(spec) = &listen {
@@ -661,6 +620,7 @@ fn main() -> Result<()> {
                     .context("after applying the listen overrides")?;
             }
 
+            let config_path = config_path.clone();
             let console = tui::choose(tui, no_tui, tui::at_a_terminal());
             init_tracing(console, &config)?;
             if overridden {
@@ -671,7 +631,7 @@ fn main() -> Result<()> {
                     "listen addresses overridden outside the config file"
                 );
             }
-            tokio_runtime()?.block_on(run(config, console))
+            tokio_runtime()?.block_on(run(config, console, config_path))
         }
         Command::Mcp {
             config,
@@ -912,7 +872,7 @@ fn init_tracing(console: Console, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run(config: Config, console: Console) -> Result<()> {
+async fn run(config: Config, console: Console, config_path: PathBuf) -> Result<()> {
     let listen = config.server.listen;
     let admin_listen = config.server.admin_listen;
     let audit_path = config.audit.path.clone();
@@ -985,7 +945,7 @@ async fn run(config: Config, console: Console) -> Result<()> {
 
     let drawing = console.draws().then(|| {
         let state = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || agent_iap::tui::run(state))
+        tokio::task::spawn_blocking(move || agent_iap::tui::run(state, &config_path))
     });
 
     match (admin, drawing) {
@@ -1339,7 +1299,7 @@ fn remove_agent(path: &Path, id: &str, prune: bool) -> Result<()> {
     println!("Removed agent `{id}` from {}.", path.display());
     println!("Its token authenticates nothing now, and no upstream credential rotated.");
     report_removal(&removal, id);
-    restart_notice("the running proxy still accepts the old token");
+    reload_notice("the running proxy still accepts the old token");
     Ok(())
 }
 
@@ -1353,7 +1313,7 @@ fn rotate_agent(path: &Path, id: &str) -> Result<()> {
     println!("  {}\n", rotated.token);
     println!("The old hash is gone from the file. Hand this to the agent before you restart,");
     println!("so the two changes land together rather than as an outage in between.");
-    restart_notice("the running proxy still accepts the old token and rejects this one");
+    reload_notice("the running proxy still accepts the old token and rejects this one");
     Ok(())
 }
 
@@ -1385,13 +1345,25 @@ fn report_removal(removal: &enroll::Removal, subject: &str) {
     }
 }
 
-/// The policy file is read once, at startup. Every removal edits a file the
-/// running proxy stopped looking at, and an operator who has just revoked a
-/// leaked token is exactly the person who must not assume otherwise.
+/// A service and its credential are wired into the running process — a resolved
+/// secret, a warmed signer, an open stdio child — and none of that can be
+/// swapped under a request in flight. So this edit waits for a restart.
 fn restart_notice(consequence: &str) {
     println!(
-        "\nThis takes effect at the next restart — there is no hot reload, so until then \
-         {consequence}."
+        "\nThis takes effect at the next restart — an upstream or MCP server cannot be \
+         swapped under an open connection, so until then {consequence}."
+    );
+}
+
+/// Agents and rules are pure policy: a hash to compare against and a list to
+/// match in order, both re-derivable from the file at any moment. A console
+/// attached to the running proxy re-reads them on `r`, and writes its own the
+/// moment it makes them — but an operator who has just revoked a leaked token
+/// is exactly the person who must not assume a console is attached.
+fn reload_notice(consequence: &str) {
+    println!(
+        "\nThis takes effect at the next restart, or as soon as a console on the running \
+         proxy re-reads the file (`r`). Until then {consequence}."
     );
 }
 
@@ -1595,7 +1567,7 @@ fn remove_rule(path: &Path, index: usize) -> Result<()> {
             plural(removed.remaining, "rule")
         );
     }
-    restart_notice("the running proxy still decides by the old rule");
+    reload_notice("the running proxy still decides by the old rule");
     Ok(())
 }
 
@@ -1887,11 +1859,11 @@ fn show_profile(id: &str) -> Result<()> {
 
 fn add_profile(path: &Path, id: &str, options: profiles::AddOptions) -> Result<()> {
     let profile = profiles::get(id)?;
-    let dry_run = options.dry_run;
     let added = profiles::add(path, &profile, &options)?;
 
-    if dry_run {
-        println!("\n# nothing was written — drop `--dry-run` to apply this.");
+    if let Some(plan) = &added.plan {
+        println!("{plan}");
+        println!("# nothing was written — drop `--dry-run` to apply this.");
         return Ok(());
     }
 

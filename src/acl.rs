@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AclRuleConfig, Action, Config};
@@ -89,6 +90,10 @@ pub struct Decision {
     pub action: Action,
     /// Which rule decided, for the audit log. `None` means the default applied.
     pub rule: Option<String>,
+    /// Where that rule sits in the file. First match wins, so a rule written to
+    /// override this decision has to land *before* this position — which is the
+    /// one thing the label alone cannot say.
+    pub index: Option<usize>,
 }
 
 impl Decision {
@@ -147,46 +152,69 @@ impl CompiledRule {
     }
 }
 
-pub struct Acl {
+/// The rule list as one unit, so a reload swaps the rules and the default
+/// together. Two locks would let a request be weighed against the new rules and
+/// the old default, which is a policy that was never written down anywhere.
+struct Compiled {
     rules: Vec<CompiledRule>,
     default: Action,
 }
 
+/// The compiled rule list, behind a lock so the console can replace it.
+///
+/// Every read is a whole decision taken under one guard: the point of an ACL is
+/// that a request is weighed against one policy, not against the first half of
+/// one and the second half of another.
+pub struct Acl {
+    compiled: RwLock<Compiled>,
+}
+
 impl Acl {
     pub fn compile(config: &Config) -> Result<Self> {
-        let mut rules = Vec::with_capacity(config.acl.len());
-        for (index, rule) in config.acl.iter().enumerate() {
-            rules.push(compile_rule(index, rule)?);
-        }
         Ok(Acl {
-            rules,
-            default: config.acl_default.action,
+            compiled: RwLock::new(compile_all(config)?),
         })
     }
 
+    /// Replace the rule list with the one this config spells out.
+    ///
+    /// Compiled first and swapped second: a policy file edited into something
+    /// that does not compile must leave the running proxy on the rules it
+    /// already has rather than on no rules at all.
+    pub fn reload(&self, config: &Config) -> Result<()> {
+        let compiled = compile_all(config)?;
+        *self.compiled.write() = compiled;
+        Ok(())
+    }
+
     pub fn evaluate(&self, request: &AccessRequest) -> Decision {
-        for rule in &self.rules {
+        let compiled = self.compiled.read();
+        for (index, rule) in compiled.rules.iter().enumerate() {
             if rule.matches(request) {
                 return Decision {
                     action: rule.action,
                     rule: Some(rule.label.clone()),
+                    index: Some(index),
                 };
             }
         }
         Decision {
-            action: self.default,
+            action: compiled.default,
             rule: None,
+            index: None,
         }
     }
 
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.compiled.read().rules.len()
     }
 
     /// How many rules could ever apply to a target. Used to catch a config that
     /// grants an agent an upstream the policy never mentions, which denies.
     pub fn rules_mentioning(&self, target: &str) -> usize {
-        self.rules
+        self.compiled
+            .read()
+            .rules
             .iter()
             .filter(|rule| rule.target.is_match(target))
             .count()
@@ -196,7 +224,9 @@ impl Acl {
     /// match order, and therefore the policy. Used by `agent-iap list --agent` to
     /// show one agent's slice of the rule list without renumbering it.
     pub fn rule_indices_for_agent(&self, agent: &str) -> Vec<usize> {
-        self.rules
+        self.compiled
+            .read()
+            .rules
             .iter()
             .enumerate()
             .filter(|(_, rule)| rule.agent.is_match(agent))
@@ -209,7 +239,9 @@ impl Acl {
     /// Zero is the answer worth seeing: a target an agent is allowed to address
     /// but that no rule ever names falls through to the default, which denies.
     pub fn rules_for(&self, agent: &str, kind: Kind, target: &str) -> usize {
-        self.rules
+        self.compiled
+            .read()
+            .rules
             .iter()
             .filter(|rule| {
                 rule.kind.is_none_or(|k| k == kind)
@@ -220,14 +252,27 @@ impl Acl {
     }
 
     pub fn default_action(&self) -> Action {
-        self.default
+        self.compiled.read().default
     }
 
     /// Can this policy ever stop a request on a human? A proxy running without
     /// the console loses nothing if it cannot, and silently denies if it can.
     pub fn can_ask(&self) -> bool {
-        self.default == Action::Ask || self.rules.iter().any(|rule| rule.action == Action::Ask)
+        let compiled = self.compiled.read();
+        compiled.default == Action::Ask
+            || compiled.rules.iter().any(|rule| rule.action == Action::Ask)
     }
+}
+
+fn compile_all(config: &Config) -> Result<Compiled> {
+    let mut rules = Vec::with_capacity(config.acl.len());
+    for (index, rule) in config.acl.iter().enumerate() {
+        rules.push(compile_rule(index, rule)?);
+    }
+    Ok(Compiled {
+        rules,
+        default: config.acl_default.action,
+    })
 }
 
 fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {

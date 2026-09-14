@@ -10,6 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use http::StatusCode;
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,57 +38,86 @@ pub fn generate_token() -> Result<String> {
     Ok(format!("iap_{}", hex::encode(bytes)))
 }
 
-#[derive(Debug)]
-pub struct AgentRegistry {
+/// Both lookups, swapped together. A token that has been re-keyed must not be
+/// findable by its old hash for even one request, so `by_hash` and `by_id` are
+/// replaced under one lock rather than one after the other.
+#[derive(Debug, Default)]
+struct Enrolled {
     by_hash: HashMap<String, Arc<AgentConfig>>,
     by_id: HashMap<String, Arc<AgentConfig>>,
+}
+
+#[derive(Debug)]
+pub struct AgentRegistry {
+    enrolled: RwLock<Enrolled>,
 }
 
 impl AgentRegistry {
     /// Build the registry, resolving any `token_ref` into its hash.
     pub fn build(config: &Config, resolver: &SecretResolver) -> Result<Self> {
-        let mut by_hash = HashMap::new();
-        let mut by_id = HashMap::new();
+        Ok(AgentRegistry {
+            enrolled: RwLock::new(enrol(config, resolver)?),
+        })
+    }
 
-        for agent in &config.agents {
-            let hash = match (&agent.token_sha256, &agent.token_ref) {
-                (Some(hash), _) => hash.to_ascii_lowercase(),
-                (None, Some(reference)) => {
-                    let secret = resolver.resolve(reference)?;
-                    token_hash(secret.expose())
-                }
-                (None, None) => bail!("agent `{}` has no token configured", agent.id),
-            };
-
-            let shared = Arc::new(agent.clone());
-            if let Some(existing) = by_hash.insert(hash, Arc::clone(&shared)) {
-                bail!(
-                    "agents `{}` and `{}` share the same token",
-                    existing.id,
-                    agent.id
-                );
-            }
-            by_id.insert(agent.id.clone(), shared);
-        }
-
-        Ok(AgentRegistry { by_hash, by_id })
+    /// Re-enrol from a policy file that has been edited since startup — the
+    /// console mints a token and the agent holding it must be able to call
+    /// immediately, not after a restart.
+    ///
+    /// Resolved first and swapped second, so a file that no longer enrols
+    /// cleanly leaves the running proxy on the agents it already knows.
+    pub fn reload(&self, config: &Config, resolver: &SecretResolver) -> Result<()> {
+        let enrolled = enrol(config, resolver)?;
+        *self.enrolled.write() = enrolled;
+        Ok(())
     }
 
     pub fn authenticate(&self, token: &str) -> Option<Arc<AgentConfig>> {
-        self.by_hash.get(&token_hash(token)).cloned()
+        self.enrolled
+            .read()
+            .by_hash
+            .get(&token_hash(token))
+            .cloned()
     }
 
     pub fn by_id(&self, id: &str) -> Option<Arc<AgentConfig>> {
-        self.by_id.get(id).cloned()
+        self.enrolled.read().by_id.get(id).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.enrolled.read().by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.enrolled.read().by_id.is_empty()
     }
+}
+
+fn enrol(config: &Config, resolver: &SecretResolver) -> Result<Enrolled> {
+    let mut enrolled = Enrolled::default();
+
+    for agent in &config.agents {
+        let hash = match (&agent.token_sha256, &agent.token_ref) {
+            (Some(hash), _) => hash.to_ascii_lowercase(),
+            (None, Some(reference)) => {
+                let secret = resolver.resolve(reference)?;
+                token_hash(secret.expose())
+            }
+            (None, None) => bail!("agent `{}` has no token configured", agent.id),
+        };
+
+        let shared = Arc::new(agent.clone());
+        if let Some(existing) = enrolled.by_hash.insert(hash, Arc::clone(&shared)) {
+            bail!(
+                "agents `{}` and `{}` share the same token",
+                existing.id,
+                agent.id
+            );
+        }
+        enrolled.by_id.insert(agent.id.clone(), shared);
+    }
+
+    Ok(enrolled)
 }
 
 /// Who is calling, after whichever credential they presented has been checked.

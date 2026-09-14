@@ -440,22 +440,34 @@ pub enum AuthConfig {
 impl AuthConfig {
     /// Every secret reference this scheme needs, for preloading and validation.
     pub fn secret_refs(&self) -> Vec<&str> {
+        self.secret_fields()
+            .into_iter()
+            .map(|(_, reference)| reference)
+            .collect()
+    }
+
+    /// The same references, each beside the field it fills.
+    ///
+    /// `secret_refs` answers "what has to resolve for this to start"; this
+    /// answers "and which one is it" — which is the question an operator
+    /// looking at a list of credentials is actually asking.
+    pub fn secret_fields(&self) -> Vec<(&'static str, &str)> {
         match self {
             AuthConfig::None => vec![],
             AuthConfig::Bearer { secret }
             | AuthConfig::Header { secret, .. }
-            | AuthConfig::Query { secret, .. } => vec![secret.as_str()],
+            | AuthConfig::Query { secret, .. } => vec![("auth.secret", secret.as_str())],
             AuthConfig::Basic {
                 username_secret,
                 secret,
                 ..
             } => username_secret
                 .iter()
-                .map(String::as_str)
-                .chain(std::iter::once(secret.as_str()))
+                .map(|reference| ("auth.username_secret", reference.as_str()))
+                .chain(std::iter::once(("auth.secret", secret.as_str())))
                 .collect(),
             AuthConfig::Oauth2ClientCredentials { client_secret, .. } => {
-                vec![client_secret.as_str()]
+                vec![("auth.client_secret", client_secret.as_str())]
             }
             AuthConfig::ServiceAccountJwt {
                 key_file,
@@ -463,8 +475,12 @@ impl AuthConfig {
                 ..
             } => key_file
                 .iter()
-                .chain(private_key.iter())
-                .map(String::as_str)
+                .map(|reference| ("auth.key_file", reference.as_str()))
+                .chain(
+                    private_key
+                        .iter()
+                        .map(|reference| ("auth.private_key", reference.as_str())),
+                )
                 .collect(),
         }
     }

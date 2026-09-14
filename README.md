@@ -466,10 +466,12 @@ number, so a rule matching nothing is something you were told about rather than
 something you find later. Only rules that name it *outright* are pruned:
 `agent = "ci-*"` covers a fleet, and one member leaving is not that rule ending.
 
-**None of it takes effect until the proxy restarts.** There is no hot reload
-(§ Multiple agents), so a rotated token is not yet a revoked one — every one of
-these commands says so, and the leaked token keeps working until the process
-comes back.
+**From the CLI, none of it takes effect until the proxy restarts** — or until
+somebody presses `r` at the console, which re-reads the file and re-enrols the
+agents and recompiles the rules from it. So a rotated token is not yet a revoked
+one: every one of these commands says so, and the leaked token keeps working
+until one of those two things happens. Upstreams, MCP servers and server
+settings need the restart either way (§ Not built yet).
 
 ## What happens to a request
 
@@ -535,9 +537,80 @@ banner says which of the two you are getting.
 The console owns the terminal, so diagnostics go to `agent-iap.log` beside the
 audit log instead of to stdout, and the bottom pane is a live tail of the audit
 log — what the agent has been doing while you decide what to allow next.
-`↑`/`↓` moves, `a`/`d` answers, `A`/`D` answers and remembers it for this
-session, `f` forgets what was remembered, and `q` quits the console and stops
-the proxy with it.
+
+#### The dialogue
+
+A parked request raises a dialogue of its own, unprompted, because a request
+sitting behind a pane nobody happens to be looking at will time out and a
+timeout denies. It is Little Snitch's dialogue, and for Little Snitch's reason:
+"may this connect" is unanswerable on its own, and what an operator *can* answer
+is may this agent do this much, for how long.
+
+```
+┌ an agent is asking ──────────────────────────────────────────┐
+│  Claude Code                                                 │
+│  wants to POST /repos/acme/api/issues on github              │
+│  agent-iap holds the credential and attaches it on the way   │
+│  out — allowing this does not hand it over.                  │
+│                                                              │
+│       Once   Until quit   From now on                        │
+│                                                              │
+│      ( ) any request from Claude Code                        │
+│      ( ) → anything on github                                │
+│      ( ) → POST on github                                    │
+│      (•) → POST /repos/acme/api/issues on github             │
+│                                                              │
+│  writes an acl rule into the policy file at #0, in front of  │
+│  `github-writes-need-a-human`                                │
+│                                                              │
+│       d  Deny     a  Allow     esc  leave it waiting         │
+└──────────────────────────────── waiting 4s ──────────────────┘
+```
+
+`←`/`→` picks how long, `↑`/`↓` picks how far, and the line above the buttons
+says what the pair of them will actually do. The three durations are three
+different mechanisms:
+
+- **Once** answers this request. The next identical call asks again.
+- **Until quit** is remembered in this process, for everything the chosen row
+  covers, and dies with it. Nothing is written to disk.
+- **From now on** writes an ACL rule into the policy file — *in front of* the
+  `ask` rule that raised the question, because first match wins and an appended
+  rule would sit behind it and never be reached. The rule is live in this
+  process immediately.
+
+The cursor starts on the narrowest row and on `Once`: a dialogue whose default
+hands out more than was asked for is a dialogue that hands out more than was
+asked for. `a`/`d` on the queue itself answer once, at that narrowest scope,
+without opening anything.
+
+#### The other panes
+
+`1`…`7` or `tab` move between them, and everything the enrolment commands do
+from a shell is a form here, over the same functions with the same validation:
+
+| Pane | What it shows | Keys |
+| --- | --- | --- |
+| approvals | the queue, and the request in full | `enter` `a` `d` `f` |
+| agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
+| upstreams | base URL, scheme, credential reference | `n` `x` |
+| mcp | transport, command or URL, credential references | `n` `x` |
+| acl | every rule in match order, with its number | `n` `x` |
+| credentials | every reference the file names, and whether it still resolves | `c` re-check |
+| profiles | the ready-made service definitions | `enter` add |
+
+`r` re-reads the policy file, `?` lists the keys, and `q` quits the console and
+stops the proxy with it.
+
+A minted token is shown once, in a modal, and then only its sha256 exists. No
+credential *value* is ever displayed: the credentials pane shows references, and
+resolves them on `c` to answer the one question the file cannot — whether the
+vault is still unlocked and the variable still set.
+
+Rules and agents written here take effect in this process immediately. Upstreams,
+MCP servers and server settings cannot be swapped under an open connection, so
+the header carries a `restart to apply` banner naming what is owed, rather than
+letting an edit look applied when it is not.
 
 ## The policy file
 
@@ -912,9 +985,20 @@ gcs        https://storage.googleapis.com  service_account_jwt  op://Private/GCP
 github     https://api.github.com          bearer               op://Private/GitHub/token
 ```
 
-`agent-iap list` alone prints every section; `agents`, `upstreams`, `mcp` and `acl`
-narrow it to one. ACL rules keep their position in the file, because first match
-wins and that order *is* the policy.
+`agent-iap list` alone prints every section; `agents`, `upstreams`, `mcp`, `acl`
+and `credentials` narrow it to one. ACL rules keep their position in the file,
+because first match wins and that order *is* the policy. `credentials` is the
+inventory of references — every credential the proxy holds, and which field of
+which service reads it, with never a value:
+
+```console
+$ agent-iap list credentials
+HOLDER             FIELD            REFERENCE
+server             admin_token      file:audit/admin-token
+upstream anthropic auth.secret      op://Private/Anthropic API/credential
+upstream gcs       auth.key_file    op://Private/GCP Service Account/credential
+mcp notes          env.NOTES_TOKEN  op://Private/Notes/token
+```
 
 The question that actually matters once there is more than one agent is what a
 single one of them can reach — `targets` and the ACL intersected:
@@ -986,23 +1070,25 @@ agent-iap audit tail --agent ci-runner --target github
 agent-iap audit tail -f --agent ci-runner
 ```
 
-Approvals are per agent too: a "remember for this session" answer is keyed by
-the agent *and* the exact request, so releasing a call for one agent never
-releases the same call for another.
+Approvals are per agent too. A standing answer — "until quit" in the dialogue —
+always names the agent that prompted it, however wide the rest of the scope is
+set, so releasing a call for one agent never releases the same call for another.
 
 Agents off this host need `[server.tls]`; without it their tokens are on the
 wire in cleartext, and this is the process holding every upstream credential.
 
-What this does **not** do yet, and all three matter more as the agent count grows:
+What this does **not** do yet, and both matter more as the agent count grows:
 
 - **A renewed certificate means a restart.** `[server.tls]` is read once, at
-  startup — see § TLS — so every renewal costs the same outage the next bullet
-  describes.
-- **Changing the roster means a restart.** There is no reload: adding an agent,
-  or revoking a leaked token, restarts the process and takes every other agent's
-  in-flight request and MCP session with it. At one agent that is free. At
-  twenty it is an outage. Every `rm` and `rotate` says so on the way out, because
-  a revocation that has not taken effect yet is worse than one you know is
+  startup — see § TLS — so every renewal costs an outage that takes every
+  agent's in-flight request and MCP session with it. Adding an upstream or an
+  MCP server costs the same.
+- **Changing the roster does not.** Enrolling an agent, revoking one, or
+  rotating a leaked token reloads into the running proxy: from the console it is
+  immediate, and from a shell it lands on the next `r` at the console. Without a
+  console attached there is nothing to re-read the file, and a restart is still
+  what applies it — which is what every `rm` and `rotate` says on the way out,
+  because a revocation that has not taken effect is worse than one you know is
   pending.
 - **No per-agent limits.** No rate limit, no concurrency cap, no spend budget.
   The agents share one upstream credential and therefore one quota and one bill,
@@ -1476,10 +1562,15 @@ every deployment that has not upgraded yet.
 
 ## Not built yet
 
-Rate limits and spend caps per agent; hot config reload, which is also what a
-certificate renewal is waiting on — those two are what a fleet sharing one proxy
-wants next, and § Multiple agents says what each one costs until then. Also: a
-decoupled TUI that attaches to an already-running daemon over the control plane;
+Rate limits and spend caps per agent; the rest of hot config reload, which is
+also what a certificate renewal is waiting on. Agents and ACL rules do reload
+live — the console writes them and the running proxy picks them up, and `r`
+re-reads the file for edits made from a shell — but upstreams, MCP servers and
+server settings still need a restart, because a credential injector and a bound
+socket cannot be swapped under an open connection. Those are what a fleet
+sharing one proxy wants next, and § Multiple agents says what it costs until
+then. Also: a decoupled TUI that attaches to an already-running daemon over the
+control plane;
 SSE streaming for the HTTP MCP transport (single JSON responses work, `data:`
 frames are parsed, long-lived streams are not); mTLS agent identity, which is
 the missing half of § Workload identity — the token proves what a run may do,

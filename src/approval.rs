@@ -7,13 +7,12 @@
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
-use crate::acl::AccessRequest;
+use crate::acl::{AccessRequest, Kind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +55,71 @@ impl Outcome {
     }
 }
 
+/// How wide an answer reaches.
+///
+/// The Little Snitch dialogue's second column: an operator allowing one call is
+/// answering a different question from one allowing everything this agent ever
+/// does to this service, and a console that can only express the narrowest of
+/// them trains its operator to hold the key down.
+///
+/// A `None` field places no constraint. Matching is exact rather than glob:
+/// every scope here is built from a request that actually arrived, so there is
+/// nothing to pattern-match and nothing for a stray `*` in a tool name to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    pub agent: Option<String>,
+    pub kind: Option<Kind>,
+    pub target: Option<String>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+}
+
+impl Scope {
+    /// This request and nothing else — what `remember` meant before scopes.
+    pub fn exact(request: &AccessRequest) -> Self {
+        Scope {
+            agent: Some(request.agent.clone()),
+            kind: Some(request.kind),
+            target: Some(request.target.clone()),
+            method: Some(request.method.clone()),
+            path: Some(request.path.clone()),
+        }
+    }
+
+    pub fn matches(&self, request: &AccessRequest) -> bool {
+        self.agent.as_ref().is_none_or(|a| *a == request.agent)
+            && self.kind.is_none_or(|k| k == request.kind)
+            && self.target.as_ref().is_none_or(|t| *t == request.target)
+            && self.method.as_ref().is_none_or(|m| *m == request.method)
+            && self.path.as_ref().is_none_or(|p| *p == request.path)
+    }
+}
+
+/// The rule that sent this request to a human.
+///
+/// Carried through to the console because an answer meant to hold *from now on*
+/// has to be written into the file in front of this position — appended after
+/// it, a new `allow` would sit behind the `ask` that is still matching first,
+/// and the operator would be asked the same question forever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskingRule {
+    pub index: usize,
+    pub label: String,
+}
+
+impl AskingRule {
+    /// The rule an `ask` decision came from.
+    ///
+    /// `None` when the *default* did the asking: there is no rule to write in
+    /// front of, so a standing answer appends to the end of the list instead.
+    pub fn of(decision: &crate::acl::Decision) -> Option<Self> {
+        Some(AskingRule {
+            index: decision.index?,
+            label: decision.rule.clone()?,
+        })
+    }
+}
+
 /// What the TUI and the control API see for one parked request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingView {
@@ -64,11 +128,15 @@ pub struct PendingView {
     pub summary: String,
     pub waited_ms: u64,
     pub agent_name: String,
+    /// The `ask` rule that parked it, when a rule did rather than the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<AskingRule>,
 }
 
 struct Pending {
     request: AccessRequest,
     agent_name: String,
+    asked_by: Option<AskingRule>,
     created: Instant,
     responder: oneshot::Sender<Verdict>,
 }
@@ -80,8 +148,11 @@ const APPROVER_POLL_TTL: Duration = Duration::from_secs(30);
 
 pub struct ApprovalBroker {
     pending: Mutex<IndexMap<String, Pending>>,
-    /// "…and remember for this session" answers, keyed by the exact access request.
-    remembered: Mutex<HashMap<String, Verdict>>,
+    /// "…and remember for this session" answers. Newest first, because an
+    /// operator who narrows or reverses an earlier standing answer means the
+    /// new one — the alternative is a decision that cannot be taken back
+    /// without restarting the proxy.
+    remembered: Mutex<Vec<(Scope, Verdict)>>,
     console_attached: AtomicBool,
     last_poll: Mutex<Option<Instant>>,
     changes: broadcast::Sender<()>,
@@ -93,7 +164,7 @@ impl ApprovalBroker {
         let (changes, _) = broadcast::channel(64);
         ApprovalBroker {
             pending: Mutex::new(IndexMap::new()),
-            remembered: Mutex::new(HashMap::new()),
+            remembered: Mutex::new(Vec::new()),
             console_attached: AtomicBool::new(false),
             last_poll: Mutex::new(None),
             changes,
@@ -126,8 +197,13 @@ impl ApprovalBroker {
     }
 
     /// Park a request until a human answers, a remembered answer applies, or we time out.
-    pub async fn ask(&self, request: &AccessRequest, agent_name: &str) -> Outcome {
-        if let Some(verdict) = self.remembered.lock().get(&request.session_key()).copied() {
+    pub async fn ask(
+        &self,
+        request: &AccessRequest,
+        agent_name: &str,
+        asked_by: Option<AskingRule>,
+    ) -> Outcome {
+        if let Some(verdict) = self.remembered_verdict(request) {
             return Outcome::Remembered(verdict);
         }
         if !self.has_approver() {
@@ -141,6 +217,7 @@ impl ApprovalBroker {
             Pending {
                 request: request.clone(),
                 agent_name: agent_name.to_string(),
+                asked_by,
                 created: Instant::now(),
                 responder,
             },
@@ -169,6 +246,7 @@ impl ApprovalBroker {
                 request: pending.request.clone(),
                 waited_ms: pending.created.elapsed().as_millis() as u64,
                 agent_name: pending.agent_name.clone(),
+                asked_by: pending.asked_by.clone(),
             })
             .collect()
     }
@@ -184,13 +262,56 @@ impl ApprovalBroker {
             return false;
         };
         if remember {
-            self.remembered
-                .lock()
-                .insert(pending.request.session_key(), verdict);
+            self.remember(Scope::exact(&pending.request), verdict);
         }
+        self.deliver(pending, verdict)
+    }
+
+    /// Answer one parked request, and stand by that answer for everything
+    /// `scope` covers until this process exits.
+    ///
+    /// The standing answer is recorded first, and whether or not the request
+    /// that prompted it is still parked: it is the operator's intent about a
+    /// whole class of calls, not about the one that happened to raise the
+    /// dialogue, and that one may well have timed out while they read it.
+    pub fn decide_scoped(&self, id: &str, verdict: Verdict, scope: Option<Scope>) -> bool {
+        if let Some(scope) = scope {
+            self.remember(scope, verdict);
+        }
+        let Some(pending) = self.pending.lock().shift_remove(id) else {
+            return false;
+        };
+        self.deliver(pending, verdict)
+    }
+
+    fn deliver(&self, pending: Pending, verdict: Verdict) -> bool {
         let delivered = pending.responder.send(verdict).is_ok();
         let _ = self.changes.send(());
         delivered
+    }
+
+    /// Stand by `verdict` for everything `scope` covers, from now until exit.
+    pub fn remember(&self, scope: Scope, verdict: Verdict) {
+        self.remembered.lock().push((scope, verdict));
+        let _ = self.changes.send(());
+    }
+
+    /// The standing answer that covers this request, newest first.
+    fn remembered_verdict(&self, request: &AccessRequest) -> Option<Verdict> {
+        self.remembered
+            .lock()
+            .iter()
+            .rev()
+            .find(|(scope, _)| scope.matches(request))
+            .map(|(_, verdict)| *verdict)
+    }
+
+    /// The standing answers, newest first — what the console lists so an
+    /// operator can see what they have already waved through.
+    pub fn remembered(&self) -> Vec<(Scope, Verdict)> {
+        let mut answers = self.remembered.lock().clone();
+        answers.reverse();
+        answers
     }
 
     /// Answer the request that has been waiting longest — the TUI's default target.
@@ -224,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn denies_when_nothing_is_watching_the_queue() {
         let broker = ApprovalBroker::new(Duration::from_secs(5));
-        let outcome = broker.ask(&request(), "Claude").await;
+        let outcome = broker.ask(&request(), "Claude", None).await;
         assert_eq!(outcome, Outcome::NoApprover);
         assert_eq!(outcome.verdict(), Verdict::Deny);
     }
@@ -247,7 +368,7 @@ mod tests {
 
         let asker = {
             let broker = Arc::clone(&broker);
-            tokio::spawn(async move { broker.ask(&request(), "Claude").await })
+            tokio::spawn(async move { broker.ask(&request(), "Claude", None).await })
         };
 
         // Wait for it to appear in the queue, then answer it.
@@ -270,7 +391,7 @@ mod tests {
 
         let asker = {
             let broker = Arc::clone(&broker);
-            tokio::spawn(async move { broker.ask(&request(), "Claude").await })
+            tokio::spawn(async move { broker.ask(&request(), "Claude", None).await })
         };
         let id = loop {
             if let Some(view) = broker.list().into_iter().next() {
@@ -283,13 +404,16 @@ mod tests {
 
         // Same request again: answered from memory, without parking.
         assert_eq!(
-            broker.ask(&request(), "Claude").await,
+            broker.ask(&request(), "Claude", None).await,
             Outcome::Remembered(Verdict::Allow)
         );
         // A different path is a different decision and must be asked again.
         let other = AccessRequest::http("claude", "gh", "DELETE", "/repos/x");
         broker.set_has_approver(false);
-        assert_eq!(broker.ask(&other, "Claude").await, Outcome::NoApprover);
+        assert_eq!(
+            broker.ask(&other, "Claude", None).await,
+            Outcome::NoApprover
+        );
 
         broker.forget_all();
         assert_eq!(broker.remembered_count(), 0);
@@ -299,7 +423,7 @@ mod tests {
     async fn an_unanswered_request_times_out_denied() {
         let broker = ApprovalBroker::new(Duration::from_millis(40));
         broker.set_has_approver(true);
-        let outcome = broker.ask(&request(), "Claude").await;
+        let outcome = broker.ask(&request(), "Claude", None).await;
         assert_eq!(outcome, Outcome::TimedOut);
         assert_eq!(outcome.verdict(), Verdict::Deny);
         assert_eq!(

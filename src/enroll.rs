@@ -106,6 +106,191 @@ pub enum AuthSpec {
     },
 }
 
+/// Every credential scheme there is, spelled as the CLI's `--auth` takes them.
+///
+/// The console offers the same list from the same constant: a scheme the CLI
+/// can enrol and the console cannot is a reason to keep a terminal open beside
+/// the terminal, which is what the console exists to stop.
+pub const AUTH_SCHEMES: &[&str] = &[
+    "none",
+    "bearer",
+    "header",
+    "basic",
+    "query",
+    "oauth2-client-credentials",
+    "service-account-jwt",
+];
+
+/// Everything the credential schemes take, in the shape a human supplies it —
+/// a flag on the command line, a field in the console's form.
+///
+/// One struct for both because each scheme needs a different subset, and the
+/// rule about which subset is the difference between a credential that is
+/// injected and one that silently is not. Two copies of that rule would be two
+/// chances to get it wrong.
+#[derive(Debug, Clone, Default)]
+pub struct AuthInput {
+    /// One of `AUTH_SCHEMES`. `-` and `_` are interchangeable.
+    pub scheme: String,
+    pub secret: Option<String>,
+    pub header: Option<String>,
+    pub prefix: Option<String>,
+    pub username: Option<String>,
+    pub username_secret: Option<String>,
+    pub param: Option<String>,
+    pub key_file: Option<String>,
+    pub private_key: Option<String>,
+    pub issuer: Option<String>,
+    pub key_id: Option<String>,
+    pub token_url: Option<String>,
+    pub audience: Option<String>,
+    pub scopes: Vec<String>,
+    pub subject: Option<String>,
+    pub lifetime_secs: Option<u64>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+impl AuthInput {
+    /// Which fields this scheme reads. The console shows these and hides the
+    /// rest, so a form for `bearer` does not ask for a token endpoint.
+    pub fn fields_for(scheme: &str) -> &'static [&'static str] {
+        match normalise_scheme(scheme) {
+            "none" => &[],
+            "bearer" => &["secret"],
+            "header" => &["header", "secret", "prefix"],
+            "basic" => &["username", "username-secret", "secret"],
+            "query" => &["param", "secret"],
+            "oauth2-client-credentials" => &[
+                "token-url",
+                "client-id",
+                "client-secret",
+                "scope",
+                "audience",
+            ],
+            "service-account-jwt" => &[
+                "key-file",
+                "private-key",
+                "issuer",
+                "key-id",
+                "token-url",
+                "audience",
+                "scope",
+                "subject",
+                "lifetime-secs",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Each scheme needs a different subset of the fields, and silently ignoring
+    /// one that was supplied is how a credential ends up not being sent.
+    pub fn to_spec(&self) -> Result<AuthSpec> {
+        let need_secret = || -> Result<String> {
+            self.secret.clone().context(
+                "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
+            )
+        };
+        let spec = match normalise_scheme(&self.scheme) {
+            "none" => AuthSpec::None,
+            "bearer" => AuthSpec::Bearer {
+                secret: need_secret()?,
+            },
+            "header" => AuthSpec::Header {
+                header: self.header.clone().context(
+                    "`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`",
+                )?,
+                secret: need_secret()?,
+                prefix: self.prefix.clone(),
+            },
+            "basic" => {
+                if self.username.is_none() && self.username_secret.is_none() {
+                    bail!(
+                        "`--auth basic` needs `--username <NAME>`, or `--username-secret <REF>` \
+                         for an API like Graylog whose user field is the credential"
+                    );
+                }
+                if self.username.is_some() && self.username_secret.is_some() {
+                    bail!("`--username` and `--username-secret` are two spellings of the same field — pass one");
+                }
+                AuthSpec::Basic {
+                    username: self.username.clone(),
+                    username_secret: self.username_secret.clone(),
+                    secret: need_secret()?,
+                }
+            }
+            "query" => AuthSpec::Query {
+                param: self
+                    .param
+                    .clone()
+                    .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
+                secret: need_secret()?,
+            },
+            "oauth2-client-credentials" => AuthSpec::Oauth2ClientCredentials {
+                token_url: self
+                    .token_url
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--token-url <URL>`")?,
+                client_id: self
+                    .client_id
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--client-id <ID>`")?,
+                client_secret: self
+                    .client_secret
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--client-secret <REF>`")?,
+                // One space-delimited `scope` parameter, which is how the grant
+                // spells a list; the flag is repeatable so the caller does not
+                // have to know that.
+                scope: (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
+                audience: self.audience.clone(),
+            },
+            "service-account-jwt" => {
+                if self.key_file.is_none() && self.private_key.is_none() {
+                    bail!(
+                        "`--auth service-account-jwt` needs `--key-file <REF>` (the JSON key \
+                         Google issues) or `--private-key <REF>` with `--issuer` and `--token-url`"
+                    );
+                }
+                if self.key_file.is_some() && self.private_key.is_some() {
+                    bail!("`--key-file` already carries the private key — pass one or the other");
+                }
+                AuthSpec::ServiceAccountJwt {
+                    key_file: self.key_file.clone(),
+                    issuer: self.issuer.clone(),
+                    private_key: self.private_key.clone(),
+                    key_id: self.key_id.clone(),
+                    token_url: self.token_url.clone(),
+                    audience: self.audience.clone(),
+                    scopes: self.scopes.clone(),
+                    subject: self.subject.clone(),
+                    lifetime_secs: self.lifetime_secs,
+                }
+            }
+            other => bail!(
+                "`{other}` is not a credential scheme — it is one of {}",
+                AUTH_SCHEMES.join(", ")
+            ),
+        };
+        if matches!(spec, AuthSpec::None) && self.secret.is_some() {
+            bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
+        }
+        Ok(spec)
+    }
+}
+
+/// `service_account_jwt` as the config file spells it and `service-account-jwt`
+/// as the flag does are the same scheme, and an operator reading one and typing
+/// the other should not be told it does not exist.
+fn normalise_scheme(scheme: &str) -> &str {
+    match scheme.trim() {
+        "oauth2_client_credentials" => "oauth2-client-credentials",
+        "service_account_jwt" => "service-account-jwt",
+        "" => "none",
+        other => other,
+    }
+}
+
 /// Add `[[agents]]`, minting the token and writing only its hash.
 pub fn add_agent(
     path: &Path,
@@ -411,11 +596,48 @@ pub fn add_rule(
     methods: &[String],
     paths: &[String],
     action: &str,
-) -> Result<()> {
+) -> Result<usize> {
     let mut document = read(path)?;
     let entry = rule_entry(name, agent, kind, target, methods, paths, action);
     append(&mut document, "acl", entry);
-    save(path, document)
+    let landed = document_config(&document)?.acl.len().saturating_sub(1);
+    save(path, document)?;
+    Ok(landed)
+}
+
+/// Put a rule *before* the one at `index`, rather than after everything.
+///
+/// The one edit `add_rule` cannot express, and the one the approval console
+/// needs: an operator answering "allow this from now on" is overriding the
+/// `ask` rule that just stopped them, and first match wins — appended after it,
+/// the new rule would never be reached and the same question would come back on
+/// the next call. An `index` past the end appends, which is what a decision
+/// taken by the *default* action means.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_rule(
+    path: &Path,
+    index: usize,
+    name: Option<&str>,
+    agent: &str,
+    kind: &str,
+    target: &str,
+    methods: &[String],
+    paths: &[String],
+    action: &str,
+) -> Result<usize> {
+    let mut document = read(path)?;
+    let entry = rule_entry(name, agent, kind, target, methods, paths, action);
+
+    let existing = document_config(&document)?.acl.len();
+    if index >= existing {
+        append(&mut document, "acl", entry);
+        save(path, document)?;
+        return Ok(existing);
+    }
+
+    array_of_tables(&mut document, "acl", path)?.insert(index, entry);
+    save(path, document)?;
+    Ok(index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1539,6 +1761,66 @@ mod tests {
         // rather than the top-level "the edit produced a policy file…".
         let error = format!("{error:#}");
         assert!(error.contains("username"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_can_be_put_in_front_of_the_one_it_overrides() {
+        // The approval console's "from now on": an `ask` rule already matches,
+        // so an allow appended after it would never be reached and the operator
+        // would be asked the same question forever.
+        let (_dir, path) = empty_policy();
+        add_rule(
+            &path,
+            Some("writes-need-a-human"),
+            "*",
+            "http",
+            "github",
+            &["POST".into()],
+            &["**".into()],
+            "ask",
+        )
+        .unwrap();
+
+        let landed = insert_rule(
+            &path,
+            0,
+            Some("console-allow"),
+            "claude",
+            "http",
+            "github",
+            &["POST".into()],
+            &["/repos/acme/api/issues".into()],
+            "allow",
+        )
+        .unwrap();
+        assert_eq!(landed, 0);
+
+        let config = document_config(&read(&path).unwrap()).unwrap();
+        assert_eq!(config.acl[0].name.as_deref(), Some("console-allow"));
+        assert_eq!(config.acl[1].name.as_deref(), Some("writes-need-a-human"));
+    }
+
+    #[test]
+    fn inserting_past_the_end_appends_rather_than_failing() {
+        // The default action did the asking, so there is no rule to get in
+        // front of — and "nowhere to insert" must not be an error path the
+        // console has to have a second answer for.
+        let (_dir, path) = empty_policy();
+        let landed = insert_rule(
+            &path,
+            7,
+            Some("only-rule"),
+            "*",
+            "*",
+            "*",
+            &["*".into()],
+            &["**".into()],
+            "deny",
+        )
+        .unwrap();
+
+        assert_eq!(landed, 0);
+        assert_eq!(rule_count(&path).unwrap(), 1);
     }
 
     #[test]

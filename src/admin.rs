@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::acl::{AccessRequest, Kind};
-use crate::approval::{PendingView, Verdict};
+use crate::approval::{AskingRule, PendingView, Verdict};
 use crate::audit::AuditRecord;
 use crate::config::Action;
 use crate::identity::agent_may_address;
@@ -317,7 +317,10 @@ async fn authorize(
             }
         }
         Action::Ask => {
-            let outcome = state.broker.ask(&access, agent.display_name()).await;
+            let outcome = state
+                .broker
+                .ask(&access, agent.display_name(), AskingRule::of(&decision))
+                .await;
             record.decision = Some(outcome.label().to_string());
             AuthorizeResult {
                 allowed: outcome.verdict() == Verdict::Allow,
