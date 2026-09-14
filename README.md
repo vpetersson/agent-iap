@@ -226,7 +226,8 @@ agent-iap upstream add anthropic \
 agent-iap acl add --target anthropic \
     --methods POST --paths /v1/messages
 agent-iap agent add claude-code --target anthropic
-#    ^ prints the agent's token once. Only its sha256 goes in the file.
+#    ^ prints the agent's token once, and copies it to your clipboard. Only
+#      its sha256 goes in the file.
 
 # 3. Check the policy and prove every credential reference resolves.
 export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
@@ -452,6 +453,37 @@ meant to be committable, so the user field takes a reference and the password
 takes the scheme's documented constant. That constant is the one `literal:`
 the loader does not complain about, and only in that position: a `literal:` in
 `--username-secret` is still refused.
+
+### Getting the token out
+
+Every command that mints a token — `init`, `agent add`, `agent rotate`,
+`gen-token` — prints it once and also puts it on your clipboard, so the step
+between "the proxy minted this" and "the agent has it" is a paste rather than a
+careful drag with a mouse. A token with one character missing authenticates
+nothing, and the plaintext it came from is already gone.
+
+It uses OSC 52: the escape sequence that asks the *terminal* to set the
+clipboard. The point of doing it that way is where it works — over SSH, from
+inside a container, from a tmux pane on a jump host, none of which have a
+clipboard of their own for `pbcopy` to reach. Every terminal in common use
+implements it; tmux and screen forward it. In the console, the modal that shows
+a token copies it on `c`.
+
+```bash
+agent-iap agent rotate ci-runner --no-clipboard   # just print it
+export IAP_NO_CLIPBOARD=1                         # never copy, any command
+```
+
+Two things worth knowing. The sequence is one-way, so nothing here can confirm
+the clipboard actually changed — paste it somewhere before you close the
+terminal. And a desktop clipboard is shared with everything else on that
+desktop, and is often kept in a history by a clipboard manager; that is a fair
+trade for a token that buys nothing off this proxy and rotates with one command,
+but it is your trade to refuse. Nothing is copied when neither stream is a
+terminal — a pipe, a file, a unit's journal — and nothing is ever copied without
+a line saying so. The sequence goes to the terminal itself rather than to
+stdout, so `agent-iap gen-token > token.txt` still writes a file with a token in
+it and nothing else.
 
 ### Revoking and removing
 

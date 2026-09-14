@@ -9,6 +9,7 @@ pub mod acl;
 pub mod admin;
 pub mod approval;
 pub mod audit;
+pub mod clipboard;
 pub mod config;
 pub mod credentials;
 pub mod enroll;

@@ -217,13 +217,62 @@ enum Modal {
     Form(Box<Form>),
     Confirm(Confirm),
     /// Something to read and dismiss: a minted token, a dry run.
-    Show {
-        title: String,
-        body: String,
-        /// Rendered as a warning — a token is on screen and will not be again.
-        secret: bool,
-    },
+    Show(Shown),
     Help,
+}
+
+/// A modal that is only there to be read — and, when it is holding a token,
+/// copied.
+struct Shown {
+    title: String,
+    body: String,
+    /// Rendered as a warning — a token is on screen and will not be again.
+    secret: bool,
+    /// The token on its own, without the paragraph of explanation around it.
+    /// `Some` is what makes `c` do anything.
+    copy: Option<String>,
+    /// What the last `c` did. Shown in the modal rather than flashed on the
+    /// footer, which this may well be covering.
+    note: Option<String>,
+}
+
+impl Shown {
+    /// A dry run, a preview — something to read and close.
+    fn plain(title: String, body: String) -> Self {
+        Shown {
+            title,
+            body,
+            secret: false,
+            copy: None,
+            note: None,
+        }
+    }
+
+    /// A token: the warning colours, and `c` wired up to the value itself.
+    fn token(title: String, token: &str, body: String) -> Self {
+        Shown {
+            title,
+            body,
+            secret: true,
+            copy: Some(token.to_string()),
+            note: None,
+        }
+    }
+}
+
+/// What `c` did, in a line short enough for the modal's footer.
+///
+/// Every outcome gets one, including the refusals: the operator pressed a key
+/// and is owed an answer, and "nothing happened" is indistinguishable from a
+/// console that has stopped responding.
+fn copy_note(outcome: crate::clipboard::Copied) -> String {
+    use crate::clipboard::Copied;
+    match outcome {
+        Copied::Sent => "copied — OSC 52 is one-way, so paste it somewhere to be sure".into(),
+        Copied::Declined => "not copied — IAP_NO_CLIPBOARD is set".into(),
+        Copied::NoTerminal | Copied::Failed => "could not reach the terminal's clipboard".into(),
+        Copied::TooLarge => "too long for OSC 52, so nothing was copied".into(),
+    }
 }
 
 struct Confirm {
@@ -279,7 +328,8 @@ struct App {
     /// does not spring back the instant it is dismissed.
     dismissed: HashSet<String>,
     /// Is the terminal reporting the pointer? Off makes the terminal's own
-    /// selection work again, which is how a token gets copied out of here.
+    /// selection work again — the fallback for getting a token out of here
+    /// when the terminal will not take an OSC 52 copy.
     mouse: bool,
     hits: Hits,
     /// The last click, for spotting the second one of a pair.
@@ -498,8 +548,9 @@ impl App {
             }
             // Reporting the pointer is what stops the terminal's own
             // selection working, and the one thing an operator most wants to
-            // select out of this screen is a token. So it is a toggle, and it
-            // says which way it went.
+            // select out of this screen is a token — which `c` now copies
+            // outright, leaving this for the terminals that ignore OSC 52. So
+            // it is a toggle, and it says which way it went.
             KeyCode::Char('m') => {
                 self.mouse = set_mouse(!self.mouse);
                 match self.mouse {
@@ -838,7 +889,17 @@ impl App {
 
     fn handle_modal(&mut self, key: KeyEvent) {
         match self.modal.take() {
-            Some(Modal::Help) | Some(Modal::Show { .. }) => {}
+            Some(Modal::Help) => {}
+            // Any key closes this one — except the one that copies, which
+            // would otherwise take the token off the screen at the same moment
+            // it says whether the clipboard got it.
+            Some(Modal::Show(mut shown)) => {
+                let copying = key.code == KeyCode::Char('c') && key.modifiers.is_empty();
+                if let (true, Some(token)) = (copying, shown.copy.clone()) {
+                    shown.note = Some(copy_note(crate::clipboard::copy(&token, true)));
+                    self.modal = Some(Modal::Show(shown));
+                }
+            }
             Some(Modal::Approve(mut dialogue)) => match dialogue.handle(key) {
                 None => self.modal = Some(Modal::Approve(dialogue)),
                 Some(Answer::Dismiss) => {
@@ -858,22 +919,22 @@ impl App {
                         self.refresh();
                         self.say(effect.message);
                         if let Some((id, token)) = effect.token {
-                            self.modal = Some(Modal::Show {
-                                title: format!("token for `{id}` — shown once"),
-                                body: format!(
-                                    "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
-                                     upstream key: it buys nothing anywhere else, and revoking it \
-                                     rotates nothing. The file got only its sha256, so this is the \
-                                     last time anything can print it."
-                                ),
-                                secret: true,
-                            });
+                            let body = format!(
+                                "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
+                                 upstream key: it buys nothing anywhere else, and revoking it \
+                                 rotates nothing. The file got only its sha256, so this is the \
+                                 last time anything can print it."
+                            );
+                            self.modal = Some(Modal::Show(Shown::token(
+                                format!("token for `{id}` — shown once"),
+                                &token,
+                                body,
+                            )));
                         } else if let Some(preview) = effect.preview {
-                            self.modal = Some(Modal::Show {
-                                title: "dry run — nothing was written".into(),
-                                body: preview,
-                                secret: false,
-                            });
+                            self.modal = Some(Modal::Show(Shown::plain(
+                                "dry run — nothing was written".into(),
+                                preview,
+                            )));
                         }
                     }
                     Err(error) => {
@@ -921,14 +982,15 @@ impl App {
             Destructive::RotateAgent(id) => {
                 let agent = crate::enroll::rotate_agent(&path, id)?;
                 let token = agent.token.clone();
-                self.modal = Some(Modal::Show {
-                    title: format!("new token for `{id}` — shown once"),
-                    body: format!(
-                        "{token}\n\nThe old token stopped working the moment this was written. \
-                         Nothing upstream rotated."
-                    ),
-                    secret: true,
-                });
+                let body = format!(
+                    "{token}\n\nThe old token stopped working the moment this was written. \
+                     Nothing upstream rotated."
+                );
+                self.modal = Some(Modal::Show(Shown::token(
+                    format!("new token for `{id}` — shown once"),
+                    &token,
+                    body,
+                )));
                 Ok(format!("re-keyed `{id}`"))
             }
             Destructive::RemoveUpstream(name) => {
@@ -1085,12 +1147,8 @@ impl App {
             Some(Modal::Confirm(confirm)) => {
                 self.hits.confirm = Some(draw_confirm(frame, frame.area(), confirm));
             }
-            Some(Modal::Show {
-                title,
-                body,
-                secret,
-            }) => {
-                self.hits.plain_modal = Some(draw_show(frame, frame.area(), title, body, *secret));
+            Some(Modal::Show(shown)) => {
+                self.hits.plain_modal = Some(draw_show(frame, frame.area(), shown));
             }
             Some(Modal::Help) => self.hits.plain_modal = Some(draw_help(frame, frame.area())),
             None => {}
@@ -1652,17 +1710,24 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) -> (Rect, Rect
     (yes, no)
 }
 
-fn draw_show(frame: &mut Frame, area: Rect, title: &str, body: &str, secret: bool) -> Rect {
+fn draw_show(frame: &mut Frame, area: Rect, shown: &Shown) -> Rect {
+    let Shown {
+        title,
+        body,
+        secret,
+        copy,
+        note,
+    } = shown;
     let height = (body.lines().count() as u16 + 8).min(area.height);
     let popup = form::centred(area, 80.min(area.width), height);
     frame.render_widget(Clear, popup);
 
-    let accent = if secret { Color::Yellow } else { Color::Cyan };
+    let accent = if *secret { Color::Yellow } else { Color::Cyan };
     let mut lines = vec![Line::raw("")];
     for line in body.lines() {
         lines.push(Line::from(Span::styled(
             line.to_string(),
-            if secret {
+            if *secret {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
@@ -1672,8 +1737,17 @@ fn draw_show(frame: &mut Frame, area: Rect, title: &str, body: &str, secret: boo
         )));
     }
     lines.push(Line::raw(""));
+    if let Some(note) = note {
+        lines.push(Line::from(Span::styled(
+            note.clone(),
+            Style::default().fg(accent),
+        )));
+    }
     lines.push(Line::from(Span::styled(
-        "any key to close",
+        match copy {
+            Some(_) => "`c` to copy it to your clipboard · any other key to close",
+            None => "any key to close",
+        },
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1703,7 +1777,10 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ("n", "add — agent, upstream, MCP server, rule"),
         ("x", "remove what the cursor is on"),
         ("t", "mint a new token for the selected agent"),
-        ("c", "re-resolve every credential reference"),
+        (
+            "c",
+            "copy the token a modal is showing — or, on credentials, re-resolve them",
+        ),
         ("enter", "answer a request, or add the selected profile"),
         ("a / d", "allow or deny the selected request, once"),
         ("f", "forget every standing answer"),
@@ -1743,7 +1820,7 @@ fn agent_form() -> Form {
     Form::new(
         Intent::Agent,
         "enrol an agent",
-        "Mints a token and writes only its sha256. The token is shown once, here.",
+        "Mints a token and writes only its sha256. The token is shown once, here — `c` copies it.",
         vec![
             Field::text("id", "id", "how the agent authenticates, and the name every audit record uses"),
             Field::text("name", "name", "what a human calls it, when the id is not that"),
@@ -2471,6 +2548,56 @@ action = "ask"
             .watcher()
             .reload(&app.state, crate::reload::Trigger::Edited)
             .expect("the edit loads")
+    }
+
+    /// The token modal is the one place in this console with a secret on
+    /// screen, and the key that copies it must not be the key that dismisses
+    /// it — otherwise the answer about the clipboard arrives after the only
+    /// copy of the token has gone.
+    #[tokio::test]
+    async fn copying_a_shown_token_leaves_it_up_and_says_what_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.modal = Some(Modal::Show(Shown::token(
+            "token for `codex` — shown once".into(),
+            "iap_deadbeef",
+            "iap_deadbeef\n\nGive this to the agent as IAP_TOKEN.".into(),
+        )));
+
+        let before = render(&mut app, 100, 30);
+        assert!(before.contains("`c` to copy"), "{before}");
+
+        app.handle(KeyEvent::from(KeyCode::Char('c'))).unwrap();
+        assert!(app.modal.is_some(), "`c` copies; it does not dismiss");
+
+        let after = render(&mut app, 100, 30);
+        assert!(
+            after.contains("iap_deadbeef"),
+            "the token is still up:\n{after}"
+        );
+        // Under `cargo test` there is no terminal to copy to, so which note
+        // this is depends on the environment. That there is one does not.
+        assert_ne!(before, after, "pressing `c` has to say something:\n{after}");
+
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(app.modal.is_none(), "every other key still closes it");
+    }
+
+    #[tokio::test]
+    async fn a_modal_with_nothing_to_copy_does_not_offer_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.modal = Some(Modal::Show(Shown::plain(
+            "dry run — nothing was written".into(),
+            "[[acl]]".into(),
+        )));
+
+        let rendered = render(&mut app, 100, 30);
+        assert!(rendered.contains("any key to close"), "{rendered}");
+        assert!(!rendered.contains("`c` to copy"), "{rendered}");
+
+        app.handle(KeyEvent::from(KeyCode::Char('c'))).unwrap();
+        assert!(app.modal.is_none(), "`c` is any key here");
     }
 
     fn type_in(app: &mut App, text: &str) {

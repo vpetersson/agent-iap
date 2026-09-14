@@ -1,0 +1,330 @@
+//! Putting a minted token on the operator's clipboard, through the terminal.
+//!
+//! A token is printed exactly once and then has to get somewhere else — an
+//! agent's environment, a password manager, another host's shell. The step in
+//! between is a human selecting forty-eight hex characters with a mouse, which
+//! is the one part of enrolling an agent that can silently go wrong: a dropped
+//! leading character produces a token that authenticates nothing, and the
+//! plaintext it came from is gone.
+//!
+//! OSC 52 is the terminal's own answer. The program writes
+//! `ESC ] 52 ; c ; <base64> BEL` to the terminal and the *terminal* — not this
+//! process, and not the kernel it happens to be running on — puts the payload
+//! on the clipboard of whoever is looking at it. That is the property worth
+//! having: it works identically over SSH, inside a container, and from a tmux
+//! pane on a jump host, none of which have a clipboard of their own for a
+//! `pbcopy` to reach. xterm, kitty, foot, Alacritty, WezTerm, iTerm2, Ghostty,
+//! Windows Terminal and VS Code's terminal all implement it; tmux and screen
+//! forward it when asked in the dialect each one wants, which is what `Relay`
+//! is for.
+//!
+//! Two things it is not:
+//!
+//! - **Confirmable.** The sequence is one-way. A terminal that does not
+//!   implement it drops the bytes and says nothing, so the most this module
+//!   can honestly report is that the write succeeded — never that the clipboard
+//!   changed. Every message built on top of it says so.
+//! - **Free of consequence.** The token lands in a desktop clipboard, which is
+//!   readable by anything else on that desktop and is often kept in a history
+//!   by a clipboard manager. That is a fair trade for a token that authorises
+//!   nothing off this proxy and can be rotated with one command — but it is the
+//!   operator's trade to refuse, so `IAP_NO_CLIPBOARD` and `--no-clipboard`
+//!   turn it off, and nothing is ever copied without a line saying it was.
+
+use std::io::{IsTerminal, Write};
+
+/// The escape sequence's ceiling, in bytes of base64.
+///
+/// xterm's is the smallest in common use and everything else is more generous.
+/// An agent token is under a hundred bytes, so this can only ever be hit by a
+/// caller that is copying something it should not be; refusing beats writing a
+/// truncated secret into a clipboard and reporting success.
+const MAX_ENCODED: usize = 74_994;
+
+/// Which dialect the terminal on the other end speaks.
+///
+/// A multiplexer sits between this process and the terminal that owns the
+/// clipboard, and will not forward an escape sequence it does not recognise as
+/// something to forward. Each one has its own way of being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relay {
+    /// Straight to the terminal.
+    None,
+    /// tmux, which passes a sequence through when it arrives wrapped in its own
+    /// DCS and with every `ESC` inside doubled.
+    Tmux,
+    /// GNU screen, whose DCS passthrough has a length limit, so a long payload
+    /// arrives as several of them in a row.
+    Screen,
+}
+
+/// What happened, in enough detail for the caller to say something true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copied {
+    /// The sequence reached the terminal. Whether the terminal did anything
+    /// with it is not knowable from here.
+    Sent,
+    /// Turned off by `IAP_NO_CLIPBOARD`, or by the caller's own flag.
+    Declined,
+    /// Nobody is watching: output is a pipe, a file, a unit's journal.
+    NoTerminal,
+    /// Too long to be a token. Nothing was written.
+    TooLarge,
+    /// A terminal was there and the write to it failed.
+    Failed,
+}
+
+impl Copied {
+    pub fn sent(self) -> bool {
+        matches!(self, Copied::Sent)
+    }
+
+    /// The line to print under a token, or `None` when the right thing to say
+    /// is nothing.
+    ///
+    /// Silence is deliberate for the ordinary refusals: an operator who set
+    /// `IAP_NO_CLIPBOARD` does not need telling on every mint, and a run with
+    /// its output redirected is usually a script, where a note about a
+    /// clipboard is noise in a file someone will read later.
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Copied::Sent => Some(
+                "Copied to your clipboard. OSC 52 is one-way, so paste it somewhere to be sure \
+                 it arrived.",
+            ),
+            Copied::Failed => Some("Could not write to the terminal, so nothing was copied."),
+            Copied::TooLarge => Some("Too long to copy over OSC 52, so nothing was copied."),
+            Copied::Declined | Copied::NoTerminal => None,
+        }
+    }
+}
+
+/// Has the operator turned this off?
+///
+/// Any value but the explicitly falsey ones counts: somebody exporting
+/// `IAP_NO_CLIPBOARD=1` and somebody exporting `IAP_NO_CLIPBOARD=yes` mean the
+/// same thing, and a variable set to nothing at all is the shell's usual way of
+/// having unset it.
+pub fn disabled_by_environment() -> bool {
+    match std::env::var("IAP_NO_CLIPBOARD") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Copy, unless the operator asked not to.
+///
+/// `allowed` is the caller's own say — a `--no-clipboard` flag, or a mode in
+/// which copying makes no sense. The environment is checked here so that every
+/// call site honours it without having to remember to.
+pub fn copy(text: &str, allowed: bool) -> Copied {
+    if !allowed || disabled_by_environment() {
+        return Copied::Declined;
+    }
+    // Neither stream being a terminal means the output is going somewhere
+    // nobody is looking at right now — a file, a pipe, a CI log. `/dev/tty`
+    // might still open in that case, but writing to it would put a secret on
+    // the clipboard of whoever happens to own the session, for a command they
+    // are not watching.
+    if !std::io::stdout().is_terminal() && !std::io::stderr().is_terminal() {
+        return Copied::NoTerminal;
+    }
+    let Some(sequence) = sequence(
+        text,
+        relay_from(std::env::var_os("TMUX").is_some(), &term()),
+    ) else {
+        return Copied::TooLarge;
+    };
+    match write_to_terminal(&sequence) {
+        true => Copied::Sent,
+        false => Copied::Failed,
+    }
+}
+
+fn term() -> String {
+    std::env::var("TERM").unwrap_or_default()
+}
+
+/// Which multiplexer, if any, is in the way.
+///
+/// `TMUX` is set inside a tmux pane and nowhere else, so it is the reliable
+/// signal; screen only leaves `TERM`, which tmux also sets to `screen…` under
+/// its default terminal setting — hence the order.
+pub fn relay_from(tmux_env: bool, term: &str) -> Relay {
+    if tmux_env {
+        Relay::Tmux
+    } else if term.starts_with("screen") {
+        Relay::Screen
+    } else {
+        Relay::None
+    }
+}
+
+/// The bytes to write, or `None` if the payload is too long to be worth
+/// writing.
+///
+/// `c` is the selection: the clipboard proper, rather than the X primary
+/// selection a bare `ESC ] 52 ; ; …` would target on some terminals.
+pub fn sequence(text: &str, relay: Relay) -> Option<String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let encoded = STANDARD.encode(text.as_bytes());
+    if encoded.len() > MAX_ENCODED {
+        return None;
+    }
+    // BEL rather than ST terminates it: both are legal, and BEL is what the
+    // terminals that only implement one of the two implement.
+    let osc = format!("\x1b]52;c;{encoded}\x07");
+
+    Some(match relay {
+        Relay::None => osc,
+        // tmux reads its own DCS and replays the contents outward, so the
+        // inner ESCs have to survive being parsed once on the way through.
+        Relay::Tmux => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
+        // screen's passthrough takes the sequence verbatim, but caps how much
+        // of it fits in one DCS. Ending and reopening mid-sequence is how the
+        // rest gets across.
+        Relay::Screen => {
+            let mut wrapped = String::from("\x1bP");
+            for (index, chunk) in chunks(&osc, SCREEN_CHUNK).enumerate() {
+                if index > 0 {
+                    wrapped.push_str("\x1b\\\x1bP");
+                }
+                wrapped.push_str(chunk);
+            }
+            wrapped.push_str("\x1b\\");
+            wrapped
+        }
+    })
+}
+
+/// How much of a sequence fits in one of screen's DCS strings. Its buffer is
+/// 768 bytes; this leaves room for the wrapper around each chunk.
+const SCREEN_CHUNK: usize = 496;
+
+/// Split on byte boundaries. Sound because everything passed here is base64
+/// and ASCII punctuation, and cheap enough not to need to be clever about it.
+fn chunks(text: &str, size: usize) -> impl Iterator<Item = &str> {
+    text.as_bytes()
+        .chunks(size)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+}
+
+/// Write to the terminal itself rather than to stdout.
+///
+/// Stdout is the program's output, and an operator is entitled to redirect it
+/// into a file without finding an escape sequence in the middle of the token
+/// they saved. `/dev/tty` is the session's terminal whatever stdout was pointed
+/// at — and it is also the only handle that works from inside the console,
+/// where ratatui owns stdout.
+fn write_to_terminal(sequence: &str) -> bool {
+    #[cfg(unix)]
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        return tty
+            .write_all(sequence.as_bytes())
+            .and_then(|()| tty.flush())
+            .is_ok();
+    }
+    // No controlling terminal to open, or not a platform that has one. Stderr
+    // is the fallback because it is the stream that is still a terminal when
+    // stdout has been redirected, and because it is not anybody's output.
+    let mut stderr = std::io::stderr();
+    if !stderr.is_terminal() {
+        return false;
+    }
+    stderr
+        .write_all(sequence.as_bytes())
+        .and_then(|()| stderr.flush())
+        .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "iap_0123456789abcdef";
+    /// base64("iap_0123456789abcdef")
+    const ENCODED: &str = "aWFwXzAxMjM0NTY3ODlhYmNkZWY=";
+
+    #[test]
+    fn a_bare_terminal_gets_the_sequence_itself() {
+        let sequence = sequence(TOKEN, Relay::None).expect("a token is not too long");
+        assert_eq!(sequence, format!("\x1b]52;c;{ENCODED}\x07"));
+    }
+
+    #[test]
+    fn the_clipboard_is_asked_for_by_name() {
+        // `c`, not the empty selection: the empty one means "whatever the
+        // terminal defaults to", which on some is the primary selection.
+        let sequence = sequence(TOKEN, Relay::None).unwrap();
+        assert!(sequence.starts_with("\x1b]52;c;"), "{sequence:?}");
+    }
+
+    #[test]
+    fn tmux_gets_a_passthrough_with_its_escapes_doubled() {
+        let sequence = sequence(TOKEN, Relay::Tmux).unwrap();
+        assert_eq!(
+            sequence,
+            format!("\x1bPtmux;\x1b\x1b]52;c;{ENCODED}\x07\x1b\\")
+        );
+    }
+
+    #[test]
+    fn screen_gets_one_dcs_when_the_payload_is_short() {
+        let sequence = sequence(TOKEN, Relay::Screen).unwrap();
+        assert_eq!(sequence, format!("\x1bP\x1b]52;c;{ENCODED}\x07\x1b\\"));
+    }
+
+    #[test]
+    fn screen_gets_several_when_it_is_long() {
+        let long = "a".repeat(4_000);
+        let wrapped = sequence(&long, Relay::Screen).unwrap();
+        // Opened once per chunk, closed once per chunk, and the payload is
+        // still all there once the wrappers are taken back off.
+        let opens = wrapped.matches("\x1bP").count();
+        assert!(opens > 1, "expected several chunks, got {opens}");
+        assert_eq!(wrapped.matches("\x1b\\").count(), opens);
+        let rejoined = wrapped
+            .trim_start_matches("\x1bP")
+            .trim_end_matches("\x1b\\")
+            .replace("\x1b\\\x1bP", "");
+        assert_eq!(rejoined, sequence(&long, Relay::None).unwrap());
+    }
+
+    #[test]
+    fn nothing_absurdly_long_is_written_at_all() {
+        // Well past any terminal's buffer: a truncated secret on the clipboard
+        // would be reported as a success, which is worse than refusing.
+        assert!(sequence(&"a".repeat(MAX_ENCODED), Relay::None).is_none());
+    }
+
+    #[test]
+    fn tmux_wins_over_the_term_it_sets() {
+        // tmux's own default `TERM` is `screen-256color`, so a pane would be
+        // taken for screen if `TMUX` were not checked first.
+        assert_eq!(relay_from(true, "screen-256color"), Relay::Tmux);
+        assert_eq!(relay_from(false, "screen.xterm-256color"), Relay::Screen);
+        assert_eq!(relay_from(false, "xterm-256color"), Relay::None);
+        assert_eq!(relay_from(false, ""), Relay::None);
+    }
+
+    #[test]
+    fn the_callers_own_no_is_enough() {
+        // No terminal is opened and no environment is read: a caller that says
+        // no has already answered the question.
+        assert_eq!(copy(TOKEN, false), Copied::Declined);
+    }
+
+    #[test]
+    fn only_the_outcomes_worth_a_line_get_one() {
+        assert!(Copied::Sent.note().is_some());
+        assert!(Copied::Failed.note().is_some());
+        assert!(Copied::TooLarge.note().is_some());
+        assert!(Copied::Declined.note().is_none());
+        assert!(Copied::NoTerminal.note().is_none());
+    }
+}
