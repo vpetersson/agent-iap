@@ -64,4 +64,5 @@ pub mod stdio;
 pub mod tls;
 pub mod tokens;
 pub mod tui;
+pub mod verify;
 pub mod workload;

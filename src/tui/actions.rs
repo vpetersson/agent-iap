@@ -142,6 +142,11 @@ pub struct Effect {
     pub token: Option<(String, String)>,
     /// A preview rather than a write — the dry run.
     pub preview: Option<String>,
+    /// The service to call now that it is written, when the form asked for it.
+    /// Carried back rather than done here: the call is a network round trip and
+    /// sometimes a child process, and this function runs on the thread that
+    /// draws.
+    pub verify: Option<String>,
 }
 
 impl Effect {
@@ -150,6 +155,15 @@ impl Effect {
             message: message.into(),
             token: None,
             preview: None,
+            verify: None,
+        }
+    }
+
+    /// The same, for a service the form offered to verify.
+    fn wrote(form: &Form, name: &str, message: impl Into<String>) -> Self {
+        Effect {
+            verify: form.flag("verify").then(|| name.to_string()),
+            ..Effect::said(message)
         }
     }
 }
@@ -170,6 +184,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 message: format!("enrolled `{id}` — its token is live now, no restart needed"),
                 token: Some((agent.id, agent.token)),
                 preview: None,
+                verify: None,
             })
         }
         Intent::Upstream => {
@@ -177,17 +192,21 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             let base_url = required(form, "base-url")?;
             let headers = form.pairs("set-header")?;
             enroll::add_upstream(path, &name, &base_url, &form.auth().to_spec()?, &headers)?;
-            Ok(Effect::said(format!(
-                "added upstream `{name}` — agents can reach it now"
-            )))
+            Ok(Effect::wrote(
+                form,
+                &name,
+                format!("added upstream `{name}` — agents can reach it now"),
+            ))
         }
         Intent::EditUpstream(name) => {
             let base_url = required(form, "base-url")?;
             let headers = form.pairs("set-header")?;
             enroll::edit_upstream(path, name, &base_url, &form.auth().to_spec()?, &headers)?;
-            Ok(Effect::said(format!(
-                "updated upstream `{name}` — the next call through it uses this"
-            )))
+            Ok(Effect::wrote(
+                form,
+                name,
+                format!("updated upstream `{name}` — the next call through it uses this"),
+            ))
         }
         Intent::McpServer => {
             let name = required(form, "name")?;
@@ -203,9 +222,11 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 },
             };
             enroll::add_mcp_server(path, &name, &transport, &form.auth().to_spec()?)?;
-            Ok(Effect::said(format!(
-                "added MCP server `{name}` — agents can reach it now"
-            )))
+            Ok(Effect::wrote(
+                form,
+                &name,
+                format!("added MCP server `{name}` — agents can reach it now"),
+            ))
         }
         Intent::Rule => {
             let methods = non_empty(form.list("methods"), "*");
@@ -275,15 +296,20 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                     message: format!("`{id}` — nothing written"),
                     token: None,
                     preview: Some(plan),
+                    verify: None,
                 });
             }
-            Ok(Effect::said(format!(
-                "added `{}` ({}) at access `{}`, {} rules — live now",
-                added.name,
-                added.kind,
-                added.access,
-                added.rules.len()
-            )))
+            Ok(Effect::wrote(
+                form,
+                &added.name,
+                format!(
+                    "added `{}` ({}) at access `{}`, {} rules — live now",
+                    added.name,
+                    added.kind,
+                    added.access,
+                    added.rules.len()
+                ),
+            ))
         }
     }
 }

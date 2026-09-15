@@ -44,7 +44,7 @@ use crate::state::AppState;
 pub const MOUNT: &str = "/_iap/mcp";
 
 /// The MCP revision this server implements.
-const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// JSON-RPC reserved codes.
 const PARSE_ERROR: i64 = -32700;

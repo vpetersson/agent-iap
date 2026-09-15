@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_iap::audit;
 use agent_iap::clipboard;
@@ -15,10 +16,12 @@ use agent_iap::mcp;
 use agent_iap::paths;
 use agent_iap::profiles;
 use agent_iap::reload::Watcher;
+use agent_iap::secrets::SecretResolver;
 use agent_iap::state::AppState;
 use agent_iap::stdio;
 use agent_iap::tls::{self, Listener, ServerTls};
 use agent_iap::tui::{self, Console};
+use agent_iap::verify;
 
 #[derive(Parser)]
 #[command(
@@ -275,6 +278,23 @@ enum AgentCommand {
     },
 }
 
+/// The opt-in that turns an enrolment into an enrolment plus a phone call.
+///
+/// Off by default, and after the write rather than before it: adding a service
+/// should not depend on that service being up, and a base URL typed wrong is
+/// fixed with `upstream edit`, not by doing the whole enrolment again. What it
+/// buys is finding out now instead of on the agent's first call.
+#[derive(Args, Clone, Copy)]
+struct VerifyArg {
+    /// After writing it, call the service: resolve the credential (minting the
+    /// token, for a scheme that mints one), make one request, and check the ACL
+    /// for a rule that reaches it. The entry is written either way; a failed
+    /// verification only changes the exit status. Nothing is written by a dry
+    /// run, so nothing is verified by one either.
+    #[arg(long)]
+    verify: bool,
+}
+
 #[derive(Subcommand)]
 enum UpstreamCommand {
     /// Add a service the proxy fronts, and the credential it attaches.
@@ -329,6 +349,29 @@ enum UpstreamCommand {
             conflicts_with = "profile"
         )]
         set_headers: Vec<String>,
+        #[command(flatten)]
+        verify: VerifyArg,
+    },
+    /// Call a service the proxy fronts and report what came back.
+    ///
+    /// The half of a policy file `check` cannot read: `check` proves the
+    /// credential resolves, this proves the service accepts it. One GET, with
+    /// the credential attached exactly the way the proxy attaches it — which
+    /// for an OAuth or service-account upstream means the token is really
+    /// minted. Name nothing to verify every upstream.
+    Verify {
+        /// Name of the `[[upstreams]]` entry. Every one of them when omitted.
+        name: Option<String>,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Endpoint to call, relative to the base URL — `/user`, or
+        /// `/v1/models?limit=1`. Defaults to the root, which most APIs answer
+        /// with a 404 that says nothing about the credential.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// How long one call gets.
+        #[arg(long, value_name = "SECS", default_value_t = 10)]
+        timeout: u64,
     },
     /// Remove a service, and stop injecting its credential.
     #[command(alias = "remove")]
@@ -375,6 +418,23 @@ enum McpServerCommand {
         // Boxed for size, as in `UpstreamCommand::Add`.
         #[command(flatten)]
         auth: Box<AuthFlags>,
+        #[command(flatten)]
+        verify: VerifyArg,
+    },
+    /// Open an MCP session with a configured server and report what came back.
+    ///
+    /// Spawns the child, or calls the remote endpoint, with the credential the
+    /// policy file names, does the `initialize` handshake and asks for the tool
+    /// list — which is the list the ACL's `tools/call` rules are written
+    /// against. Name nothing to verify every server.
+    Verify {
+        /// Name of the `[[mcp_servers]]` entry. Every one of them when omitted.
+        name: Option<String>,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// How long the handshake gets.
+        #[arg(long, value_name = "SECS", default_value_t = 10)]
+        timeout: u64,
     },
     /// Remove a `[[mcp_servers]]` entry.
     #[command(alias = "remove")]
@@ -431,6 +491,8 @@ enum ProfileCommand {
         /// Print the TOML that would be appended, and write nothing.
         #[arg(long)]
         dry_run: bool,
+        #[command(flatten)]
+        verify: VerifyArg,
     },
 }
 
@@ -818,6 +880,7 @@ fn main() -> Result<()> {
             agent,
             dry_run,
             set_headers,
+            verify,
         }) => add_upstream(AddUpstream {
             path: config.config,
             name,
@@ -829,7 +892,14 @@ fn main() -> Result<()> {
             agent,
             dry_run,
             set_headers,
+            verify,
         }),
+        Command::Upstream(UpstreamCommand::Verify {
+            name,
+            config,
+            path,
+            timeout,
+        }) => verify_upstreams(&config.config, name.as_deref(), path, timeout),
         Command::Upstream(UpstreamCommand::Rm {
             name,
             config,
@@ -848,6 +918,7 @@ fn main() -> Result<()> {
             vars,
             agent,
             dry_run,
+            verify,
         }) => add_profile(
             &config.config,
             &id,
@@ -859,6 +930,7 @@ fn main() -> Result<()> {
                 agent,
                 dry_run,
             },
+            verify,
         ),
         Command::McpServer(McpServerCommand::Add {
             name,
@@ -869,6 +941,7 @@ fn main() -> Result<()> {
             env,
             cwd,
             auth,
+            verify,
         }) => add_mcp_server(AddMcpServer {
             path: config.config,
             name,
@@ -878,7 +951,13 @@ fn main() -> Result<()> {
             env,
             cwd,
             auth,
+            verify,
         }),
+        Command::McpServer(McpServerCommand::Verify {
+            name,
+            config,
+            timeout,
+        }) => verify_mcp_servers(&config.config, name.as_deref(), timeout),
         Command::McpServer(McpServerCommand::Rm {
             name,
             config,
@@ -1319,7 +1398,7 @@ fn check(path: &Path) -> Result<()> {
 
     // Before the secrets, because a shape problem in the policy is worth
     // reporting even on a run that bails on an unresolvable credential.
-    for warning in mcp_handshake_warnings(&config) {
+    for warning in verify::mcp_handshake_warnings(&config) {
         println!();
         for (index, line) in warning.lines().enumerate() {
             // First line under the `warning` label, the rest aligned to it, so
@@ -1376,71 +1455,143 @@ fn check(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// MCP servers whose rules would deny the handshake.
+// ---- verify ---------------------------------------------------------------
+
+/// `--verify` on an enrolment: the service was written, now call it.
 ///
-/// `initialize` names no tool, so it matches only a rule that leaves `paths`
-/// unconstrained. A policy whose every MCP rule scopes tool names therefore
-/// looks complete, validates, starts — and then the agent's session never
-/// opens, with a `<default>` deny that names no rule to go and fix. This is the
-/// one misconfiguration in the file that produces no useful error at the point
-/// it bites, so `check` says it here instead.
-fn mcp_handshake_warnings(config: &Config) -> Vec<String> {
-    let unconstrained = |paths: &[String]| {
-        paths
-            .iter()
-            .any(|path| matches!(path.as_str(), "*" | "**" | "/**"))
+/// Whatever comes back, the entry stays — only the exit status carries the
+/// verdict, so a script that adds a service and a script that proves it works
+/// can be the same script without the first half having to be undone.
+fn verify_after_write(path: &Path, name: &str, verify: VerifyArg) -> Result<()> {
+    if !verify.verify {
+        return Ok(());
+    }
+    let config = Config::load(path)?;
+    let resolver = resolver_for(&config);
+    let options = verify::Options {
+        timeout: verify::DEFAULT_TIMEOUT,
+        path: None,
+        audit: None,
     };
 
-    let mut warnings = Vec::new();
-    for server in &config.mcp_servers {
-        // Only rules that could reach this server at all, and only ones that
-        // would let `initialize` through: an unconstrained-path allow.
-        let admits_handshake = config.acl.iter().any(|rule| {
-            matches!(rule.kind.as_str(), "mcp" | "*")
-                && glob_matches(&rule.target, &server.name)
-                && rule.action == agent_iap::config::Action::Allow
-                && unconstrained(&rule.paths)
-                && rule
-                    .methods
-                    .iter()
-                    .any(|method| glob_matches(method, "initialize"))
-        });
-        if admits_handshake {
-            continue;
-        }
-        let reachable = config.acl.iter().any(|rule| {
-            matches!(rule.kind.as_str(), "mcp" | "*") && glob_matches(&rule.target, &server.name)
-        });
-        // A server with no rules at all is already obvious from `list`; the
-        // trap is the one that looks configured.
-        if !reachable {
-            continue;
-        }
-        if config.acl_default.action == agent_iap::config::Action::Allow {
-            continue;
-        }
-        let fix = profiles::MCP_SESSION_METHODS
-            .iter()
-            .map(|method| format!("--methods '{method}'"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        warnings.push(format!(
-            "mcp server `{name}` has rules, but none of them admits `initialize`.\n\
-             The handshake will be denied by `<default>`, and the agent will see a\n\
-             server that never starts. Add a session rule before the tool rules:\n\n\
-             \x20 agent-iap acl add --kind mcp --target {name} --paths '**' \\\n\
-             \x20   {fix}",
-            name = server.name,
-        ));
+    println!();
+    let report = tokio_runtime()?.block_on(verify::target(&config, &resolver, name, &options))?;
+    print_report(&report);
+    match report.ok() {
+        true => Ok(()),
+        // The write stands; this is the verdict on the service, not on the
+        // enrolment, and the message has to keep the two apart.
+        false => bail!(
+            "`{name}` was written to {} — but it did not verify",
+            path.display()
+        ),
     }
-    warnings
 }
 
-/// The same `*`/`**` glob the ACL compiles, for names that contain no `/`.
-fn glob_matches(pattern: &str, value: &str) -> bool {
-    globset::Glob::new(pattern)
-        .map(|glob| glob.compile_matcher().is_match(value))
-        .unwrap_or(false)
+fn verify_upstreams(
+    path: &Path,
+    name: Option<&str>,
+    probe: Option<String>,
+    timeout: u64,
+) -> Result<()> {
+    let config = Config::load(path)?;
+    let names = chosen(
+        name,
+        config.upstreams.iter().map(|u| u.name.as_str()),
+        "upstream",
+    )?;
+    let resolver = resolver_for(&config);
+    let options = verify::Options {
+        timeout: Duration::from_secs(timeout),
+        path: probe,
+        audit: None,
+    };
+
+    let runtime = tokio_runtime()?;
+    report_all(
+        names
+            .iter()
+            .map(|name| runtime.block_on(verify::upstream(&config, &resolver, name, &options))),
+    )
+}
+
+fn verify_mcp_servers(path: &Path, name: Option<&str>, timeout: u64) -> Result<()> {
+    let config = Config::load(path)?;
+    let names = chosen(
+        name,
+        config.mcp_servers.iter().map(|s| s.name.as_str()),
+        "MCP server",
+    )?;
+    let resolver = resolver_for(&config);
+    let options = verify::Options {
+        timeout: Duration::from_secs(timeout),
+        path: None,
+        audit: None,
+    };
+
+    let runtime = tokio_runtime()?;
+    report_all(
+        names
+            .iter()
+            .map(|name| runtime.block_on(verify::mcp_server(&config, &resolver, name, &options))),
+    )
+}
+
+/// The one that was named, or all of them — and a refusal rather than a silent
+/// success when the file has none to verify.
+fn chosen<'a>(
+    name: Option<&str>,
+    all: impl Iterator<Item = &'a str>,
+    noun: &str,
+) -> Result<Vec<String>> {
+    if let Some(name) = name {
+        return Ok(vec![name.to_string()]);
+    }
+    let all: Vec<String> = all.map(str::to_string).collect();
+    if all.is_empty() {
+        bail!("this policy file has no {noun} to verify");
+    }
+    Ok(all)
+}
+
+/// Print every report, and let the exit status carry the worst of them.
+fn report_all(reports: impl Iterator<Item = Result<verify::Report>>) -> Result<()> {
+    let mut failed = 0;
+    let mut total = 0;
+    for report in reports {
+        let report = report?;
+        total += 1;
+        if !report.ok() {
+            failed += 1;
+        }
+        print_report(&report);
+        println!();
+    }
+    match (failed, total) {
+        (0, total) => println!("{} verified.", plural(total, "service")),
+        (_, 1) => bail!("verification failed"),
+        (failed, total) => bail!("{failed} of {total} did not verify"),
+    }
+    Ok(())
+}
+
+/// One report, laid out on `check`'s column stops so the two read as one tool.
+fn print_report(report: &verify::Report) {
+    println!("{} `{}` → {}", report.kind, report.target, report.endpoint);
+    for step in &report.steps {
+        // The detail is the long half and wraps badly on its own, so it is
+        // indented under itself rather than left to run back to column zero.
+        let mut lines = verify::wrap(&step.detail, 58).into_iter();
+        let first = lines.next().unwrap_or_default();
+        println!("  {:<8} {:<11} {first}", step.outcome.label(), step.name);
+        for line in lines {
+            println!("  {:<8} {:<11} {line}", "", "");
+        }
+    }
+}
+
+fn resolver_for(config: &Config) -> Arc<SecretResolver> {
+    Arc::new(SecretResolver::new(config.server.op_binary.clone()))
 }
 
 /// Print a freshly minted token, and put it on the clipboard on the way past.
@@ -1657,6 +1808,7 @@ struct AddUpstream {
     agent: Option<String>,
     dry_run: bool,
     set_headers: Vec<String>,
+    verify: VerifyArg,
 }
 
 fn add_upstream(options: AddUpstream) -> Result<()> {
@@ -1671,6 +1823,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
         agent,
         dry_run,
         set_headers,
+        verify,
     } = options;
 
     // A profile is the same enrolment with the vendor's half already answered,
@@ -1691,6 +1844,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
                 agent,
                 dry_run,
             },
+            verify,
         );
     }
 
@@ -1708,7 +1862,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
              agent-iap acl add --target {name} --methods GET --paths '/**'"
         );
     }
-    Ok(())
+    verify_after_write(&path, &name, verify)
 }
 
 /// `upstream add --profile <id>`: the profile's service and rules, under the
@@ -1723,6 +1877,7 @@ fn add_upstream_from_profile(
     id: &str,
     flags: &AuthFlags,
     options: profiles::AddOptions,
+    verify: VerifyArg,
 ) -> Result<()> {
     let profile = profiles::get(id)?;
     if profile.service.kind() != "http" {
@@ -1739,7 +1894,7 @@ fn add_upstream_from_profile(
              it reads. Drop the others, or drop `--profile` and spell the service out"
         );
     }
-    add_from_profile(path, &profile, &options)
+    add_from_profile(path, &profile, &options, verify)
 }
 
 fn remove_upstream(path: &Path, name: &str, prune: bool) -> Result<()> {
@@ -1773,6 +1928,7 @@ struct AddMcpServer {
     env: Vec<String>,
     cwd: Option<String>,
     auth: Box<AuthFlags>,
+    verify: VerifyArg,
 }
 
 fn add_mcp_server(options: AddMcpServer) -> Result<()> {
@@ -1785,6 +1941,7 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
         env,
         cwd,
         auth,
+        verify,
     } = options;
 
     let transport = match (url, command) {
@@ -1816,7 +1973,7 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
              agent-iap acl add --kind mcp --target {name} --methods 'tools/call' --paths 'get_*'"
         );
     }
-    Ok(())
+    verify_after_write(&path, &name, verify)
 }
 
 fn remove_mcp_server(path: &Path, name: &str, prune: bool) -> Result<()> {
@@ -2210,9 +2367,14 @@ fn show_profile(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_profile(path: &Path, id: &str, options: profiles::AddOptions) -> Result<()> {
+fn add_profile(
+    path: &Path,
+    id: &str,
+    options: profiles::AddOptions,
+    verify: VerifyArg,
+) -> Result<()> {
     let profile = profiles::get(id)?;
-    add_from_profile(path, &profile, &options)
+    add_from_profile(path, &profile, &options, verify)
 }
 
 /// Write a profile out and say what landed. Shared with `upstream add
@@ -2221,6 +2383,7 @@ fn add_from_profile(
     path: &Path,
     profile: &profiles::Profile,
     options: &profiles::AddOptions,
+    verify: VerifyArg,
 ) -> Result<()> {
     let added = profiles::add(path, profile, options)?;
 
@@ -2253,5 +2416,5 @@ fn add_from_profile(
         added.name,
         path.display()
     );
-    Ok(())
+    verify_after_write(path, &added.name, verify)
 }
