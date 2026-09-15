@@ -16,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use std::borrow::Cow;
 
+use super::browse::{self, Browser, Pick};
 use crate::config::AuthConfig;
 use crate::enroll::{AuthInput, AUTH_SCHEMES};
 
@@ -44,6 +45,10 @@ pub struct Field {
     /// options. A credential form that asks for a token endpoint while you are
     /// enrolling a bearer token is a form that gets filled in wrong.
     pub shown_for: Option<(&'static str, Vec<String>)>,
+    /// This field takes a secret *reference*, one shape of which is a path —
+    /// so it can be filled in from the file picker as well as typed. See
+    /// `browse`.
+    pub browses: bool,
 }
 
 impl Field {
@@ -58,6 +63,7 @@ impl Field {
             hint: hint.into(),
             value: Value::Text(String::new()),
             shown_for: None,
+            browses: false,
         }
     }
 
@@ -127,6 +133,12 @@ impl Field {
         self
     }
 
+    /// Say that this field names a file, so `ctrl-o` on it opens the picker.
+    pub fn browsable(mut self) -> Self {
+        self.browses = true;
+        self
+    }
+
     fn rendered(&self) -> String {
         match &self.value {
             Value::Text(text) => text.clone(),
@@ -145,6 +157,12 @@ pub struct Hits {
     /// The whole dialogue, so a click outside it can be told from one inside.
     pub popup: Rect,
     pub fields: Vec<(Rect, usize)>,
+    /// Where `[browse]` was drawn beside the focused field, when that field
+    /// takes a path.
+    pub browse: Option<Rect>,
+    /// The picker, when it is open over the form. Present means it owns the
+    /// screen, and the fields underneath are not reachable.
+    pub browser: Option<browse::Hits>,
 }
 
 /// What the event loop should do with the form after a keystroke.
@@ -169,6 +187,10 @@ pub struct Form {
     /// this module knows nothing about the catalogue, only that the first
     /// field decides what the rest of them are.
     pub picker: bool,
+    /// The file picker, open over this form and filling one of its fields.
+    /// While it is up it takes every keystroke — including `enter`, which in
+    /// here opens a directory rather than submitting an unfinished form.
+    browser: Option<Browser>,
 }
 
 /// Which enrolment a filled-in form is.
@@ -195,6 +217,7 @@ impl Form {
             focus: 0,
             error: None,
             picker: false,
+            browser: None,
         };
         form.focus = form.visible().first().copied().unwrap_or(0);
         form
@@ -333,6 +356,9 @@ impl Form {
     }
 
     pub fn handle(&mut self, key: KeyEvent) -> Outcome {
+        if self.browser.is_some() {
+            return self.handle_browse(key);
+        }
         let visible = self.visible();
         let at = visible.iter().position(|index| *index == self.focus);
 
@@ -357,6 +383,7 @@ impl Form {
                     text.clear();
                 }
             }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.browse(),
             code => self.edit(code),
         }
 
@@ -372,6 +399,77 @@ impl Form {
         self.fields
             .get_mut(self.focus)
             .map(|field| &mut field.value)
+    }
+
+    /// Is the picker up? The console asks because the wheel and a click mean
+    /// different things over it than they do over the form.
+    pub fn browsing(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    /// Open the picker on the focused field, when that field names a file.
+    /// A no-op anywhere else: `ctrl-o` on a header name has nothing to pick.
+    pub fn browse(&mut self) {
+        let Some(field) = self.fields.get(self.focus) else {
+            return;
+        };
+        let (true, Value::Text(text)) = (field.browses, &field.value) else {
+            return;
+        };
+        self.browser = Some(Browser::open(self.focus, text));
+    }
+
+    /// A click on a row of the open picker.
+    pub fn click_browse(&mut self, at: usize, double: bool) {
+        let Some(browser) = &mut self.browser else {
+            return;
+        };
+        let picked = browser.click(at, double);
+        self.settle(picked);
+    }
+
+    /// The wheel over the open picker.
+    pub fn scroll_browse(&mut self, up: bool) {
+        if let Some(browser) = &mut self.browser {
+            browser.scroll(up);
+        }
+    }
+
+    fn handle_browse(&mut self, key: KeyEvent) -> Outcome {
+        let Some(browser) = &mut self.browser else {
+            return Outcome::Continue;
+        };
+        let picked = browser.handle(key);
+        self.settle(picked);
+        // Never `Submit`: `enter` in the picker opens a directory, and a form
+        // that saved itself halfway through choosing a file would write the
+        // credential that was there before.
+        Outcome::Continue
+    }
+
+    /// Write back whatever the picker decided, and close it if it is done.
+    fn settle(&mut self, picked: Pick) {
+        let field = match picked {
+            Pick::Continue => return,
+            Pick::Close => {
+                self.browser = None;
+                return;
+            }
+            Pick::Chose(reference) => {
+                let Some(browser) = self.browser.take() else {
+                    return;
+                };
+                if let Some(Value::Text(text)) =
+                    self.fields.get_mut(browser.field).map(|f| &mut f.value)
+                {
+                    *text = reference;
+                }
+                browser.field
+            }
+        };
+        // Back on the field that was just filled in, not wherever the form
+        // happened to be — the picker was opened from there.
+        self.focus(field);
     }
 
     fn edit(&mut self, code: KeyCode) {
@@ -458,6 +556,8 @@ impl Form {
         let mut hits = Hits {
             popup,
             fields: Vec::new(),
+            browse: None,
+            browser: None,
         };
         let lines: Vec<Line> = visible
             .iter()
@@ -466,14 +566,12 @@ impl Form {
                 // One field per line, in order, starting at the top of the
                 // field block — which is what makes the mapping back this
                 // simple.
-                hits.fields.push((
-                    Rect {
-                        y: rows[1].y.saturating_add(row as u16),
-                        height: 1,
-                        ..rows[1]
-                    },
-                    *index,
-                ));
+                let line = Rect {
+                    y: rows[1].y.saturating_add(row as u16),
+                    height: 1,
+                    ..rows[1]
+                };
+                hits.fields.push((line, *index));
                 let field = &self.fields[*index];
                 let focused = *index == self.focus;
                 let value = field.rendered();
@@ -482,7 +580,7 @@ impl Form {
                     (Value::Choice { .. }, _) => format!("◂ {value} ▸"),
                     _ => value,
                 };
-                Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         if focused { "▶ " } else { "  " },
                         Style::default().fg(Color::Cyan),
@@ -492,7 +590,7 @@ impl Form {
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
-                        shown,
+                        shown.clone(),
                         if focused {
                             Style::default()
                                 .fg(Color::White)
@@ -501,20 +599,38 @@ impl Form {
                             Style::default().fg(Color::Gray)
                         },
                     ),
-                ])
+                ];
+                // A field that names a file says so on the line, while the
+                // cursor is on it — and the words are a button, because the
+                // console has already promised that what it draws can be
+                // clicked.
+                if focused && field.browses {
+                    let before = 4 + label_width + shown.chars().count();
+                    spans.push(Span::styled(BROWSE, key_style()));
+                    if before + BROWSE.len() <= line.width as usize {
+                        hits.browse = Some(Rect {
+                            x: line.x.saturating_add(before as u16),
+                            width: BROWSE.len() as u16,
+                            ..line
+                        });
+                    }
+                }
+                Line::from(spans)
             })
             .collect();
 
         frame.render_widget(Paragraph::new(lines), rows[1]);
 
-        let hint = self
-            .fields
-            .get(self.focus)
-            .map(|field| field.hint.as_ref())
-            .unwrap_or_default();
+        let hint: Cow<'_, str> = match self.fields.get(self.focus) {
+            Some(field) if field.browses => {
+                Cow::Owned(format!("{}  —  ctrl-o to pick the file", field.hint))
+            }
+            Some(field) => Cow::Borrowed(field.hint.as_ref()),
+            None => Cow::Borrowed(""),
+        };
         let footer = match &self.error {
             Some(error) => Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red)),
-            None => Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            None => Paragraph::new(hint.as_ref()).style(Style::default().fg(Color::DarkGray)),
         };
         frame.render_widget(footer.wrap(Wrap { trim: true }), rows[2]);
 
@@ -533,11 +649,21 @@ impl Form {
             rows[3],
         );
 
+        // Last, and over everything else: while the picker is up it owns the
+        // screen, and the fields behind it are not reachable by a click.
+        if let Some(browser) = &self.browser {
+            hits.browser = Some(browser.render(frame, area));
+        }
+
         hits
     }
 }
 
-fn key_style() -> Style {
+/// What a field that names a file is offered with, and the width the hit box
+/// is worked out from. ASCII, so `len` is the column count.
+const BROWSE: &str = " browse ";
+
+pub(super) fn key_style() -> Style {
     Style::default()
         .fg(Color::Black)
         .bg(Color::Cyan)
@@ -578,7 +704,15 @@ pub fn auth_fields() -> Vec<Field> {
                 .filter(|other| AuthInput::fields_for(other).contains(key))
                 .collect();
             let (label, hint) = wording(key);
-            fields.push(Field::text(*key, label, hint).when("auth", &schemes));
+            let field = Field::text(*key, label, hint).when("auth", &schemes);
+            // Which fields the picker is offered on comes from `enroll` too,
+            // for the same reason the set of fields does: a reference is a
+            // reference wherever it is typed, and a second list here would be
+            // a second list to forget to add a scheme to.
+            fields.push(match AuthInput::is_reference(key) {
+                true => field.browsable(),
+                false => field,
+            });
         }
     }
 
@@ -761,6 +895,106 @@ mod tests {
         assert!(
             form.visible().contains(&form.focus),
             "the cursor cannot be left on a field that is no longer on screen"
+        );
+    }
+
+    /// The picker is offered where a path is a legal value and nowhere else.
+    /// A `browse` on `--header` would fill a header name with `file:/…`.
+    #[test]
+    fn the_picker_is_offered_on_the_fields_that_take_a_reference() {
+        let form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        for field in &form.fields {
+            assert_eq!(
+                field.browses,
+                AuthInput::is_reference(field.key.as_ref()),
+                "`{}`",
+                field.key
+            );
+        }
+    }
+
+    /// End to end, over the keyboard: `ctrl-o` on the secret, walk to a file,
+    /// `enter` — and the field holds the reference the config file takes.
+    #[test]
+    fn picking_a_file_fills_the_field_it_was_opened_from() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("anthropic.key"), "x").unwrap();
+
+        let mut form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        while form.text("auth") != "bearer" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        form.handle(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(form.fields[form.focus].key, "secret");
+        let on = form.focus;
+
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        for c in format!("file:{}/", dir.path().display()).chars() {
+            form.handle(KeyEvent::from(KeyCode::Char(c)));
+        }
+        form.handle(ctrl(KeyCode::Char('o')));
+        assert!(form.browsing(), "ctrl-o opens the picker");
+
+        // `enter` belongs to the picker while it is up: it opens what is under
+        // the cursor, and must not submit a form in the middle of being filled.
+        for c in "anthropic".chars() {
+            form.handle(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(matches!(
+            form.handle(KeyEvent::from(KeyCode::Enter)),
+            Outcome::Continue
+        ));
+
+        assert!(!form.browsing(), "picking closes the picker");
+        assert_eq!(form.focus, on, "and puts the cursor back where it opened");
+        assert_eq!(
+            form.text("secret"),
+            format!("file:{}", dir.path().join("anthropic.key").display())
+        );
+        assert_eq!(
+            form.auth().secret.as_deref(),
+            Some(form.text("secret").as_str())
+        );
+    }
+
+    #[test]
+    fn a_field_that_takes_no_path_has_no_picker() {
+        let mut form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        while form.text("auth") != "header" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        let at = form
+            .fields
+            .iter()
+            .position(|field| field.key == "header")
+            .unwrap();
+        form.focus(at);
+        form.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!form.browsing());
+        assert_eq!(form.text("header"), "", "and ctrl-o is not typed into it");
+    }
+
+    #[test]
+    fn leaving_the_picker_leaves_the_field_as_it_was() {
+        let mut form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        while form.text("auth") != "bearer" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        form.handle(KeyEvent::from(KeyCode::Tab));
+        for c in "env:ANTHROPIC_API_KEY".chars() {
+            form.handle(KeyEvent::from(KeyCode::Char(c)));
+        }
+        form.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(form.browsing());
+        assert!(matches!(
+            form.handle(KeyEvent::from(KeyCode::Esc)),
+            Outcome::Continue
+        ));
+        assert!(!form.browsing(), "esc closes the picker");
+        assert_eq!(
+            form.text("secret"),
+            "env:ANTHROPIC_API_KEY",
+            "and not the form, nor the reference it already held"
         );
     }
 
