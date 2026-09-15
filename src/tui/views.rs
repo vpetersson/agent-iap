@@ -280,9 +280,10 @@ pub type Verifications = HashMap<String, Verification>;
 /// reported is a fact about the row.
 fn verdict(verified: &Verifications, name: &str) -> (String, Color) {
     match verified.get(name) {
-        // Deliberately not "ok": nobody has asked, and a blank that reads as a
-        // pass is worse than no column at all.
-        None => ("not checked".to_string(), Color::DarkGray),
+        // Deliberately not a blank and deliberately not a tick: nobody has
+        // asked, and a column that reads as a pass before anyone checked is
+        // worse than no column at all. `·` lines up under the glyphs.
+        None => ("· not checked".to_string(), Color::DarkGray),
         Some(held) => held.cell(),
     }
 }

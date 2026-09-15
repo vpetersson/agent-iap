@@ -576,7 +576,9 @@ verify_path = "/accounts/3f1c…/tokens/verify"
 `verify_path` is what a verify calls when nobody passed `--path` — on the
 enrolment, on `v` in the console, and on an `upstream verify` months later. An
 explicit `--path` still wins, because that is a question about one endpoint
-rather than about the credential.
+rather than about the credential. An upstream carrying none — enrolled before
+its profile had a probe, or written by hand — falls back to the profile whose
+base URL matches it, so nothing has to be re-enrolled to become verifiable.
 
 Profiles write it for the services that have somewhere safe to send it, and
 `agent-iap profile show` says which those are:
@@ -610,8 +612,24 @@ verified without being asked — the call is real and so is the credential, so i
 happens on a flag or a keystroke and never on a timer.
 
 In the console it is `v` on the upstreams or `mcp` pane, and a switch on the add
-and edit forms that is on by default. Results land in a `VERIFIED` column beside
-the row, the way the credentials pane reports what still resolves.
+and edit forms that is on by default. The answer lands in a `VERIFIED` column
+beside the row — a glyph and two words, because a column is scanned rather than
+read:
+
+```
+NAME                   BASE URL                             VERIFIED
+dataforseo             https://api.dataforseo.com           ✓ credential ok
+google-search-console  https://searchconsole.googleapis.com ! not entitled
+semrush-v4             https://api.semrush.com/apis/v4      ✓ reachable
+posthog                https://eu.posthog.com               ✗ rejected
+linear                 https://api.linear.app               · not checked
+```
+
+`✓` passed, `!` worth a look, `✗` broken, `·` nobody has asked yet — by shape
+before colour, so the column still works for anyone who cannot tell the green
+from the red. `✓ credential ok` means the service accepted it; `✓ reachable`
+means the host answered and the credential was never put to the question. The
+sentence behind any of them is one keystroke away, in the report.
 
 ### Getting the token out
 
@@ -891,11 +909,12 @@ and a file edited into something that will not parse is reported once, with the
 proxy left running the last policy that did (§ Reloading).
 
 `v` on an upstream or an MCP server calls it, with the credential the file names,
-and puts the answer in the row's `VERIFIED` column — green, amber or red, and the
-whole report in a modal. It runs off the drawing thread, because the console
-cannot stop answering an `ask` for ten seconds while a vault wakes up. The add
-and edit forms carry the same thing as a switch, on by default, so a service
-written here reports whether it works before you look away (§ Verifying).
+and puts the answer in the row's `VERIFIED` column — a glyph and two words — with
+the whole report in a modal behind it. It runs off the drawing thread, because
+the console cannot stop answering an `ask` for ten seconds while a vault wakes
+up. The add and edit forms carry the same thing as a switch, on by default, so a
+service written here reports whether it works before you look away
+(§ Verifying).
 
 A minted token is shown once, in a modal, and then only its sha256 exists. No
 credential *value* is ever displayed: the credentials pane shows references, and
@@ -1998,7 +2017,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 438 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 442 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

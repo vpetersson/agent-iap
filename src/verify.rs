@@ -99,13 +99,36 @@ impl Outcome {
             Outcome::Failed => "FAILED",
         }
     }
+
+    /// The one character a table cell can afford. What the eye is actually
+    /// scanning a status column for is which rows are not the shape of the
+    /// others, and a glyph does that in a way a sentence cannot.
+    pub fn glyph(self) -> char {
+        match self {
+            Outcome::Passed => '✓',
+            Outcome::Warned => '!',
+            Outcome::Failed => '✗',
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Step {
     pub name: &'static str,
     pub outcome: Outcome,
+    /// The sentence, for a report somebody sat down to read.
     pub detail: String,
+    /// Two or three words, for a table cell that has no room for the sentence.
+    /// The step's own name when nothing better was given, which is already the
+    /// most useful thing a cell can say: it names the line of the full report
+    /// to go and read.
+    brief: Option<String>,
+}
+
+impl Step {
+    pub fn brief(&self) -> &str {
+        self.brief.as_deref().unwrap_or(self.name)
+    }
 }
 
 /// What one verification found, in the order it found it.
@@ -133,7 +156,22 @@ impl Report {
             name,
             outcome,
             detail: detail.into(),
+            brief: None,
         });
+    }
+
+    /// The same, with the short form a table cell gets.
+    fn noted(
+        &mut self,
+        name: &'static str,
+        outcome: Outcome,
+        brief: &str,
+        detail: impl Into<String>,
+    ) {
+        self.step(name, outcome, detail);
+        if let Some(step) = self.steps.last_mut() {
+            step.brief = Some(brief.to_string());
+        }
     }
 
     fn passed(&mut self, name: &'static str, detail: impl Into<String>) {
@@ -167,18 +205,23 @@ impl Report {
         self.verdict() != Outcome::Failed
     }
 
-    /// One line, for a footer or a table cell: the first thing that went wrong,
-    /// or — when nothing did — what the service actually said.
-    pub fn headline(&self) -> String {
+    /// Two or three words and nothing else, for the status column.
+    ///
+    /// The column exists to be glanced at. Putting the whole sentence in it was
+    /// the mistake: it ran off the side of the pane, it read as alarming when
+    /// it was not, and it buried the one bit that matters — which of these
+    /// rows is not like the others. The sentence still exists, one keystroke
+    /// away in the report.
+    pub fn brief(&self) -> &str {
         let worst = self.verdict();
         if worst != Outcome::Passed {
             if let Some(step) = self.steps.iter().find(|step| step.outcome == worst) {
-                return format!("{}: {}", step.name, step.detail);
+                return step.brief();
             }
         }
         match self.find(REACH).or_else(|| self.find(HANDSHAKE)) {
-            Some(step) => step.detail.clone(),
-            None => "ok".to_string(),
+            Some(step) => step.brief(),
+            None => "ok",
         }
     }
 }
@@ -260,11 +303,19 @@ async fn probe_upstream(
     let mut report = Report::new(&upstream.name, "upstream", &upstream.base_url);
 
     // What the caller named wins — `--path` is how you ask a question about one
-    // endpoint. Otherwise the upstream's own `verify_path`, which is the answer
-    // its profile already knew, and only then the root.
+    // endpoint. Then the upstream's own `verify_path`, which its enrolment
+    // wrote. Then the catalogue, which is what covers an upstream enrolled
+    // before its profile had a probe, or written by hand. Only then the root.
+    let inherited;
     let (probe, aim) = match options.path.as_deref().or(upstream.verify_path.as_deref()) {
         Some(probe) => (probe, Aim::Endpoint),
-        None => (ROOT, Aim::Root),
+        None => match crate::profiles::probe_for(&upstream.base_url) {
+            Some(probe) => {
+                inherited = probe;
+                (inherited.as_str(), Aim::Endpoint)
+            }
+            None => (ROOT, Aim::Root),
+        },
     };
     let (path, query) = split_query(probe);
     let url = match crate::proxy::build_url(&upstream.base_url, &path, query.as_deref()) {
@@ -326,7 +377,12 @@ async fn probe_upstream(
     {
         Ok(()) => report.passed(CREDENTIAL, describe_auth(&upstream.auth)),
         Err(error) => {
-            report.failed(CREDENTIAL, format!("{error:#}"));
+            report.noted(
+                CREDENTIAL,
+                Outcome::Failed,
+                "cannot resolve",
+                format!("{error:#}"),
+            );
             http_policy(config, &upstream.name, &mut report);
             return report;
         }
@@ -335,10 +391,10 @@ async fn probe_upstream(
     let started = Instant::now();
     match http.execute(request).await {
         Ok(response) => {
-            let (outcome, detail) = classify(&response, started.elapsed(), aim);
-            report.step(REACH, outcome, detail);
+            let (outcome, brief, detail) = classify(&response, started.elapsed(), aim);
+            report.noted(REACH, outcome, brief, detail);
         }
-        Err(error) => report.failed(REACH, describe(&error)),
+        Err(error) => report.noted(REACH, Outcome::Failed, "unreachable", describe(&error)),
     }
 
     http_policy(config, &upstream.name, &mut report);
@@ -353,7 +409,11 @@ async fn probe_upstream(
 /// an answer about the credential turns every healthy upstream amber — and a
 /// status column that is amber for a working fleet is one an operator learns
 /// within a day to stop reading, which is worse than not having it.
-fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outcome, String) {
+fn classify(
+    response: &reqwest::Response,
+    elapsed: Duration,
+    aim: Aim,
+) -> (Outcome, &'static str, String) {
     let status = response.status();
     let took = format!("in {}ms", elapsed.as_millis());
 
@@ -361,10 +421,12 @@ fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outco
         return match aim {
             Aim::Endpoint => (
                 Outcome::Passed,
+                "credential ok",
                 format!("answered {status} {took} — the credential was accepted"),
             ),
             Aim::Root => (
                 Outcome::Passed,
+                REACHABLE,
                 format!("the host answered {status} {took}{NOT_EXERCISED}"),
             ),
         };
@@ -380,6 +442,7 @@ fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outco
         // conclusion that must never be drawn from a redirect.
         return (
             Outcome::Warned,
+            "redirected",
             format!("answered {status} → {to} — the base URL may be the wrong one"),
         );
     }
@@ -389,6 +452,7 @@ fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outco
         // key, and that is worth failing on.
         (401, _) => (
             Outcome::Failed,
+            "rejected",
             format!("the service rejected the credential — {status} {took}"),
         ),
         // Authenticated and not entitled. Against a real endpoint that is a
@@ -396,6 +460,7 @@ fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outco
         // the property is exactly this shape.
         (403, Aim::Endpoint) => (
             Outcome::Warned,
+            "not entitled",
             format!(
                 "answered {status} {took} — the credential is accepted but not entitled here. \
                  Check the scopes, and that the account has been granted the resource."
@@ -405,10 +470,12 @@ fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outco
         // what the root was asked. Nothing is wrong, so nothing is amber.
         (_, Aim::Root) if status.is_client_error() => (
             Outcome::Passed,
+            REACHABLE,
             format!("the host answered {status} {took}{NOT_EXERCISED}"),
         ),
         (404 | 405, Aim::Endpoint) => (
             Outcome::Warned,
+            "no such endpoint",
             format!(
                 "answered {status} {took} for an endpoint that should exist — the base URL \
                  may be wrong, or the API has moved"
@@ -416,14 +483,21 @@ fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outco
         ),
         (429, _) => (
             Outcome::Warned,
+            "rate limited",
             format!("the service is rate-limiting this credential — {status} {took}"),
         ),
         _ => (
             Outcome::Warned,
+            "http error",
             format!("the service answered {status} {took}"),
         ),
     }
 }
+
+/// What the column says for a root probe that came back clean. Deliberately
+/// not "ok": the host is there and the credential is untested, and those are
+/// different claims.
+const REACHABLE: &str = "reachable";
 
 /// The sentence a root probe owes the reader. Without it a pass here would
 /// imply the report proved something it never went near.
@@ -542,14 +616,20 @@ async fn probe_mcp_http(
                 answer
             }
             Err(refused) => {
-                report.failed(refused.at, refused.why);
+                let brief = match refused.at {
+                    CREDENTIAL => "cannot resolve",
+                    _ => "unreachable",
+                };
+                report.noted(refused.at, Outcome::Failed, brief, refused.why);
                 return;
             }
         };
 
     match rpc_result(&body, 1) {
-        Some(Ok(result)) => report.passed(
+        Some(Ok(result)) => report.noted(
             HANDSHAKE,
+            Outcome::Passed,
+            "session ok",
             format!(
                 "{} in {}ms",
                 describe_server(&result),
@@ -557,8 +637,10 @@ async fn probe_mcp_http(
             ),
         ),
         other => {
-            report.failed(
+            report.noted(
                 HANDSHAKE,
+                Outcome::Failed,
+                "no session",
                 match (status.as_u16(), other) {
                     (401 | 403, _) => format!("the server rejected the credential — {status}"),
                     (_, Some(Err(error))) => format!("the server refused `initialize`: {error}"),
@@ -595,7 +677,12 @@ async fn probe_mcp_http(
     .await
     {
         Ok((_, _, body)) => match rpc_result(&body, 2) {
-            Some(Ok(result)) => report.passed(TOOLS, describe_tools(&result)),
+            Some(Ok(result)) => report.noted(
+                TOOLS,
+                Outcome::Passed,
+                &count_tools(&result),
+                describe_tools(&result),
+            ),
             Some(Err(error)) => report.warned(
                 TOOLS,
                 format!("the handshake worked, but `tools/list` returned an error: {error}"),
@@ -635,7 +722,12 @@ async fn probe_mcp_stdio(
             env
         }
         Err(error) => {
-            report.failed(CREDENTIAL, format!("{error:#}"));
+            report.noted(
+                CREDENTIAL,
+                Outcome::Failed,
+                "cannot resolve",
+                format!("{error:#}"),
+            );
             return;
         }
     };
@@ -657,8 +749,10 @@ async fn probe_mcp_stdio(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            report.failed(
+            report.noted(
                 HANDSHAKE,
+                Outcome::Failed,
+                "no session",
                 format!("could not spawn `{command_name}`: {error}"),
             );
             return;
@@ -702,8 +796,10 @@ async fn probe_mcp_stdio(
 
     match answered {
         Ok(Ok(Some(Ok(result)))) => {
-            report.passed(
+            report.noted(
                 HANDSHAKE,
+                Outcome::Passed,
+                "session ok",
                 format!(
                     "{} in {}ms",
                     describe_server(&result),
@@ -713,7 +809,12 @@ async fn probe_mcp_stdio(
             let asking = [initialized_notification(), tools_request()];
             let tools = exchange(&mut stdin, &mut lines, &asking, 2);
             match tokio::time::timeout(options.timeout, tools).await {
-                Ok(Ok(Some(Ok(result)))) => report.passed(TOOLS, describe_tools(&result)),
+                Ok(Ok(Some(Ok(result)))) => report.noted(
+                    TOOLS,
+                    Outcome::Passed,
+                    &count_tools(&result),
+                    describe_tools(&result),
+                ),
                 Ok(Ok(Some(Err(error)))) => report.warned(
                     TOOLS,
                     format!("the handshake worked, but `tools/list` returned an error: {error}"),
@@ -724,23 +825,31 @@ async fn probe_mcp_stdio(
                 ),
             }
         }
-        Ok(Ok(Some(Err(error)))) => report.failed(
+        Ok(Ok(Some(Err(error)))) => report.noted(
             HANDSHAKE,
+            Outcome::Failed,
+            "no session",
             format!("`{command_name}` refused `initialize`: {error}"),
         ),
-        Ok(Ok(None)) => report.failed(
+        Ok(Ok(None)) => report.noted(
             HANDSHAKE,
+            Outcome::Failed,
+            "no session",
             format!(
                 "`{command_name}` exited without answering `initialize`{}",
                 said()
             ),
         ),
-        Ok(Err(error)) => report.failed(
+        Ok(Err(error)) => report.noted(
             HANDSHAKE,
+            Outcome::Failed,
+            "no session",
             format!("talking to `{command_name}`: {error:#}{}", said()),
         ),
-        Err(_) => report.failed(
+        Err(_) => report.noted(
             HANDSHAKE,
+            Outcome::Failed,
+            "no session",
             format!(
                 "`{command_name}` did not answer `initialize` within {}s{}",
                 options.timeout.as_secs(),
@@ -796,13 +905,13 @@ struct Refused {
 /// the credential resolves, the host answers, and every agent call is denied by
 /// `<default>` with no rule to point at.
 fn http_policy(config: &Config, name: &str, report: &mut Report) {
-    let (outcome, detail) = reachability(
+    let (outcome, brief, detail) = reachability(
         config,
         name,
         "http",
         &format!("agent-iap acl add --kind http --target {name} --methods GET --paths '/**'"),
     );
-    report.step(POLICY, outcome, detail);
+    report.noted(POLICY, outcome, brief, detail);
 }
 
 fn mcp_policy(config: &Config, server: &McpServerConfig, report: &mut Report) {
@@ -810,8 +919,10 @@ fn mcp_policy(config: &Config, server: &McpServerConfig, report: &mut Report) {
     // are the case that looks configured and is not. Worded for one line rather
     // than reusing `check`'s paragraph, which is laid out to be read as a block.
     if mcp_handshake_warning(config, server).is_some() {
-        report.warned(
+        report.noted(
             POLICY,
+            Outcome::Warned,
+            "no initialize rule",
             format!(
                 "rules reach it, but none admits `initialize` — the handshake will be denied \
                  by `<default>` and the agent will see a server that never starts. Add a \
@@ -828,11 +939,16 @@ fn mcp_policy(config: &Config, server: &McpServerConfig, report: &mut Report) {
         server.name,
         session_methods()
     );
-    let (outcome, detail) = reachability(config, &server.name, "mcp", &fix);
-    report.step(POLICY, outcome, detail);
+    let (outcome, brief, detail) = reachability(config, &server.name, "mcp", &fix);
+    report.noted(POLICY, outcome, brief, detail);
 }
 
-fn reachability(config: &Config, name: &str, kind: &str, fix: &str) -> (Outcome, String) {
+fn reachability(
+    config: &Config,
+    name: &str,
+    kind: &str,
+    fix: &str,
+) -> (Outcome, &'static str, String) {
     let now = chrono::Utc::now();
     let reaching: Vec<(usize, &AclRuleConfig)> = config
         .acl
@@ -854,6 +970,7 @@ fn reachability(config: &Config, name: &str, kind: &str, fix: &str) -> (Outcome,
     if !admitting.is_empty() {
         return (
             Outcome::Passed,
+            "reachable by acl",
             format!(
                 "reached by {}: {}",
                 plural(admitting.len()),
@@ -864,6 +981,7 @@ fn reachability(config: &Config, name: &str, kind: &str, fix: &str) -> (Outcome,
     if config.acl_default.action != Action::Deny {
         return (
             Outcome::Passed,
+            "acl default",
             format!(
                 "no rule names it, but the ACL default is `{}`",
                 config.acl_default.action
@@ -876,6 +994,7 @@ fn reachability(config: &Config, name: &str, kind: &str, fix: &str) -> (Outcome,
     };
     (
         Outcome::Warned,
+        "no acl rule",
         format!("{had} — agent calls will be denied by `<default>`. Add one: {fix}"),
     )
 }
@@ -1130,8 +1249,17 @@ fn describe_server(result: &Value) -> String {
     format!("{name}{version}, speaking MCP {protocol}")
 }
 
-fn describe_tools(result: &Value) -> String {
-    let tools: Vec<&str> = result
+/// `12 tools`, for a cell. The names belong in the report, not the column.
+fn count_tools(result: &Value) -> String {
+    match tool_names(result).len() {
+        0 => "no tools".to_string(),
+        1 => "1 tool".to_string(),
+        many => format!("{many} tools"),
+    }
+}
+
+fn tool_names(result: &Value) -> Vec<&str> {
+    result
         .get("tools")
         .and_then(Value::as_array)
         .map(|tools| {
@@ -1140,7 +1268,11 @@ fn describe_tools(result: &Value) -> String {
                 .filter_map(|tool| tool.get("name").and_then(Value::as_str))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn describe_tools(result: &Value) -> String {
+    let tools = tool_names(result);
     match tools.len() {
         0 => "the server offers no tools".to_string(),
         count => {
@@ -1251,20 +1383,20 @@ mod tests {
     #[test]
     fn a_root_probe_says_what_it_did_not_prove() {
         for status in [200, 404] {
-            let (outcome, detail) =
+            let (outcome, _, detail) =
                 classify(&response(status, &[]), Duration::from_millis(1), Aim::Root);
             assert_eq!(outcome, Outcome::Passed);
             assert!(detail.contains("not exercised"), "{detail}");
             assert!(detail.contains("--path"), "{detail}");
         }
-        let (_, detail) = classify(&response(200, &[]), Duration::from_millis(1), Aim::Endpoint);
+        let (_, _, detail) = classify(&response(200, &[]), Duration::from_millis(1), Aim::Endpoint);
         assert!(detail.contains("credential was accepted"), "{detail}");
         assert!(!detail.contains("not exercised"), "{detail}");
     }
 
     #[test]
     fn a_redirect_is_reported_rather_than_followed() {
-        let (outcome, detail) = classify(
+        let (outcome, _, detail) = classify(
             &response(302, &[("location", "https://login.example.com/")]),
             Duration::from_millis(1),
             Aim::Root,
@@ -1279,8 +1411,8 @@ mod tests {
     /// The suggestion only makes sense when nobody has taken it yet.
     #[test]
     fn a_404_stops_suggesting_a_path_once_one_was_given() {
-        let asked = classify(&response(404, &[]), Duration::from_millis(1), Aim::Endpoint).1;
-        let unasked = classify(&response(404, &[]), Duration::from_millis(1), Aim::Root).1;
+        let asked = classify(&response(404, &[]), Duration::from_millis(1), Aim::Endpoint).2;
+        let unasked = classify(&response(404, &[]), Duration::from_millis(1), Aim::Root).2;
         assert!(!asked.contains("--path"), "{asked}");
         assert!(unasked.contains("--path"), "{unasked}");
     }
@@ -1332,7 +1464,7 @@ base_url = "https://api.github.com"
     #[test]
     fn an_upstream_nothing_reaches_is_a_warning_and_one_with_a_rule_is_not() {
         let bare = config(UPSTREAM);
-        let (outcome, detail) = reachability(&bare, "github", "http", "…");
+        let (outcome, _, detail) = reachability(&bare, "github", "http", "…");
         assert_eq!(outcome, Outcome::Warned);
         assert!(detail.contains("<default>"), "{detail}");
 
@@ -1345,7 +1477,7 @@ target = "gith*"
 action = "allow"
 "#
         ));
-        let (outcome, detail) = reachability(&allowed, "github", "http", "…");
+        let (outcome, _, detail) = reachability(&allowed, "github", "http", "…");
         assert_eq!(outcome, Outcome::Passed);
         assert!(detail.contains("github-reads"), "{detail}");
     }
@@ -1387,7 +1519,7 @@ target = "github"
 action = "ask"
 "#
         ));
-        let (outcome, detail) = reachability(&config, "github", "http", "…");
+        let (outcome, _, detail) = reachability(&config, "github", "http", "…");
         assert_eq!(outcome, Outcome::Passed);
         // Unnamed rules are numbered the way `agent-iap list` numbers them.
         assert!(detail.contains("acl[0]"), "{detail}");
@@ -1420,25 +1552,97 @@ command = "server"
     }
 
     #[test]
-    fn a_verdict_is_the_worst_step_and_the_headline_is_what_it_says() {
+    fn a_verdict_is_the_worst_step_whatever_order_they_arrived_in() {
         let mut report = Report::new("github", "upstream", "https://api.github.com");
         report.passed(ENDPOINT, "GET https://api.github.com/");
         report.passed(REACH, "answered 200 OK in 9ms");
         assert_eq!(report.verdict(), Outcome::Passed);
         assert!(report.ok());
-        // Nothing wrong, so the headline is the thing the caller wanted to
-        // know: what the service actually said.
-        assert_eq!(report.headline(), "answered 200 OK in 9ms");
 
         report.warned(POLICY, "no ACL rule reaches it");
         assert_eq!(report.verdict(), Outcome::Warned);
         assert!(report.ok(), "a warning is not a failure");
-        assert_eq!(report.headline(), "policy: no ACL rule reaches it");
 
         report.failed(CREDENTIAL, "env:NOPE is not set");
         assert_eq!(report.verdict(), Outcome::Failed);
         assert!(!report.ok());
-        assert_eq!(report.headline(), "credential: env:NOPE is not set");
+
+        // And a pass arriving after the failure does not undo it.
+        report.passed(TOOLS, "3 tools");
+        assert_eq!(report.verdict(), Outcome::Failed);
+    }
+
+    /// What the status column says, for every shape of report. The rule it has
+    /// to keep: short enough to sit in a table cell beside four other columns.
+    #[test]
+    fn the_short_form_stays_short_and_never_repeats_the_sentence() {
+        let mut report = Report::new("api", "upstream", "https://api.example.com");
+        report.noted(ENDPOINT, Outcome::Passed, "endpoint", "GET https://…/user");
+        report.noted(
+            REACH,
+            Outcome::Passed,
+            "credential ok",
+            "answered 200 OK in 9ms — the credential was accepted",
+        );
+        report.noted(
+            POLICY,
+            Outcome::Passed,
+            "reachable by acl",
+            "reached by 1 rule: api-reads",
+        );
+        assert_eq!(report.verdict(), Outcome::Passed);
+        // The network result, not the last step: "reachable by acl" is true and
+        // is not what somebody scanning this column wants to know.
+        assert_eq!(report.brief(), "credential ok");
+
+        report.noted(
+            POLICY,
+            Outcome::Warned,
+            "no acl rule",
+            "no ACL rule reaches it — agent calls will be denied by `<default>`. Add one: …",
+        );
+        assert_eq!(report.brief(), "no acl rule");
+
+        report.noted(
+            CREDENTIAL,
+            Outcome::Failed,
+            "cannot resolve",
+            "environment variable `NOPE` is not set",
+        );
+        assert_eq!(report.brief(), "cannot resolve");
+
+        for step in &report.steps {
+            assert!(
+                step.brief().chars().count() <= 18,
+                "`{}` is too long for a cell",
+                step.brief()
+            );
+            assert!(!step.brief().contains('.'), "a cell is not a sentence");
+        }
+    }
+
+    /// A step nobody gave a short form to still says something useful: its own
+    /// name, which points at the line of the report to go and read.
+    #[test]
+    fn a_step_without_a_short_form_falls_back_to_its_name() {
+        let mut report = Report::new("api", "upstream", "https://api.example.com");
+        report.failed(ENDPOINT, "`nonsense` is not a URL");
+        assert_eq!(report.brief(), ENDPOINT);
+    }
+
+    /// Every outcome has a glyph, and no two share one — the column is read by
+    /// shape before it is read by colour, which is also what makes it work for
+    /// anyone who cannot tell the red from the green.
+    #[test]
+    fn each_outcome_has_its_own_glyph() {
+        let glyphs: Vec<char> = [Outcome::Passed, Outcome::Warned, Outcome::Failed]
+            .iter()
+            .map(|outcome| outcome.glyph())
+            .collect();
+        assert_eq!(glyphs.len(), 3);
+        for (at, glyph) in glyphs.iter().enumerate() {
+            assert!(!glyphs[at + 1..].contains(glyph), "`{glyph}` is used twice");
+        }
     }
 
     #[test]

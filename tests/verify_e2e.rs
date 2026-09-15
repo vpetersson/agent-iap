@@ -178,11 +178,8 @@ auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_
     // Named as a rejection rather than as "something went wrong", because the
     // two have entirely different fixes.
     assert!(detail(&report, "reach").contains("rejected the credential"));
-    assert!(
-        report.headline().starts_with("reach:"),
-        "{}",
-        report.headline()
-    );
+    // And the status column names it in two words rather than a sentence.
+    assert_eq!(report.brief(), "rejected");
 }
 
 /// A reference that does not resolve stops the report before the call — there
