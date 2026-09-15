@@ -1708,6 +1708,13 @@ fn add_agent(
     } else {
         println!("It may address: {}.", targets.join(", "));
     }
+    // What to hand over, at the moment the operator is deciding what else to
+    // write into the agent's environment: the token and the address are the
+    // whole handover, because the proxy explains itself to whoever holds one.
+    println!(
+        "\nGive it the token and the proxy's address and it can work out the rest —\n\
+         `GET /` there answers with what this agent may reach and how to call it."
+    );
     // An agent with no rule matching it is the quiet failure: the file is
     // valid, the token works, and every call it makes is denied.
     if enroll::rule_count(path)? == 0 {

@@ -45,6 +45,7 @@ pub mod audit;
 pub mod clipboard;
 pub mod config;
 pub mod credentials;
+pub mod discovery;
 pub mod enroll;
 pub mod gate;
 pub mod gateway;

@@ -218,10 +218,9 @@ impl AuthFailure {
 
     pub fn message(&self) -> String {
         match self {
-            AuthFailure::Missing => {
-                "no agent token — send `Authorization: Bearer <iap-token>` or `X-IAP-Token`"
-                    .to_string()
-            }
+            AuthFailure::Missing => "no agent token — send `Authorization: Bearer <iap-token>` or \
+                 `X-IAP-Token`, then `GET /` for what this proxy is and how to call it"
+                .to_string(),
             AuthFailure::UnknownAgent => "the agent token is not recognised".to_string(),
             AuthFailure::WorkloadRequired => {
                 "this proxy takes workload tokens on the data plane — exchange the agent \

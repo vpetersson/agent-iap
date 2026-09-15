@@ -104,7 +104,7 @@ pub fn find(state: &AppState, agent: &AgentConfig, wanted: &str) -> Option<Skill
 /// "Could" is the `targets` list plus the existence of a rule that can name the
 /// target. A target no rule ever mentions falls through to a default that
 /// denies, so listing it would advertise a call that cannot succeed.
-fn reachable_upstreams(
+pub(crate) fn reachable_upstreams(
     state: &AppState,
     agent: &AgentConfig,
 ) -> Vec<crate::config::UpstreamConfig> {
@@ -231,7 +231,7 @@ fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
         None => text.push_str("This upstream is no longer in the policy file.\n\n"),
     }
 
-    text.push_str(&rules_table(state, agent, name));
+    text.push_str(&rules_table(state, agent, name, "##"));
 
     Skill {
         uri: format!("{SCHEME}{}", skill_name_for(name)),
@@ -245,8 +245,17 @@ fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
 /// The rules that can match this agent against this target, in the order the
 /// ACL walks them — because first match wins, and a table in any other order
 /// would describe a policy nobody is running.
-fn rules_table(state: &AppState, agent: &AgentConfig, target: &str) -> String {
-    let mut text = String::from("## Rules that apply to you, in order\n\n");
+///
+/// `heading` is the caller's level for the table's own heading: this reads at
+/// `##` inside a document about one upstream, and deeper inside one that covers
+/// several.
+pub(crate) fn rules_table(
+    state: &AppState,
+    agent: &AgentConfig,
+    target: &str,
+    heading: &str,
+) -> String {
+    let mut text = format!("{heading} Rules that apply to you, in order\n\n");
     let mut any = false;
 
     for index in state.acl.rule_indices_for_agent(&agent.id) {
