@@ -2325,6 +2325,17 @@ fn show_profile(id: &str) -> Result<()> {
         "credential  {}\n            create one at {}",
         profile.credential.about, profile.credential.url
     );
+    // What `verify` will do with this enrolment, before it is made. The absence
+    // is as worth printing as the presence: it is the difference between a
+    // check that proves the credential and one that proves DNS.
+    match &profile.probe {
+        Some(probe) => println!("verify      GET {probe}"),
+        None => println!(
+            "verify      nothing cheap and safe on file — `upstream verify` will reach \
+             this service\n            without exercising the credential unless you pass \
+             --path"
+        ),
+    }
 
     if !profile.vars.is_empty() {
         println!("\nVARIABLES");

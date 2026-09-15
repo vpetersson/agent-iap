@@ -542,12 +542,28 @@ default is deny. For an MCP server it also catches the narrower version: rules
 that scope `tools/call` and never admit `initialize`, so the session never opens
 and the agent sees a server that never starts.
 
-A 401 is a failure. A 404 on a base URL is not — it says the host is real and
-says nothing about the credential, which is why `--path` is worth giving. A
-redirect is reported rather than followed, since a 302 to a login page reads as
-a 200 to anything that follows it. Exit status is zero unless something failed.
+Where the probe was aimed is what decides what its answer is worth, so the
+verdicts split on it:
 
-Giving it every time is the part nobody remembers, so an upstream can carry the
+- **A 401 fails, wherever it was aimed.** The service looked at this credential
+  and said no; being pointed at the root does not soften that.
+- **Any other 4xx from the root passes**, reported as *reachable, credential not
+  exercised*. Almost no API serves anything at its root, so that 404 proves the
+  host is real and proves nothing else — and it must not be dressed up as
+  proving more. The earlier version of this called it a warning, which turned
+  every healthy upstream amber; a status column that is amber for a working
+  fleet is one you stop reading, and then it is worse than not being there.
+- **A 404 from a real endpoint warns.** Something that should have been there
+  was not: the base URL is wrong, or the API moved.
+- **A 403 from a real endpoint warns** — accepted but not entitled, which is
+  usually a missing scope or an account that was never granted the resource.
+
+A redirect is reported rather than followed, since a 302 to a login page reads
+as a 200 to anything that follows it. Exit status is zero unless something
+failed.
+
+The way to get a conclusive answer is to aim at something real, and giving
+`--path` every time is the part nobody remembers — so an upstream can carry the
 answer:
 
 ```toml
@@ -558,11 +574,27 @@ verify_path = "/accounts/3f1c…/tokens/verify"
 ```
 
 `verify_path` is what a verify calls when nobody passed `--path` — on the
-enrolment, on `v` in the console, and on an `upstream verify` months later.
-Profiles write it for the services whose vendor documents an endpoint for the
-purpose: Cloudflare's `/accounts/<id>/tokens/verify`, DataForSEO's
-`/v3/appendix/user_data`. An explicit `--path` still wins, because that is a
-question about one endpoint rather than about the credential.
+enrolment, on `v` in the console, and on an `upstream verify` months later. An
+explicit `--path` still wins, because that is a question about one endpoint
+rather than about the credential.
+
+Profiles write it for the services that have somewhere safe to send it, and
+`agent-iap profile show` says which those are:
+
+```
+verify      GET /webmasters/v3/sites
+verify      nothing cheap and safe on file — `upstream verify` will reach this
+            service without exercising the credential unless you pass --path
+```
+
+An endpoint earns that line by being a **GET**, being **free**, and having **no
+side effect** — a verify runs on a keystroke and after every `--verify`
+enrolment, so a probe that bills a unit or writes something is far worse than no
+probe at all. Several vendors have nothing that qualifies: the GA4 Data API is
+POST-only, Semrush bills per call, Slack answers `200 OK` with `"ok": false` in
+the body so status codes cannot speak for it. Those are left blank on purpose.
+There is no shame in an inconclusive verification; there is real harm in a
+confident wrong one.
 
 `--verify` runs the same thing as the last step of an enrolment:
 
@@ -1966,7 +1998,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 425 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 438 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
