@@ -60,6 +60,12 @@ pub enum AuthTemplate {
     BasicSecretUser {
         password: String,
     },
+    /// The credential goes in the query string, because the vendor takes it
+    /// nowhere else — Semrush's v3 `?key=`. Worth naming as its own template so
+    /// nobody reaches for `Bearer` and gets a 401 that says nothing.
+    Query {
+        param: String,
+    },
     /// Google and anything else doing RFC 7523. Scopes come from the access
     /// level, because "read" and "write" are different scopes, not just
     /// different paths.
@@ -535,6 +541,10 @@ fn build_auth(
             username: None,
             username_secret: Some(secret.to_string()),
             secret: format!("literal:{password}"),
+        },
+        AuthTemplate::Query { param } => AuthSpec::Query {
+            param,
+            secret: secret.to_string(),
         },
         AuthTemplate::ServiceAccountJwt => AuthSpec::ServiceAccountJwt {
             key_file: Some(secret.to_string()),
@@ -1255,6 +1265,232 @@ pub fn catalog() -> Vec<Profile> {
                  credential is the *user* field. This profile puts it in `username_secret`, \
                  so the token stays a reference and the policy file stays committable. \
                  A session token works the same way with `session` as the password."
+                    .into(),
+            ),
+        },
+        // ---------------- Semrush ----------------
+        Profile {
+            id: "semrush".into(),
+            title: "Semrush API (v3)".into(),
+            vendor: "Semrush".into(),
+            summary: "Domain, keyword and backlink reports, Trends traffic data, and Projects."
+                .into(),
+            default_name: "semrush".into(),
+            credential: Credential {
+                about: "the v3 API key — a different key from the v4 one, and not \
+                        interchangeable with it"
+                    .into(),
+                url: "https://www.semrush.com/accounts/api-keys/active".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.semrush.com".into(),
+                // v3 takes the key nowhere but the query string. The proxy
+                // appends it on the way out, which is the only reason an agent
+                // can call this API without ever holding the key — a scheme
+                // that would otherwise put the credential in every URL the
+                // agent writes, and every log that URL passes through.
+                auth: AuthTemplate::Query {
+                    param: "key".into(),
+                },
+            },
+            access: vec![
+                access(
+                    "read",
+                    "every report: analytics, backlinks, Trends, and Projects reads",
+                    &[],
+                    vec![rule(
+                        "reads",
+                        &["GET"],
+                        &[
+                            // The SEO/analytics reports are all one path with a
+                            // `type=` parameter — `/?type=domain_ranks`. There
+                            // is nothing else at the root.
+                            "/",
+                            // Backlinks v3, documented with the trailing slash;
+                            // both spellings reach the same handler.
+                            "/analytics/v1",
+                            "/analytics/v1/**",
+                            // Trends: `/analytics/ta/api/v3/summary` and friends.
+                            "/analytics/ta/api/**",
+                            // Position Tracking and Site Audit reads.
+                            "/management/v1/**",
+                        ],
+                        "allow",
+                    )],
+                ),
+                access(
+                    "ask-writes",
+                    "reads allowed, Projects mutations prompt, DELETE denied",
+                    &[],
+                    vec![
+                        rule(
+                            "reads",
+                            &["GET"],
+                            &[
+                                "/",
+                                "/analytics/v1",
+                                "/analytics/v1/**",
+                                "/analytics/ta/api/**",
+                                "/management/v1/**",
+                            ],
+                            "allow",
+                        ),
+                        rule("deletes", &["DELETE"], &["/management/v1/**"], "deny"),
+                        rule("writes", &["*"], &["/management/v1/**"], "ask"),
+                    ],
+                ),
+                access(
+                    "write",
+                    "the reads, plus every method on the Projects API",
+                    &[],
+                    vec![
+                        rule(
+                            "reads",
+                            &["GET"],
+                            &[
+                                "/",
+                                "/analytics/v1",
+                                "/analytics/v1/**",
+                                "/analytics/ta/api/**",
+                                "/management/v1/**",
+                            ],
+                            "allow",
+                        ),
+                        // Projects is the only part of v3 that mutates
+                        // anything: creating a campaign, launching a crawl,
+                        // adding tracked keywords. The report surface is GET
+                        // and stays GET at every level.
+                        rule("projects", &["*"], &["/management/v1/**"], "allow"),
+                    ],
+                ),
+            ],
+            note: Some(
+                "Semrush v3 authenticates with `?key=` in the query string, so this profile \
+                 enrols it as `query` auth and the proxy appends the key on the way out — \
+                 the agent's own URLs never carry it. Two things the ACL cannot do here: \
+                 every analytics report lives at the same path (`/?type=domain_ranks`), so \
+                 rules cannot tell one report from another, and every report bills API \
+                 units, which no method or path reveals — `agent-iap audit tail --target \
+                 semrush` is the per-agent spend trail. The unit-balance endpoints are not \
+                 reachable through this upstream: one is on `www.semrush.com` and the other \
+                 wants the key as a path segment. The v4 surface is a separate key and a \
+                 separate profile (`semrush-v4`)."
+                    .into(),
+            ),
+        },
+        Profile {
+            id: "semrush-v4".into(),
+            title: "Semrush API (v4)".into(),
+            vendor: "Semrush".into(),
+            summary: "Backlinks, Projects and the Local APIs — listings, reviews, map rank."
+                .into(),
+            default_name: "semrush-v4".into(),
+            credential: Credential {
+                about: "a v4 API key, with its own permissions and expiry; shown once when \
+                        you create it"
+                    .into(),
+                url: "https://www.semrush.com/accounts/api-keys/active".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.semrush.com/apis/v4".into(),
+                auth: AuthTemplate::Header {
+                    header: "authorization".into(),
+                    // `Apikey`, not `Bearer` — Semrush rejects the latter.
+                    prefix: Some("Apikey ".into()),
+                },
+            },
+            access: vec![
+                access(
+                    "read",
+                    "GET across every v4 API",
+                    &[],
+                    vec![rule("reads", &["GET"], &["/**"], "allow")],
+                ),
+                access(
+                    "ask-writes",
+                    "reads allowed, writes prompt, DELETE denied outright",
+                    &[],
+                    vec![
+                        rule("reads", &["GET"], &["/**"], "allow"),
+                        rule("deletes", &["DELETE"], &["/**"], "deny"),
+                        rule("writes", &["POST", "PUT", "PATCH"], &["/**"], "ask"),
+                    ],
+                ),
+                access(
+                    "write",
+                    "every method across every v4 API",
+                    &[],
+                    vec![rule("all", &["*"], &["/**"], "allow")],
+                ),
+            ],
+            note: Some(
+                "v4 keys are separate from the v3 key and the two are not interchangeable, \
+                 so a working `semrush` upstream tells you nothing about this one. Unlike \
+                 v3, a v4 key carries its own permissions and expiry — set them narrow at \
+                 Semrush as well, since that limit holds even where the ACL is wide. The \
+                 Local APIs write: `ask-writes` is the level to start from if listings or \
+                 reviews are in scope."
+                    .into(),
+            ),
+        },
+        Profile {
+            id: "semrush-mcp".into(),
+            title: "Semrush MCP server".into(),
+            vendor: "Semrush".into(),
+            summary: "Semrush's hosted MCP server: discover a report, then run it.".into(),
+            default_name: "semrush-mcp".into(),
+            credential: Credential {
+                about: "a v4 API key — the server's OAuth flow is the alternative, and the \
+                        one the proxy cannot hold"
+                    .into(),
+                url: "https://www.semrush.com/accounts/api-keys/active".into(),
+            },
+            vars: vec![],
+            service: Service::McpHttp {
+                url: "https://mcp.semrush.com/v2/mcp".into(),
+                auth: AuthTemplate::Header {
+                    header: "authorization".into(),
+                    prefix: Some("Apikey ".into()),
+                },
+            },
+            access: vec![
+                access(
+                    "read",
+                    "every tool: the surface is read-only, and only bills",
+                    &[],
+                    vec![rule("tools", &["tools/call"], &["**"], "allow")],
+                ),
+                access(
+                    "discovery",
+                    "browsing the catalog is free; running a report prompts",
+                    &[],
+                    vec![
+                        // Unusually for an MCP server, the tool that costs
+                        // money is the one you can name: `execute_report` runs
+                        // the report and bills for it, and everything else only
+                        // describes what is available.
+                        rule("run", &["tools/call"], &["execute_report"], "ask"),
+                        rule("catalog", &["tools/call"], &["**"], "allow"),
+                    ],
+                ),
+                access(
+                    "ask",
+                    "prompt for every tool call",
+                    &[],
+                    vec![rule("tools", &["tools/call"], &["**"], "ask")],
+                ),
+            ],
+            note: Some(
+                "This server prefers OAuth, which would put the grant in the agent's own \
+                 client rather than in the proxy; the profile uses the API-key header \
+                 instead, so the credential stays on this side of the boundary. The tools \
+                 are two-step — a discovery tool names a report, `get_report_schema` gives \
+                 its parameters, `execute_report` runs it — and only the last one bills, \
+                 which is what the `discovery` level is for. Everything reachable here is a \
+                 read: the MCP server exposes the SEO and Trends APIs plus the read-only \
+                 Projects methods, and nothing that mutates."
                     .into(),
             ),
         },
