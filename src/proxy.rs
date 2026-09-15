@@ -49,6 +49,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // agent-iap's own MCP server. Same reserved prefix, and mounted before the
         // fallback so it is a route rather than an upstream called `_iap`.
         .merge(crate::gateway::routes(Arc::clone(&state)))
+        // Zero state: the root, and the skill documents it points at. An agent
+        // given nothing but this address and a token starts here — without it,
+        // `GET /` is a 404 naming no upstream, which is no way in at all.
+        .merge(crate::discovery::routes(Arc::clone(&state)))
         .fallback(handle)
         .with_state(state)
 }
@@ -137,7 +141,8 @@ async fn proxy(
         Rejection::new(
             StatusCode::UNAUTHORIZED,
             "missing_credentials",
-            "no agent token — send `Authorization: Bearer <iap-token>` or `X-IAP-Token`",
+            "no agent token — send `Authorization: Bearer <iap-token>` or `X-IAP-Token`, \
+             then `GET /` for what this proxy is and how to call it",
         )
         .with_record(record)
     })?;
@@ -172,7 +177,11 @@ async fn proxy(
         Rejection::new(
             StatusCode::NOT_FOUND,
             "no_route",
-            "no upstream in the request — use `/<upstream>/<path>` or set `X-IAP-Upstream`",
+            format!(
+                "no upstream in the request — use `/<upstream>/<path>` or set \
+                 `X-IAP-Upstream`. {}",
+                reachable_hint(&state, agent)
+            ),
         )
         .with_record(record)
     })?;
@@ -208,7 +217,10 @@ async fn proxy(
         Rejection::new(
             StatusCode::NOT_FOUND,
             "unknown_upstream",
-            format!("`{upstream_name}` is not a configured upstream"),
+            format!(
+                "`{upstream_name}` is not an upstream this proxy fronts. {}",
+                reachable_hint(&state, agent)
+            ),
         )
         .with_record(record)
     })?;
@@ -325,6 +337,27 @@ async fn proxy(
     })?;
 
     Ok(build_response(response))
+}
+
+/// What to say to an agent that guessed at a name, or sent none.
+///
+/// The upstreams are the ones *this* agent could actually reach, which is the
+/// same set `GET /` would list for it — a refusal that names them turns a guess
+/// into one working call instead of a sweep through the namespace.
+fn reachable_hint(state: &AppState, agent: &crate::config::AgentConfig) -> String {
+    let names: Vec<String> = crate::skills::reachable_upstreams(state, agent)
+        .iter()
+        .map(|upstream| format!("`{}`", upstream.name))
+        .collect();
+    match names.is_empty() {
+        true => "This agent is granted no upstream that any rule allows; `GET /` \
+                 explains what that means."
+            .to_string(),
+        false => format!(
+            "Reachable from here: {}. `GET /` describes each of them.",
+            names.join(", ")
+        ),
+    }
 }
 
 pub(crate) fn extract_token(headers: &HeaderMap) -> Option<String> {

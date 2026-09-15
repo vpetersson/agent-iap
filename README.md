@@ -268,6 +268,15 @@ policy itself. See § MCP:
     "headers": { "Authorization": "Bearer iap_..." } } } }
 ```
 
+Or hand it the address and the token and nothing else. `GET /` on the proxy
+answers with what that agent can reach and how to call it, generated from the
+policy — see [§ Zero state](#zero-state):
+
+```bash
+export IAP_TOKEN=iap_...
+export IAP_URL=http://127.0.0.1:8080
+```
+
 `init` writes the proxy and nothing else, on purpose: a starter file that
 guesses at an upstream is a file you have to read before you can trust it, and a
 token minted for an agent you may never create is a live credential sitting in
@@ -1644,6 +1653,90 @@ The MCP bridge does this on its own: when the daemon reports `workload_identity`
 on `/health`, `agent-iap mcp --server github` exchanges its agent token for one
 scoped to `github` alone, renews it two minutes before it lapses, and keeps the
 agent token for nothing but asking again.
+
+## Zero state
+
+An agent handed a token and an address has everything it needs and no way to
+find out what to do with it. Both of the other surfaces assume the explaining
+already happened: an SDK reaches `/<upstream>` because a human set a base URL,
+and the gateway ([§ MCP](#mcp)) is discovered because a human wrote it into a
+client config. Give an agent `IAP_TOKEN=iap_…` and `127.0.0.1:8080` and nothing
+else, and there was nowhere for it to start.
+
+So the root of the proxy answers that. `GET /` with the token returns a skill
+document generated from the running policy, for the agent that asked:
+
+```console
+$ curl -sH "Authorization: Bearer $IAP_TOKEN" http://127.0.0.1:8080/
+# agent-iap
+
+You have reached agent-iap 2026.9.0 at `http://127.0.0.1:8080`, as `claude`
+(Claude Code).
+
+This is an identity-aware proxy. It holds the credentials for the APIs below and
+attaches them on the way out, after checking a policy and writing an audit
+record. You are not holding any of those credentials, you do not need one, and
+you should not go looking for one or ask a person for one …
+
+## The short way: add this as an MCP server
+…
+## What you can reach
+
+### `anthropic`
+
+- proxied at `http://127.0.0.1:8080/anthropic/<path>`
+- the API itself is `https://api.anthropic.com`
+- the proxy attaches the credential — `header x-api-key` — and drops any you send
+
+#### Rules that apply to you, in order
+
+- **allow** `read-models` — GET `/v1/models`, `/v1/models/*`
+- **ask a human** `confirm-sends` — POST `/v1/messages`
+```
+
+It offers MCP first and says so plainly, because for an agent that can add an
+MCP server that is the shorter road — the catalog, the skills and the call
+itself arrive over one connection, already structured, and the snippet in the
+document is the address the agent actually reached, ready to paste. The HTTP
+form is spelled out underneath for everything else.
+
+A client that turns out to *be* an MCP client is not handed prose at all. The
+common misconfiguration — an MCP server entry pointing at the base URL rather
+than at `/_iap/mcp` — is answered with a 307, which keeps the method and the
+body, so the handshake frame it is already holding arrives at the gateway and
+the connection simply works. A `GET /` asking for `text/event-stream` goes the
+same way.
+
+| | |
+| --- | --- |
+| `GET /` | the document — markdown, or `?format=json` for the same facts structured |
+| `GET /.well-known/agent-iap` | the same, JSON by default |
+| `GET /_iap/skill` | the document plus every skill behind it, as one file to save |
+| `GET /_iap/skill/<name>` | one of them |
+| `POST /` | 307 to `/_iap/mcp` |
+
+Nothing here discloses more than the agent could learn by making one refused
+call. The document is built per agent, so two agents on one daemon are told two
+different things, each describing only what that one can actually reach — an
+agent granted a target no rule names is told it can reach nothing, because that
+is the truth about every call it could make. Credential *schemes* are named;
+credentials are not. Without a token the root says what this is and how to
+authenticate, and nothing about the policy at all.
+
+Reading it is an audit event, like anything else that consults the policy on an
+agent's behalf. An anonymous read is not: it names no agent, no upstream and no
+rule, which makes it `/_iap/health` with better prose.
+
+The refusals learned the same lesson. A request that names no upstream, or
+guesses one wrong, now comes back naming the upstreams that agent could have
+used:
+
+```console
+$ curl -sH "Authorization: Bearer $IAP_TOKEN" http://127.0.0.1:8080/gihtub/user
+{"error":{"type":"unknown_upstream","message":"`gihtub` is not an upstream this
+proxy fronts. Reachable from here: `anthropic`, `github`. `GET /` describes each
+of them."},"proxy":"agent-iap"}
+```
 
 ## MCP
 
