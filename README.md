@@ -644,7 +644,18 @@ clipboard. The point of doing it that way is where it works — over SSH, from
 inside a container, from a tmux pane on a jump host, none of which have a
 clipboard of their own for `pbcopy` to reach. Every terminal in common use
 implements it; tmux and screen forward it. In the console, the modal that shows
-a token copies it on `c`.
+a token copies it on `c`, and closes on `esc`, `enter` or `q` — a named key
+rather than any key, because it is the only time that token is on a screen.
+
+Inside tmux the sequence is sent both ways it can be sent: bare, which tmux
+forwards when `set-clipboard` is `on` or `external` (the default), and wrapped
+in tmux's DCS passthrough, which needs `allow-passthrough on` (off by default
+since tmux 3.3). If a copy from inside tmux still arrives nowhere, that pane has
+turned off both:
+
+```bash
+tmux set -g set-clipboard on
+```
 
 ```bash
 agent-iap agent rotate ci-runner --no-clipboard   # just print it

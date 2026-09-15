@@ -16,7 +16,8 @@
 //! `pbcopy` to reach. xterm, kitty, foot, Alacritty, WezTerm, iTerm2, Ghostty,
 //! Windows Terminal and VS Code's terminal all implement it; tmux and screen
 //! forward it when asked in the dialect each one wants, which is what `Relay`
-//! is for.
+//! is for — and for tmux that means asking both ways, because which one a pane
+//! answers to is a line in somebody else's `tmux.conf`.
 //!
 //! Two things it is not:
 //!
@@ -50,8 +51,8 @@ const MAX_ENCODED: usize = 74_994;
 pub enum Relay {
     /// Straight to the terminal.
     None,
-    /// tmux, which passes a sequence through when it arrives wrapped in its own
-    /// DCS and with every `ESC` inside doubled.
+    /// tmux, which has two ways of being asked and enables one of them by
+    /// default — see `sequence`, which asks both ways.
     Tmux,
     /// GNU screen, whose DCS passthrough has a length limit, so a long payload
     /// arrives as several of them in a row.
@@ -132,10 +133,7 @@ pub fn copy(text: &str, allowed: bool) -> Copied {
     if !std::io::stdout().is_terminal() && !std::io::stderr().is_terminal() {
         return Copied::NoTerminal;
     }
-    let Some(sequence) = sequence(
-        text,
-        relay_from(std::env::var_os("TMUX").is_some(), &term()),
-    ) else {
+    let Some(sequence) = sequence(text, relay()) else {
         return Copied::TooLarge;
     };
     match write_to_terminal(&sequence) {
@@ -146,6 +144,15 @@ pub fn copy(text: &str, allowed: bool) -> Copied {
 
 fn term() -> String {
     std::env::var("TERM").unwrap_or_default()
+}
+
+/// What is between this process and the clipboard, right now.
+///
+/// Public because the copy itself is unconfirmable: when an operator says
+/// nothing arrived, the only useful thing left to tell them is which
+/// multiplexer to go and configure, and that is this answer.
+pub fn relay() -> Relay {
+    relay_from(std::env::var_os("TMUX").is_some(), &term())
 }
 
 /// Which multiplexer, if any, is in the way.
@@ -182,9 +189,23 @@ pub fn sequence(text: &str, relay: Relay) -> Option<String> {
 
     Some(match relay {
         Relay::None => osc,
-        // tmux reads its own DCS and replays the contents outward, so the
-        // inner ESCs have to survive being parsed once on the way through.
-        Relay::Tmux => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
+        // Both ways of asking tmux, because which one works is a setting in
+        // somebody else's config file and neither is safe to assume:
+        //
+        // - The bare sequence, which tmux forwards itself when `set-clipboard`
+        //   is `on` or `external`. `external` is the default, so this is the
+        //   one that usually works.
+        // - Its DCS passthrough, which replays the contents outward verbatim —
+        //   hence the doubled `ESC`s, so the inner ones survive being parsed
+        //   once on the way through. `allow-passthrough` has defaulted to *off*
+        //   since tmux 3.3, so sending only this is how a copy inside tmux
+        //   silently does nothing, which is what it did.
+        //
+        // A pane with both enabled sends the terminal the same payload twice
+        // and the second write lands on the same clipboard as the first. That
+        // is the cost, and it is the right way round: a duplicate write is
+        // invisible, and a token that did not copy is a token that is gone.
+        Relay::Tmux => format!("{osc}\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
         // screen's passthrough takes the sequence verbatim, but caps how much
         // of it fits in one DCS. Ending and reopening mid-sequence is how the
         // rest gets across.
@@ -267,8 +288,24 @@ mod tests {
     #[test]
     fn tmux_gets_a_passthrough_with_its_escapes_doubled() {
         let sequence = sequence(TOKEN, Relay::Tmux).unwrap();
+        assert!(
+            sequence.contains(&format!("\x1bPtmux;\x1b\x1b]52;c;{ENCODED}\x07\x1b\\")),
+            "{sequence:?}"
+        );
+    }
+
+    /// The regression: a pane with tmux's defaults only ever sees the bare
+    /// sequence, because `allow-passthrough` is off and `set-clipboard` is not.
+    /// Sending the passthrough alone is a copy that silently does nothing.
+    #[test]
+    fn tmux_also_gets_the_bare_sequence_it_forwards_by_default() {
+        let sequence = sequence(TOKEN, Relay::Tmux).unwrap();
+        let bare = format!("\x1b]52;c;{ENCODED}\x07");
+        assert!(sequence.starts_with(&bare), "{sequence:?}");
+        // And the two are separable: the bare one first, then the wrapper, so
+        // a tmux that acts on neither is the only one that copies nothing.
         assert_eq!(
-            sequence,
+            &sequence[bare.len()..],
             format!("\x1bPtmux;\x1b\x1b]52;c;{ENCODED}\x07\x1b\\")
         );
     }
