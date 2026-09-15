@@ -176,7 +176,7 @@ struct Writer {
 fn open_chain(config: &crate::config::AuditConfig) -> Result<Writer> {
     if let Some(parent) = config.path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
+            crate::paths::ensure_dir(parent)
                 .with_context(|| format!("creating audit directory `{}`", parent.display()))?;
         }
     }

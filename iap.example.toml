@@ -72,7 +72,12 @@ mode = "optional"
 lifetime_secs = 3600             # ceiling as well as default; 60s–3600s
 
 [audit]
-path = "audit/iap-audit.jsonl"
+# Unset, the log goes to the state directory — `~/.local/state/agent-iap` on
+# Linux and macOS, `%LOCALAPPDATA%\agent-iap` on Windows — with the
+# control-plane token and the console's diagnostics log beside it. A relative
+# path is taken from there too, so set an absolute one to move the log alone
+# and `IAP_STATE_DIR` to move all three at once.
+# path = "/var/lib/agent-iap/iap-audit.jsonl"
 stderr = true
 log_bodies = false               # bodies carry prompts and customer data
 log_mcp_params = false           # JSON-RPC params likewise

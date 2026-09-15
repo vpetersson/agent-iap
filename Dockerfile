@@ -45,6 +45,11 @@ LABEL org.opencontainers.image.title="agent-iap" \
 # applied to every subcommand rather than just to `run`.
 ENV IAP_CONFIG=/etc/agent-iap/iap.toml
 
+# The audit log, the `admin-token` beside it and the console's diagnostics log.
+# The nonroot user in this image has no home directory for the default
+# `~/.local/state/agent-iap` to resolve against, so say where instead.
+ENV IAP_STATE_DIR=/var/lib/agent-iap
+
 # The data plane agents connect to, and the loopback control plane. Both are
 # whatever the policy file says — these are the defaults `init` writes.
 EXPOSE 8080 8081

@@ -12,6 +12,7 @@ use agent_iap::identity;
 use agent_iap::init::{self, InitOptions, Template};
 use agent_iap::list::{Inventory, ListOptions, What};
 use agent_iap::mcp;
+use agent_iap::paths;
 use agent_iap::profiles;
 use agent_iap::reload::Watcher;
 use agent_iap::state::AppState;
@@ -32,11 +33,13 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct ConfigArg {
-    /// Path to the TOML policy file.
+    /// Path to the TOML policy file. Defaults to `./iap.toml` when one is
+    /// already there, and otherwise to the user config directory —
+    /// `~/.config/agent-iap/iap.toml` on Linux and macOS.
     #[arg(
         short,
         long,
-        default_value = "iap.toml",
+        default_value_os_t = paths::default_config_file(),
         env = "IAP_CONFIG",
         global = true
     )]
@@ -961,7 +964,7 @@ fn init_tracing(console: Console, config: &Config) -> Result<()> {
             .unwrap_or(Path::new("."))
             .join("agent-iap.log");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            paths::ensure_dir(parent).ok();
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -1200,7 +1203,7 @@ fn write_admin_token(audit_path: &Path, token: &str) -> Result<PathBuf> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).ok();
+    paths::ensure_dir(dir).ok();
     let path = dir.join("admin-token");
 
     // Created 0600 rather than created-then-chmodded: the old order left the
@@ -1464,6 +1467,14 @@ fn show_token(headline: &str, token: &str, clipboard: ClipboardArg) {
 fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
     let written = init::init(options)?;
     let path = written.path.display();
+    // Only worth repeating back when the file is somewhere the next command
+    // would not have looked anyway — which, now that `init` writes to the user
+    // config directory, is the unusual case rather than the normal one.
+    let flag = if written.path == paths::default_config_file() {
+        String::new()
+    } else {
+        format!(" --config {path}")
+    };
 
     let (Some(agent), Some(token)) = (written.agent.as_deref(), written.token.as_deref()) else {
         // The minimal template. Nothing was granted, so the useful thing to
@@ -1486,8 +1497,8 @@ fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
         println!("  agent-iap acl add --target anthropic --methods POST --paths /v1/messages");
         println!("  agent-iap agent add claude-code --target anthropic\n");
         println!("Then:");
-        println!("  agent-iap check --config {path}   # resolves every credential reference");
-        println!("  agent-iap run --config {path}       # the approval console");
+        println!("  agent-iap check{flag}   # resolves every credential reference");
+        println!("  agent-iap run{flag}       # the approval console");
         return Ok(());
     };
 
@@ -1508,8 +1519,8 @@ fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
     {
         println!("  export {name}=...   # the credential the proxy injects on the way out");
     }
-    println!("  agent-iap check --config {path}   # resolves every credential reference");
-    println!("  agent-iap run --config {path}       # the approval console\n");
+    println!("  agent-iap check{flag}   # resolves every credential reference");
+    println!("  agent-iap run{flag}       # the approval console\n");
 
     println!("Then point the agent at the proxy:");
     println!(

@@ -60,7 +60,7 @@ pub struct InitOptions {
 impl Default for InitOptions {
     fn default() -> Self {
         InitOptions {
-            path: PathBuf::from("iap.toml"),
+            path: crate::paths::default_config_file(),
             agent: DEFAULT_AGENT_ID.to_string(),
             secret: None,
             template: Template::Minimal,
@@ -164,7 +164,7 @@ fn write_new(path: &Path, text: &str, force: bool) -> Result<()> {
     use std::io::Write;
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        crate::paths::ensure_dir(parent)
             .with_context(|| format!("creating `{}`", parent.display()))?;
     }
 
@@ -219,7 +219,8 @@ fn render(
 /// minted for an agent that may never exist. `upstream add` and `agent add`
 /// fill it in.
 fn minimal() -> String {
-    r##"# agent-iap policy file, written by `agent-iap init`.
+    format!(
+        r##"# agent-iap policy file, written by `agent-iap init`.
 #
 # Nothing here is a credential — only *references* to them, resolved inside the
 # proxy at startup. This file is safe to commit.
@@ -251,7 +252,10 @@ approval_timeout_secs = 120      # an unanswered `ask` denies after this
 # key = "op://Infra/agent-iap tls/private key"
 
 [audit]
-path = "audit/iap-audit.jsonl"
+# Unset, the log goes to the state directory, with the control-plane token and
+# the console's diagnostics log beside it. On this machine that is:
+#   {audit}
+# A relative path is taken from there too; `IAP_STATE_DIR` moves all three.
 stderr = true
 log_bodies = false               # bodies carry prompts and customer data
 
@@ -260,8 +264,9 @@ log_bodies = false               # bodies carry prompts and customer data
 
 [acl_default]
 action = "deny"
-"##
-    .to_string()
+"##,
+        audit = crate::paths::audit_file().display()
+    )
 }
 
 fn starter(agent: &str, token_hash: &str, secret: &str) -> String {
@@ -290,7 +295,10 @@ approval_timeout_secs = 120      # an unanswered `ask` denies after this
 # key = "op://Infra/agent-iap tls/private key"
 
 [audit]
-path = "audit/iap-audit.jsonl"
+# Unset, the log goes to the state directory, with the control-plane token and
+# the console's diagnostics log beside it. On this machine that is:
+#   {audit}
+# A relative path is taken from there too; `IAP_STATE_DIR` moves all three.
 stderr = true
 log_bodies = false               # bodies carry prompts and customer data
 
@@ -336,7 +344,8 @@ action = "allow"
 
 [acl_default]
 action = "deny"
-"##
+"##,
+        audit = crate::paths::audit_file().display()
     )
 }
 
@@ -528,6 +537,33 @@ mod tests {
             config.mcp_servers.iter().any(|s| s.name == "github-mcp"),
             "the full template should carry the example's MCP server"
         );
+    }
+
+    /// The whole point of writing to the user's own directories: none of the
+    /// three templates may pin an append-only log to whatever directory the
+    /// operator happened to run `init` from. They say nothing about `path`, so
+    /// the default in `crate::paths` is what governs — and a policy file that
+    /// gets copied to another host lands its log in the right place there too,
+    /// which an absolute path baked in here would not.
+    #[test]
+    fn no_template_anchors_the_audit_log_to_the_working_directory() {
+        for template in [Template::Minimal, Template::Starter, Template::Full] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("iap.toml");
+            init(&InitOptions {
+                path: path.clone(),
+                template,
+                ..Default::default()
+            })
+            .unwrap();
+
+            let config = load(&std::fs::read_to_string(&path).unwrap());
+            assert_eq!(
+                config.audit.path,
+                crate::paths::audit_file(),
+                "{template:?} named an audit path of its own"
+            );
+        }
     }
 
     /// `--agent` has to reach every place the template names the agent, or the

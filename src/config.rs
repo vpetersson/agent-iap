@@ -301,8 +301,10 @@ impl Default for AuditConfig {
     }
 }
 
+/// Under the state directory rather than beside whatever the operator's shell
+/// was pointed at — see `crate::paths`.
 fn default_audit_path() -> PathBuf {
-    PathBuf::from("iap-audit.jsonl")
+    crate::paths::audit_file()
 }
 fn yes() -> bool {
     true
@@ -707,8 +709,11 @@ impl Config {
                 anyhow::Error::new(error).context(format!("reading config `{}`", path.display()))
             }
         })?;
-        let config: Config = toml::from_str(&text)
+        let mut config: Config = toml::from_str(&text)
             .with_context(|| format!("parsing config `{}`", path.display()))?;
+        // Before validation, so an error that names the audit log names the
+        // file the proxy would actually have opened.
+        config.audit.path = crate::paths::in_state_dir(&config.audit.path);
         config.validate()?;
         Ok(config)
     }
@@ -741,7 +746,11 @@ impl Config {
         })?;
         let parsed: AuditOnly = toml::from_str(&text)
             .with_context(|| format!("parsing config `{}`", config_path.display()))?;
-        Ok(parsed.audit.path.unwrap_or_else(default_audit_path))
+        Ok(parsed
+            .audit
+            .path
+            .map(|path| crate::paths::in_state_dir(&path))
+            .unwrap_or_else(default_audit_path))
     }
 
     pub fn upstream(&self, name: &str) -> Option<&UpstreamConfig> {
@@ -1445,9 +1454,11 @@ type = "service_account_jwt"
             format!("{MINIMAL}\n[audit]\npath = \"logs/iap.jsonl\"\n"),
         )
         .unwrap();
+        // Relative, so it is anchored to the state directory rather than to
+        // wherever the reader happened to run `audit tail` from.
         assert_eq!(
             Config::audit_path_of(&path).unwrap(),
-            PathBuf::from("logs/iap.jsonl")
+            crate::paths::in_state_dir(Path::new("logs/iap.jsonl"))
         );
 
         // No `[audit]` section is the same log the proxy would write.
@@ -1469,7 +1480,7 @@ type = "service_account_jwt"
         assert!(Config::load(&path).is_err(), "the policy is invalid");
         assert_eq!(
             Config::audit_path_of(&path).unwrap(),
-            PathBuf::from("logs/iap.jsonl")
+            crate::paths::in_state_dir(Path::new("logs/iap.jsonl"))
         );
     }
 
