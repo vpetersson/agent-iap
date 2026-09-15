@@ -588,6 +588,7 @@ impl Form {
                 let field = &self.fields[*index];
                 let focused = *index == self.focus;
                 let value = field.rendered();
+                let blank = value.trim().is_empty();
                 let shown = match (&field.value, focused) {
                     (Value::Text(_), true) => format!("{value}▏"),
                     (Value::Choice { .. }, _) => format!("◂ {value} ▸"),
@@ -614,12 +615,23 @@ impl Form {
                     ),
                 ];
                 // A field that names a file says so on its own line, while
-                // the cursor is on it — and says it the way every other
-                // affordance in this console does, as the key and then what
-                // the key does. A lone highlighted word reads as decoration:
-                // it tells you a picker exists without telling you how to
-                // reach it, which is worse than not drawing it at all.
-                if focused && field.browses {
+                // the cursor is on it and there is nothing in it yet — and
+                // says it the way every other affordance in this console
+                // does, as the key and then what the key does. A lone
+                // highlighted word reads as decoration: it tells you a picker
+                // exists without telling you how to reach it, which is worse
+                // than not drawing it at all.
+                //
+                // It goes the moment you type. Sitting immediately past the
+                // caret, it reads as part of the value being entered —
+                // `op://` followed by a highlighted `ctrl-o` is a field that
+                // looks like it already contains something it does not — and
+                // an offer to go and find a file is noise over somebody who
+                // is plainly typing a reference to somewhere else. The key
+                // row below keeps it for as long as the cursor is here, so
+                // the route is announced without standing in the way of the
+                // thing it is announcing itself next to.
+                if focused && field.browses && blank {
                     let before = 4 + label_width + shown.chars().count();
                     spans.push(Span::styled(BROWSE_KEY, key_style()));
                     spans.push(Span::raw(BROWSE_WHAT));
