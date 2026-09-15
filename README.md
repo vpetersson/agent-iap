@@ -1157,6 +1157,20 @@ startup, so a locked vault fails the process rather than the tenth request.
 A bare value that is not one of these forms is rejected, and the error never
 echoes what you pasted.
 
+1Password vaults, items, sections and fields are named by humans, so they have
+spaces in them — `op://Private/Anthropic API/credential` is one reference, and
+it is handed to `op` as one argument, never through a shell. In the policy file
+it needs nothing special. On a command line it needs the quotes any string with
+a space needs:
+
+```shell
+agent-iap upstream add anthropic --base-url https://api.anthropic.com \
+    --auth header --header x-api-key --secret "op://Private/Anthropic API/credential"
+```
+
+Space *around* a reference is a typo rather than part of it, and is trimmed:
+`" op://Private/Anthropic API/credential"` names the same field.
+
 ### TLS
 
 `[server.tls]` puts the proxy on HTTPS. Absent, it speaks plain HTTP exactly as
