@@ -16,9 +16,13 @@ Type=exec
 User=agent-iap
 Group=agent-iap
 
-# Every subcommand reads this, so `systemd-run` and `machinectl shell` one-offs
-# find the same policy file the daemon is running.
+# Every subcommand reads these, so `systemd-run` and `machinectl shell` one-offs
+# find the same policy file and the same audit log the daemon is using.
 Environment=IAP_CONFIG=/etc/agent-iap/iap.toml
+# Where the audit log, the `admin-token` beside it and the console's
+# diagnostics log go. Without this they would default to the service user's
+# `~/.local/state`, which `ProtectHome=yes` below has made unreachable anyway.
+Environment=IAP_STATE_DIR=/var/lib/agent-iap
 # Credentials the policy file reaches for by `env:` reference. Owner-only, and
 # 1Password's OP_SERVICE_ACCOUNT_TOKEN goes here too if you use `op://`.
 EnvironmentFile=-/etc/agent-iap/env
@@ -40,9 +44,10 @@ ExecStart=/usr/local/bin/agent-iap run --no-tui
 # has just finished writing and does not want to wait to be noticed.
 ExecReload=/bin/kill -HUP $MAINPID
 
-# /var/lib/agent-iap, created owner-only on first start. The audit log and the
-# `admin-token` written beside it live here, and it is the only path the proxy
-# writes to.
+# /var/lib/agent-iap, created owner-only on first start. It is the only path
+# the proxy writes to — `IAP_STATE_DIR` above is what points it here, so the
+# working directory below is merely where relative `file:` references in the
+# policy file are resolved from, and nothing depends on it any more.
 StateDirectory=agent-iap
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/agent-iap

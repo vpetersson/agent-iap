@@ -52,6 +52,7 @@ pub mod identity;
 pub mod init;
 pub mod list;
 pub mod mcp;
+pub mod paths;
 pub mod profiles;
 pub mod proxy;
 pub mod reload;

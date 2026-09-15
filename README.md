@@ -210,9 +210,11 @@ into. Until then `--git` is the toolchain path.
 
 ## Quickstart
 
-Everything below writes `./iap.toml` in the current directory, so it needs no
-root and nothing installed anywhere: this is the proxy on a laptop, in front of
-one upstream. [§ Deployment](#deployment) is the same thing as a daemon.
+Everything below writes `~/.config/agent-iap/iap.toml`, so it needs no root and
+nothing installed anywhere: this is the proxy on a laptop, in front of one
+upstream. [§ Deployment](#deployment) is the same thing as a daemon.
+[§ Where things live](#where-things-live) has the full set of paths, and how to
+move them.
 
 ```bash
 # 1. Write a policy file. No agents, no upstreams, default deny — it starts a
@@ -231,14 +233,19 @@ agent-iap agent add claude-code --target anthropic
 
 # 3. Check the policy and prove every credential reference resolves.
 export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
-agent-iap check --config iap.toml
+agent-iap check
 
 # 4. See what the policy exposes, and to whom.
-agent-iap list --config iap.toml
+agent-iap list
 
 # 5. Run it. On a terminal that is the approval console.
-agent-iap run --config iap.toml
+agent-iap run
 ```
+
+Every command there found the policy file on its own. `--config` names another
+one, `IAP_CONFIG` names one for a whole shell, and a `./iap.toml` in the
+directory you are standing in still wins over the user-level file — which is
+what makes a repository or a demo able to carry a policy of its own.
 
 Point the agent at the proxy:
 
@@ -818,6 +825,53 @@ One thing this does not do: the signing key behind § Workload identity is not
 rotated, because that would invalidate every token already handed out — a
 fleet-wide outage rather than a config change.
 
+## Where things live
+
+Nothing is written to the directory you happen to be standing in. The binary is
+installed once — `~/.local/bin`, `/usr/local/bin` — and run from everywhere, so
+the policy file and the audit log live under your own directories instead:
+
+| | Linux, macOS, BSD | Windows |
+| --- | --- | --- |
+| Policy file | `$XDG_CONFIG_HOME/agent-iap/iap.toml`, else `~/.config/agent-iap/iap.toml` | `%APPDATA%\agent-iap\iap.toml` |
+| Audit log, `admin-token`, `agent-iap.log` | `$XDG_STATE_HOME/agent-iap/`, else `~/.local/state/agent-iap/` | `%LOCALAPPDATA%\agent-iap\` |
+
+Two directories rather than one, because the files age differently. The policy
+file is configuration — small, hand-edited, reviewed, safe to commit, the sort
+of thing that ends up in a dotfile repository. The audit log is state:
+append-only, unbounded, and the last thing anyone wants synced to a second
+machine. macOS gets the same layout rather than `~/Library/Application Support`,
+because this is a terminal tool whose config file is meant to be read and edited
+by hand, next to every other one in `~/.config`.
+
+Four ways to move things, narrowest first:
+
+```bash
+agent-iap run --config /etc/agent-iap/iap.toml   # this command, this file
+export IAP_CONFIG=/etc/agent-iap/iap.toml        # this shell, every subcommand
+export IAP_STATE_DIR=/var/lib/agent-iap          # audit log, token, diagnostics
+export IAP_CONFIG_DIR=/etc/agent-iap             # where `iap.toml` is looked for
+```
+
+`[audit].path` in the policy file moves the log on its own. An absolute path is
+taken as it stands; a relative one is taken from the state directory, never from
+the working directory — which is the point of all of this.
+
+A `./iap.toml` in the current directory is still what `--config` falls back to
+when one is there, so a repository, a demo or one of the walkthroughs above can
+carry a policy of its own. It is a fallback for *reading*: `agent-iap init`
+writes to the user config directory unless `--config` says otherwise.
+
+> **Upgrading from a version before this?** Nothing moves on its own. An
+> existing `./iap.toml` keeps being found where it is, and a `[audit].path` that
+> names an absolute path keeps writing there. What changes is a *relative*
+> `[audit].path` — the `audit/iap-audit.jsonl` older `init` templates wrote — which
+> now resolves under the state directory instead of the working directory. Move
+> the old log next to the new one, or set the path absolutely, or set
+> `IAP_STATE_DIR` to the directory you were running from. The unit file and the
+> container image in [§ Deployment](#deployment) set `IAP_STATE_DIR` for exactly
+> this reason.
+
 ## The policy file
 
 `agent-iap init` writes one; `iap.example.toml` is the commented walk-through it
@@ -1210,7 +1264,7 @@ which service reads it, with never a value:
 ```console
 $ agent-iap list credentials
 HOLDER             FIELD            REFERENCE
-server             admin_token      file:audit/admin-token
+server             admin_token      file:/var/lib/agent-iap/admin-token
 upstream anthropic auth.secret      op://Private/Anthropic API/credential
 upstream gcs       auth.key_file    op://Private/GCP Service Account/credential
 mcp notes          env.NOTES_TOKEN  op://Private/Notes/token
@@ -1578,7 +1632,7 @@ agent-iap audit verify
 
 # Both read `audit.path` from the policy file. Name a file to read another one —
 # a rotated log, or one copied off the host.
-agent-iap audit verify audit/iap-audit.jsonl.1
+agent-iap audit verify ~/.local/state/agent-iap/iap-audit.jsonl.1
 ```
 
 `tail -f` follows the log the way the name implies: the last `-n` entries, then
@@ -1613,12 +1667,13 @@ neither the upstream credential nor the agent token ever reaches the log.
 ## Control plane
 
 `admin_listen` (loopback, bearer token written to `admin-token` beside the audit
-log) exists for the console and the MCP bridge, and is useful directly. With
+log — see [§ Where things live](#where-things-live)) exists for the console and
+the MCP bridge, and is useful directly. With
 `[server.tls]` set it is on `https://` too — see § TLS — and these become
 `curl --cacert`:
 
 ```bash
-TOKEN=$(cat audit/admin-token)
+TOKEN=$(cat ~/.local/state/agent-iap/admin-token)
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/status
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/pending
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/decide \
@@ -1631,18 +1686,18 @@ immediately rather than parking the request for the full timeout.
 
 ## Deployment
 
-Everything so far has been the proxy in a terminal, reading `./iap.toml`. As a
-daemon it is the process on the box that holds every upstream credential the
-policy file names, so where its files live and who can read them *is* the
-security boundary.
+Everything so far has been the proxy in a terminal, reading the policy file in
+your own config directory. As a daemon it is the process on the box that holds
+every upstream credential the policy file names, so where its files live and who
+can read them *is* the security boundary.
 
 | Path | What | Mode |
 | --- | --- | --- |
 | `/usr/local/bin/agent-iap` | The binary. | `0755 root:root` |
 | `/etc/agent-iap/iap.toml` | Policy: the ACL, the agents' token hashes, the credential *references*. | `0600 agent-iap:agent-iap` |
 | `/etc/agent-iap/env` | Values for the `env:` references, and `OP_SERVICE_ACCOUNT_TOKEN` if you use `op://`. | `0600 agent-iap:agent-iap` |
-| `/var/lib/agent-iap/audit/iap-audit.jsonl` | The hash-chained audit log. | `0600 agent-iap:agent-iap` |
-| `/var/lib/agent-iap/audit/admin-token` | Control-plane bearer token, written at every start. | `0600 agent-iap:agent-iap` |
+| `/var/lib/agent-iap/iap-audit.jsonl` | The hash-chained audit log. | `0600 agent-iap:agent-iap` |
+| `/var/lib/agent-iap/admin-token` | Control-plane bearer token, written at every start. | `0600 agent-iap:agent-iap` |
 
 The policy file holds no credential — agent tokens are stored as sha256, and an
 upstream's key is a reference to somewhere else. It still wants `0600`: readable
@@ -1677,9 +1732,12 @@ sudo systemctl enable --now agent-iap
 
 `/var/lib/agent-iap` is created `0700` by `StateDirectory=` on first start — the
 audit log and the `admin-token` beside it land there, and it is the only path
-the service can write to. The unit sets `IAP_CONFIG`, so `agent-iap list`,
-`agent-iap audit verify` and the rest read the daemon's policy file with no
-`--config`.
+the service can write to. The unit says so with `IAP_STATE_DIR`, rather than
+leaning on a working directory: the service user has no home for the default
+`~/.local/state/agent-iap` to resolve against, and `ProtectHome=yes` would put it
+out of reach anyway. `IAP_CONFIG` does the same for the policy file, so
+`agent-iap list`, `agent-iap audit verify` and the rest read the daemon's
+policy and log with no `--config`.
 
 Two things worth knowing before the first restart:
 
@@ -1804,7 +1862,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 357 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 378 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
