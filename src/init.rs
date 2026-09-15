@@ -231,7 +231,8 @@ fn minimal() -> String {
 #
 #   agent-iap upstream add anthropic --base-url https://api.anthropic.com \
 #       --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY
-#   agent-iap acl add --target anthropic --methods POST --paths /v1/messages
+#   agent-iap acl add --target anthropic --methods POST --paths /v1/messages \
+#       --action allow
 #   agent-iap agent add claude-code --target anthropic
 #
 # `agent-iap init --template starter` writes that Anthropic setup for you;
