@@ -314,7 +314,7 @@ pub fn control_plane_client(
     material: Option<&TlsConfig>,
     resolver: &SecretResolver,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().user_agent(crate::USER_AGENT);
     if let Some(tls) = material {
         for certificate in
             trust_anchors(tls, resolver).context("the control plane's TLS material")?

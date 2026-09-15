@@ -748,6 +748,9 @@ fn supplied_headers(
         }
     }
 
+    let announced = crate::proxy::forwarded_user_agent(headers.get(http::header::USER_AGENT));
+    headers.insert(http::header::USER_AGENT, announced);
+
     for (name, value) in &upstream.headers {
         if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), value.parse()) {
             headers.insert(name, value);
@@ -874,6 +877,28 @@ headers = { "x-tenant" = "acme" }
 
         let headers = supplied_headers(Some(&json!({ "x-tenant": "not-acme" })), &upstream);
         assert_eq!(headers.get("x-tenant").unwrap(), "acme");
+    }
+
+    #[test]
+    fn a_tool_call_announces_the_gateway_to_the_upstream() {
+        let upstream: crate::config::UpstreamConfig = toml::from_str(
+            r#"
+name = "echo"
+base_url = "https://example.invalid"
+"#,
+        )
+        .unwrap();
+
+        // Nothing supplied: the upstream hears the gateway.
+        let headers = supplied_headers(None, &upstream);
+        assert_eq!(headers.get("user-agent").unwrap(), crate::USER_AGENT);
+
+        // Supplied: the upstream hears both, in that order.
+        let headers = supplied_headers(Some(&json!({ "user-agent": "some-agent/2" })), &upstream);
+        assert_eq!(
+            headers.get("user-agent").unwrap(),
+            format!("some-agent/2 {}", crate::USER_AGENT).as_str()
+        );
     }
 
     #[test]
