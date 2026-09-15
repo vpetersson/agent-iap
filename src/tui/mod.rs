@@ -3233,18 +3233,71 @@ action = "allow"
         app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // auth
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
-        render(&mut app, 120, 34);
-
-        let targets = app.hits.form.as_ref().unwrap().browse.clone();
-        assert_eq!(targets.len(), 2, "the field's own line, and the key row");
-        for rect in targets {
-            app.click((rect.x + 1, rect.y), false).unwrap();
-            assert!(
-                matches!(&app.modal, Some(Modal::Form(form)) if form.browsing()),
-                "a click at {rect:?} left the picker shut"
-            );
-            app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+                                                           // Empty, so both are drawn; filled, so only the key row is.
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        for (typed, drawn) in [("", 2), ("op://Private/Anthropic/key", 1)] {
+            type_in(&mut app, typed);
+            render(&mut app, 120, 34);
+            let targets = app.hits.form.as_ref().unwrap().browse.clone();
+            assert_eq!(targets.len(), drawn, "with `{typed}` in the field");
+            for rect in targets {
+                app.click((rect.x + 1, rect.y), false).unwrap();
+                assert!(
+                    matches!(&app.modal, Some(Modal::Form(form)) if form.browsing()),
+                    "a click at {rect:?} left the picker shut"
+                );
+                app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+            }
         }
+    }
+
+    /// The offer sits immediately past the caret, so the moment there is a
+    /// value it reads as part of it — `op://` followed by a highlighted
+    /// `ctrl-o` looks like a field holding something it does not hold. It goes
+    /// when you type and comes back when the field is cleared; the key row
+    /// keeps the route open throughout, so nothing is lost by hiding it.
+    #[tokio::test]
+    async fn the_offer_gets_out_of_the_way_of_what_is_being_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // auth
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let on_the_field = |app: &mut App| {
+            render(app, 120, 34)
+                .lines()
+                .any(|line| line.contains("secret") && line.contains("ctrl-o"))
+        };
+        assert!(on_the_field(&mut app), "an empty field offers the picker");
+
+        type_in(&mut app, "op://");
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            !rendered
+                .lines()
+                .any(|l| l.contains("op://") && l.contains("ctrl-o")),
+            "nothing should sit against what is being typed: {rendered}"
+        );
+        assert!(
+            rendered.contains("ctrl-o"),
+            "but the key row still says the picker is there: {rendered}"
+        );
+        // And `ctrl-o` still works while it is hidden, which is what makes
+        // hiding it safe.
+        app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(&app.modal, Some(Modal::Form(form)) if form.browsing()));
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(on_the_field(&mut app), "clearing the field brings it back");
     }
 
     /// Same form, from the pointer: a double-click opens the row.
