@@ -383,7 +383,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Two levels are worth knowing about because they exist for reasons that are not
+Three levels are worth knowing about because they exist for reasons that are not
 about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
@@ -392,6 +392,10 @@ about permissions:
 - **`dataforseo`** defaults to a level that allows the queued endpoints and makes
   the `live` ones prompt. Nothing in the method or the path says one costs more
   than the other, and an agent has no way to know.
+- **`semrush-mcp --access discovery`** allows the tools that describe what
+  reports exist and prompts for `execute_report`, the one that runs them and
+  bills. Same reasoning as `dataforseo`, except here the expensive call has a
+  name you can write a rule against.
 
 ### What is in the catalog
 
@@ -404,13 +408,14 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Cloudflare | `cloudflare` (the whole `client/v4` surface), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
 | PostHog | `posthog` (REST), `posthog-mcp` |
 | DataForSEO | `dataforseo`, `dataforseo-mcp` |
+| Semrush | `semrush` (v3, `?key=`), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
 | Graylog | `graylog` |
 | Others | `anthropic`, `openai`, `github`, `linear`, `sentry`, `slack`, `stripe` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
 
-Two honest limits, both printed by `profile show`:
+Three honest limits, all printed by `profile show`:
 
 - **Cloudflare's hosted MCP servers speak OAuth, not API tokens.** The
   `cloudflare-mcp-*` profiles therefore run them through `npx mcp-remote`, which
@@ -422,6 +427,13 @@ Two honest limits, both printed by `profile show`:
   `read` level allows the read verbs and sends everything else to `ask` rather
   than denying it. Watch the audit log for `ask` rows and promote the ones you
   want.
+- **A path the ACL cannot split.** Semrush's v3 analytics puts every report at
+  the same path and names it in a query parameter — `/?type=domain_ranks` — so
+  rules can say "reports, read-only" and nothing finer. The credential goes in
+  the query string too, which the `semrush` profile enrols as `query` auth: the
+  proxy appends the key on the way out, so it is still never in a URL the agent
+  wrote. v4 is a separate key on a separate profile, and puts both in the
+  ordinary places.
 
 ## Enrolling anything else
 

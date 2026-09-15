@@ -39,6 +39,10 @@ async fn spawn_upstream() -> SocketAddr {
         };
         Json(serde_json::json!({
             "path": path,
+            // A credential can arrive in the query string as well as in a
+            // header, so a mock that only reports headers cannot tell whether
+            // `query` auth worked.
+            "query": request.uri().query(),
             "method": request.method().as_str(),
             "authorization": header("authorization"),
             "x-api-key": header("x-api-key"),
@@ -245,6 +249,105 @@ async fn dataforseo_signs_with_the_login_and_holds_back_the_billed_endpoints() {
     )
     .await;
     assert_eq!(status, 403, "a billed `live` call was let through unasked");
+}
+
+#[tokio::test]
+async fn semrush_appends_the_key_to_a_url_the_agent_wrote_without_it() {
+    std::env::set_var("TEST_SEMRUSH_V3_KEY", "semrush-real-v3-key");
+    let upstream = spawn_upstream().await;
+    let harness =
+        harness_from_profiles(&[("semrush", options("env:TEST_SEMRUSH_V3_KEY"))], upstream).await;
+
+    // v3 takes the key nowhere but the query string, and every analytics report
+    // is the same path with a different `type=`. Both are the reasons this
+    // profile exists, and both are only observable at the upstream.
+    let (status, seen) = call(
+        &harness,
+        "GET",
+        "/semrush/?type=domain_ranks&domain=example.com",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/");
+    let query = seen["query"].as_str().unwrap();
+    assert!(
+        query.contains("key=semrush-real-v3-key"),
+        "the proxy did not attach the key: {query}"
+    );
+    // The agent asked for a report without holding a key, and its own token did
+    // not travel to Semrush.
+    assert!(query.contains("type=domain_ranks"));
+    assert!(seen["authorization"].is_null());
+    assert!(seen["x-iap-token"].is_null());
+
+    // Backlinks v3 is a second path on the same upstream, documented with the
+    // trailing slash — the spelling a rule written as `/analytics/v1` alone
+    // would miss.
+    let (status, seen) = call(&harness, "GET", "/semrush/analytics/v1/?type=backlinks").await;
+    assert_eq!(status, 200, "the v3 backlinks path is not reachable");
+    assert_eq!(seen["path"], "/analytics/v1/");
+
+    // Trends is a third, and it is a real path rather than a `type=`.
+    let (status, _) = call(&harness, "GET", "/semrush/analytics/ta/api/v3/summary").await;
+    assert_eq!(status, 200);
+
+    // `read` is GET-only: creating a Site Audit campaign is a write, and the
+    // default level must not reach the network with one.
+    let (status, body) = call(&harness, "POST", "/semrush/management/v1/projects").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a Projects write reached the upstream: {body}"
+    );
+}
+
+#[tokio::test]
+async fn semrush_v4_signs_with_apikey_and_keeps_the_version_prefix() {
+    std::env::set_var("TEST_SEMRUSH_V4_KEY", "semrush-real-v4-key");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SEMRUSH_V4_KEY");
+    opts.access = Some("ask-writes".into());
+    let harness = harness_from_profiles(&[("semrush-v4", opts)], upstream).await;
+
+    let (status, seen) = call(
+        &harness,
+        "GET",
+        "/semrush-v4/backlinks/v1/links?url=example.com",
+    )
+    .await;
+    assert_eq!(status, 200);
+    // `Apikey`, not `Bearer` — the scheme a hand-written upstream gets wrong and
+    // finds out about as an unexplained 401.
+    assert_eq!(seen["authorization"], "Apikey semrush-real-v4-key");
+    // The v4 surface hangs off `/apis/v4`, which lives in the base URL rather
+    // than in every path an agent writes.
+    assert_eq!(seen["path"], "/apis/v4/backlinks/v1/links");
+    assert!(seen["x-iap-token"].is_null());
+
+    // The Local APIs write. Nobody is watching the prompt, so `ask` resolves to
+    // a denial, and DELETE never gets as far as asking.
+    let (status, body) = call(&harness, "DELETE", "/semrush-v4/local/v1/locations/1").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a denied DELETE reached the upstream: {body}"
+    );
+}
+
+#[test]
+fn the_semrush_key_is_a_reference_in_the_policy_file_and_never_a_value() {
+    // `query` auth is the one scheme that puts the credential in a URL, so it
+    // is the one where a profile that resolved the reference too early would
+    // leave a live key in a file people commit.
+    let (dir, path) = minimal_policy();
+    let profile = profiles::get("semrush").unwrap();
+    profiles::add(&path, &profile, &options("op://Private/Semrush/key")).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("type = \"query\""));
+    assert!(written.contains("param = \"key\""));
+    assert!(written.contains("secret = \"op://Private/Semrush/key\""));
+    drop(dir);
 }
 
 #[tokio::test]
