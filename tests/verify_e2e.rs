@@ -439,3 +439,56 @@ async fn verifying_something_the_file_does_not_have_says_so() {
         "{message}"
     );
 }
+
+/// What a profile knows at enrolment, kept where `verify` can still find it.
+///
+/// The root is the path a verify falls back to, and it is the one path that
+/// proves nothing: this upstream answers it `404`, exactly as Cloudflare
+/// answers its own with `no route for that URI`. An upstream that carries a
+/// `verify_path` is probed there instead, so the call exercises the credential.
+#[tokio::test]
+async fn an_upstreams_own_verify_path_is_what_gets_probed() {
+    let api = spawn_api().await;
+    std::env::set_var("AGENT_IAP_VERIFY_PROBE", KEY);
+    let with_probe = config(&format!(
+        r#"
+[[upstreams]]
+name = "api"
+base_url = "http://{api}"
+verify_path = "/me"
+auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_PROBE" }}
+"#
+    ));
+
+    let report = verify::upstream(&with_probe, &resolver(), "api", &options(None))
+        .await
+        .unwrap();
+    assert!(report.ok(), "{report:?}");
+    assert!(detail(&report, "endpoint").ends_with("/me"), "{report:?}");
+    assert!(detail(&report, "reach").contains("200 OK"));
+
+    // Without one, the same upstream is probed at the root and comes back with
+    // a 404 that says nothing about the credential — a warning, not a pass.
+    let bare = config(&format!(
+        r#"
+[[upstreams]]
+name = "api"
+base_url = "http://{api}"
+auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_PROBE" }}
+"#
+    ));
+    let report = verify::upstream(&bare, &resolver(), "api", &options(None))
+        .await
+        .unwrap();
+    assert_eq!(report.verdict(), Outcome::Warned, "{report:?}");
+
+    // And an operator asking about one endpoint still gets that endpoint: the
+    // argument is the question being asked, the file is only the default.
+    let report = verify::upstream(&with_probe, &resolver(), "api", &options(Some("/nowhere")))
+        .await
+        .unwrap();
+    assert!(
+        detail(&report, "endpoint").ends_with("/nowhere"),
+        "{report:?}"
+    );
+}

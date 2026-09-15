@@ -290,7 +290,8 @@ For a service that already has a profile, step 2 is one command that writes the
 upstream *and* its rules — see [§ Profiles](#profiles):
 
 ```bash
-agent-iap profile add cloudflare --secret op://Private/Cloudflare/token
+agent-iap profile add cloudflare --secret op://Private/Cloudflare/token \
+    --var account_id=3f1c…
 agent-iap upstream add gh --profile github --secret op://Private/GitHub/token
 ```
 
@@ -420,7 +421,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Vendor | Profiles |
 | --- | --- |
 | Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets`, `google-cloud-logging`, `google-cloud-storage` — all one service account, all `service_account_jwt` |
-| Cloudflare | `cloudflare` (the whole `client/v4` surface), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
+| Cloudflare | `cloudflare` (the whole `client/v4` surface, `--var account_id=…`), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
 | PostHog | `posthog` (REST), `posthog-mcp` |
 | DataForSEO | `dataforseo`, `dataforseo-mcp` |
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
@@ -432,6 +433,14 @@ it.
 
 Three honest limits, all printed by `profile show`:
 
+- **A Cloudflare token is half an address.** Most of `client/v4` lives under
+  `/accounts/<id>/…`, and an account-owned token (`cfat_`, the durable
+  service-principal kind) can only be verified at that account's own endpoint —
+  `/user/tokens/verify` is for user tokens and rejects it. So `cloudflare` asks
+  for `--var account_id=…` alongside the secret, and writes it into the
+  `verify_path` the enrolment then calls (§ Verifying). The account ID is a path
+  parameter rather than a credential: it goes in the file in the clear, while
+  the token stays a reference.
 - **Cloudflare's hosted MCP servers speak OAuth, not API tokens.** The
   `cloudflare-mcp-*` profiles therefore run them through `npx mcp-remote`, which
   does the browser flow and caches the grant. The proxy still rules on and logs
@@ -537,6 +546,23 @@ A 401 is a failure. A 404 on a base URL is not — it says the host is real and
 says nothing about the credential, which is why `--path` is worth giving. A
 redirect is reported rather than followed, since a 302 to a login page reads as
 a 200 to anything that follows it. Exit status is zero unless something failed.
+
+Giving it every time is the part nobody remembers, so an upstream can carry the
+answer:
+
+```toml
+[[upstreams]]
+name = "cloudflare"
+base_url = "https://api.cloudflare.com/client/v4"
+verify_path = "/accounts/3f1c…/tokens/verify"
+```
+
+`verify_path` is what a verify calls when nobody passed `--path` — on the
+enrolment, on `v` in the console, and on an `upstream verify` months later.
+Profiles write it for the services whose vendor documents an endpoint for the
+purpose: Cloudflare's `/accounts/<id>/tokens/verify`, DataForSEO's
+`/v3/appendix/user_data`. An explicit `--path` still wins, because that is a
+question about one endpoint rather than about the credential.
 
 `--verify` runs the same thing as the last step of an enrolment:
 

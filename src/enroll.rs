@@ -555,6 +555,25 @@ pub fn add_upstream(
     auth: &AuthSpec,
     headers: &[(String, String)],
 ) -> Result<()> {
+    add_upstream_probing(path, name, base_url, auth, headers, None)
+}
+
+/// The same, for an enrolment that knows how this service proves a credential.
+///
+/// `verify_path` is written to the entry so that every later `verify` — the
+/// one on the enrolment, the `v` key in the console, `agent-iap verify
+/// upstream` months from now — calls the endpoint the vendor documents for
+/// the purpose rather than the root. It is a property of the service, so it
+/// belongs in the file next to the base URL rather than in the argv of
+/// whoever happens to be asking.
+pub fn add_upstream_probing(
+    path: &Path,
+    name: &str,
+    base_url: &str,
+    auth: &AuthSpec,
+    headers: &[(String, String)],
+    verify_path: Option<&str>,
+) -> Result<()> {
     check_id(name, "upstream name")?;
     check_base_url(base_url)?;
     check_secret_refs(auth)?;
@@ -581,7 +600,7 @@ pub fn add_upstream(
     append(
         &mut document,
         "upstreams",
-        upstream_entry(name, base_url, auth, headers),
+        upstream_entry(name, base_url, auth, headers, verify_path),
     );
     save(path, document)
 }
@@ -591,6 +610,7 @@ fn upstream_entry(
     base_url: &str,
     auth: &AuthSpec,
     headers: &[(String, String)],
+    verify_path: Option<&str>,
 ) -> Table {
     let mut entry = Table::new();
     entry["name"] = toml_edit::value(name);
@@ -602,6 +622,9 @@ fn upstream_entry(
             table.insert(key, Value::from(value.as_str()));
         }
         entry["headers"] = toml_edit::value(table);
+    }
+    if let Some(probe) = verify_path {
+        entry["verify_path"] = toml_edit::value(probe);
     }
     entry
 }
@@ -978,6 +1001,7 @@ pub fn remove_rule(path: &Path, index: usize) -> Result<RuleRemoval> {
 pub enum ServiceSpec<'a> {
     Upstream {
         base_url: &'a str,
+        verify_path: Option<&'a str>,
     },
     McpHttp {
         url: &'a str,
@@ -994,9 +1018,13 @@ pub enum ServiceSpec<'a> {
 /// the write produce another.
 pub fn render_service(name: &str, spec: ServiceSpec<'_>, auth: &AuthSpec) -> String {
     let (key, entry) = match spec {
-        ServiceSpec::Upstream { base_url } => {
-            ("upstreams", upstream_entry(name, base_url, auth, &[]))
-        }
+        ServiceSpec::Upstream {
+            base_url,
+            verify_path,
+        } => (
+            "upstreams",
+            upstream_entry(name, base_url, auth, &[], verify_path),
+        ),
         ServiceSpec::McpHttp { url } => (
             "mcp_servers",
             mcp_entry(
@@ -2226,6 +2254,7 @@ mod tests {
             "svc",
             ServiceSpec::Upstream {
                 base_url: "https://x.example.com",
+                verify_path: None,
             },
             &auth,
         );

@@ -362,6 +362,16 @@ pub struct UpstreamConfig {
     /// Extra static headers to add upstream (never credentials — use `auth`).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// The path `verify` calls to prove this credential, instead of the root.
+    ///
+    /// The root is the one path every base URL has and almost no API answers:
+    /// Cloudflare's is `7000 No route for that URI`, which says the host is
+    /// real and nothing at all about the token. A vendor that documents an
+    /// endpoint for "is this credential good" — `/accounts/<id>/tokens/verify`,
+    /// `/v3/appendix/user_data` — makes the difference between a probe that
+    /// proves DNS and one that proves the credential.
+    #[serde(default)]
+    pub verify_path: Option<String>,
 }
 
 /// Credential injection. Covers the schemes real APIs and MCP servers actually use.
