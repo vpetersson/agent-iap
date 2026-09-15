@@ -343,18 +343,27 @@ pub enum Verification {
 
 impl Verification {
     /// The cell, and what colour it is.
+    ///
+    /// A glyph and two words. The column is scanned, not read: what it has to
+    /// answer at a glance is which of these rows is not like the others, and
+    /// `enter` on the row is one keystroke away from the sentence. The first
+    /// version of this put the whole headline here, which ran off the side of
+    /// the pane and made a healthy upstream look like an incident report.
     pub fn cell(&self) -> (String, Color) {
         match self {
-            Verification::Running => ("checking…".to_string(), Color::Yellow),
-            Verification::Failed(error) => (error.clone(), Color::Red),
-            Verification::Done(report) => (
-                report.headline(),
-                match report.verdict() {
-                    verify::Outcome::Passed => Color::Green,
-                    verify::Outcome::Warned => Color::Yellow,
-                    verify::Outcome::Failed => Color::Red,
-                },
-            ),
+            Verification::Running => ("… checking".to_string(), Color::Yellow),
+            Verification::Failed(_) => ("✗ no report".to_string(), Color::Red),
+            Verification::Done(report) => {
+                let outcome = report.verdict();
+                (
+                    format!("{} {}", outcome.glyph(), report.brief()),
+                    match outcome {
+                        verify::Outcome::Passed => Color::Green,
+                        verify::Outcome::Warned => Color::Yellow,
+                        verify::Outcome::Failed => Color::Red,
+                    },
+                )
+            }
         }
     }
 }
@@ -1024,7 +1033,11 @@ impl App {
     fn landed(&mut self, name: String, result: Result<verify::Report>) {
         let held = match result {
             Ok(report) => {
-                let headline = format!("`{name}`: {}", report.headline());
+                // The footer gets the short form too. It is one line under a
+                // pane, so the sentence only ran off the end of it — and the
+                // modal below, or `enter` on the row later, is where the
+                // sentence belongs.
+                let headline = format!("`{name}` {} {}", report.verdict().glyph(), report.brief());
                 let failed = !report.ok();
                 let detail = report_text(&report);
                 // The whole report where there is room for it — a one-line
@@ -2821,13 +2834,28 @@ action = "allow"
             .expect("the verification reports back");
         app.landed(name, result);
 
-        let after = render(&mut app, 160, 24);
-        assert!(after.contains("200 OK"), "{after}");
-        // And the whole report is put in front of the operator, because a
-        // one-line summary of a failure is not enough to act on.
+        // The whole report is put in front of the operator, because a one-line
+        // summary of a failure is not enough to act on.
         assert!(
             matches!(&app.modal, Some(Modal::Show(shown)) if shown.title.contains("local")),
             "the report should be on screen"
+        );
+        let modal = render(&mut app, 160, 24);
+        assert!(
+            modal.contains("200 OK"),
+            "the sentence belongs in the report: {modal}"
+        );
+
+        // Behind it, the column: a glyph and two words. The sentence used to be
+        // here, where it ran off the side of the pane and made a healthy
+        // upstream read like an incident report.
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(app.modal.is_none());
+        let pane = render(&mut app, 160, 24);
+        assert!(pane.contains("✓ reachable"), "{pane}");
+        assert!(
+            !pane.contains("200 OK"),
+            "the cell must not carry the report's prose: {pane}"
         );
     }
 

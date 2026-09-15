@@ -188,6 +188,32 @@ impl Profile {
     }
 }
 
+/// The probe belonging to whatever profile fronts this base URL, for an
+/// upstream that has no `verify_path` of its own.
+///
+/// The fallback exists because `verify_path` is written at enrolment: every
+/// upstream added before a profile had a probe — or added by hand, or by an
+/// editor — carries none, and would go on being verified against its root
+/// forever. Matching on the base URL is what is available, since the policy
+/// file records no profile id; that is deliberate, and it is what makes a
+/// profile a starting point rather than something you are stuck inside.
+///
+/// A probe still holding a `{var}` is skipped: it was never expanded, so the
+/// path would be nonsense. Those upstreams need the real `verify_path` the
+/// enrolment writes.
+pub fn probe_for(base_url: &str) -> Option<String> {
+    let wanted = base_url.trim_end_matches('/');
+    catalog().into_iter().find_map(|profile| {
+        let Service::Http { base_url, .. } = &profile.service else {
+            return None;
+        };
+        if base_url.trim_end_matches('/') != wanted {
+            return None;
+        }
+        profile.probe.filter(|probe| !probe.contains('{'))
+    })
+}
+
 /// The MCP methods that carry the session rather than doing anything with it.
 ///
 /// These name no tool and no resource, so they match a rule only when it places
@@ -2057,6 +2083,27 @@ mod tests {
         }
         out.push_str(rest);
         out
+    }
+
+    /// The fallback, and the two cases it has to decline.
+    #[test]
+    fn a_probe_is_found_by_base_url_but_never_an_unexpanded_one() {
+        assert_eq!(
+            probe_for("https://api.github.com").as_deref(),
+            Some("/user")
+        );
+        // A trailing slash is the same service.
+        assert_eq!(
+            probe_for("https://api.github.com/").as_deref(),
+            Some("/user")
+        );
+        // Cloudflare's probe names an account the catalogue does not know, so
+        // the fallback cannot supply it — only the enrolment, which expanded it.
+        assert!(get("cloudflare").unwrap().probe.unwrap().contains('{'));
+        assert_eq!(probe_for("https://api.cloudflare.com/client/v4"), None);
+        // A known service with no free read-only route stays unprobed.
+        assert_eq!(probe_for("https://api.semrush.com/apis/v4"), None);
+        assert_eq!(probe_for("https://api.example.com"), None);
     }
 
     #[test]
