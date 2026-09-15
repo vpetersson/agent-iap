@@ -393,7 +393,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Three levels are worth knowing about because they exist for reasons that are not
+Four levels are worth knowing about because they exist for reasons that are not
 about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
@@ -406,6 +406,11 @@ about permissions:
   reports exist and prompts for `execute_report`, the one that runs them and
   bills. Same reasoning as `dataforseo`, except here the expensive call has a
   name you can write a rule against.
+- **`semrush-trends`** is the same v3 key as `semrush`, pointed at the Trends
+  endpoint on its own upstream. Trends bills against its own monthly allowance
+  rather than Standard API units, so the split is what lets one agent have
+  Trends and not the reports, and what puts the two budgets on separate rows in
+  the audit log.
 
 ### What is in the catalog
 
@@ -418,7 +423,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Cloudflare | `cloudflare` (the whole `client/v4` surface), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
 | PostHog | `posthog` (REST), `posthog-mcp` |
 | DataForSEO | `dataforseo`, `dataforseo-mcp` |
-| Semrush | `semrush` (v3, `?key=`), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
+| Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
 | Graylog | `graylog` |
 | Others | `anthropic`, `openai`, `github`, `linear`, `sentry`, `slack`, `stripe` |
 

@@ -1380,6 +1380,50 @@ pub fn catalog() -> Vec<Profile> {
             ),
         },
         Profile {
+            id: "semrush-trends".into(),
+            title: "Semrush Trends API".into(),
+            vendor: "Semrush".into(),
+            summary: "Traffic Analytics: visits, sources, audience overlap and market share."
+                .into(),
+            default_name: "semrush-trends".into(),
+            credential: Credential {
+                about: "the v3 API key — the same key `semrush` uses, on an account with a \
+                        Trends subscription"
+                    .into(),
+                url: "https://www.semrush.com/accounts/api-keys/active".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.semrush.com/analytics/ta/api/v3".into(),
+                auth: AuthTemplate::Query {
+                    param: "key".into(),
+                },
+            },
+            access: vec![
+                access(
+                    "read",
+                    "every Trends report — the API has no mutations",
+                    &[],
+                    vec![rule("reads", &["GET"], &["/**"], "allow")],
+                ),
+                access(
+                    "ask",
+                    "prompt for every report, because every report bills",
+                    &[],
+                    vec![rule("reports", &["GET"], &["/**"], "ask")],
+                ),
+            ],
+            note: Some(
+                "Trends reports are reachable through `semrush` too — this profile exists \
+                 for the budget rather than the paths. Trends bills against its own monthly \
+                 allowance rather than Standard API units, so an agent can exhaust one \
+                 without touching the other, and only a separate upstream makes that \
+                 visible in the audit log and grantable on its own: one agent can be given \
+                 Trends and not the reports. Same v3 key, different endpoint."
+                    .into(),
+            ),
+        },
+        Profile {
             id: "semrush-v4".into(),
             title: "Semrush API (v4)".into(),
             vendor: "Semrush".into(),
@@ -1836,6 +1880,51 @@ mod tests {
             }
             other => panic!("expected basic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn semrush_keeps_the_two_key_versions_on_two_schemes() {
+        // The keys are version-specific and Semrush does not accept one for the
+        // other, so the profiles differ in the credential scheme itself — not
+        // merely in which paths they allow.
+        let v3 = get("semrush").unwrap();
+        let vars = BTreeMap::new();
+        match build_auth(&v3.service, "env:SEMRUSH_V3", &vars, &[]).unwrap() {
+            AuthSpec::Query { param, secret } => {
+                assert_eq!(param, "key");
+                assert_eq!(secret, "env:SEMRUSH_V3");
+            }
+            other => panic!("expected query auth, got {other:?}"),
+        }
+
+        let v4 = get("semrush-v4").unwrap();
+        match build_auth(&v4.service, "env:SEMRUSH_V4", &vars, &[]).unwrap() {
+            AuthSpec::Header {
+                header,
+                secret,
+                prefix,
+            } => {
+                assert_eq!(header, "authorization");
+                assert_eq!(secret, "env:SEMRUSH_V4");
+                // The trailing space is load-bearing: the prefix is
+                // concatenated verbatim, and `ApikeyKEY` is not a credential.
+                assert_eq!(prefix.as_deref(), Some("Apikey "));
+            }
+            other => panic!("expected header auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_semrush_reports_are_reachable_at_the_root_path() {
+        // Every v3 report is `/` with a `type=` parameter, so a read level that
+        // only lists sub-paths would be a profile that can read nothing.
+        let read = get("semrush").unwrap().default_access().clone();
+        assert!(
+            read.rules
+                .iter()
+                .any(|rule| rule.paths.iter().any(|path| path == "/")),
+            "the v3 read level does not allow the root path"
+        );
     }
 
     #[test]
