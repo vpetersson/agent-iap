@@ -43,7 +43,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,7 @@ use crate::audit::AuditEvent;
 use crate::config::UpstreamConfig;
 use crate::profiles::Profile;
 use crate::state::AppState;
+use crate::verify;
 
 use actions::Policy;
 use approve::{Answer, Dialogue};
@@ -203,8 +204,13 @@ impl Tab {
                 ("f", "forget"),
             ],
             Tab::Agents => &[("n", "enrol"), ("t", "new token"), ("x", "revoke")],
-            Tab::Upstreams => &[("n", "add"), ("e", "edit"), ("x", "remove")],
-            Tab::Mcp => &[("n", "add"), ("x", "remove")],
+            Tab::Upstreams => &[
+                ("n", "add"),
+                ("e", "edit"),
+                ("v", "verify"),
+                ("x", "remove"),
+            ],
+            Tab::Mcp => &[("n", "add"), ("v", "verify"), ("x", "remove")],
             Tab::Acl => &[("n", "add rule"), ("x", "remove rule")],
             Tab::Credentials => &[("c", "re-check")],
             Tab::Profiles => &[("enter", "add")],
@@ -322,6 +328,37 @@ struct Hits {
     confirm: Option<(Rect, Rect)>,
 }
 
+/// A verification the console started, and what became of it.
+///
+/// Kept beside the panes rather than in them: it is a fact about the service at
+/// the other end, not about the policy file, and a reload that rewrites the
+/// pane should not blank the column an operator is reading. Same reasoning as
+/// `CredentialStatus`, one question further out.
+pub enum Verification {
+    Running,
+    Done(Box<verify::Report>),
+    /// It never got as far as a report — the name is not in the file any more.
+    Failed(String),
+}
+
+impl Verification {
+    /// The cell, and what colour it is.
+    pub fn cell(&self) -> (String, Color) {
+        match self {
+            Verification::Running => ("checking…".to_string(), Color::Yellow),
+            Verification::Failed(error) => (error.clone(), Color::Red),
+            Verification::Done(report) => (
+                report.headline(),
+                match report.verdict() {
+                    verify::Outcome::Passed => Color::Green,
+                    verify::Outcome::Warned => Color::Yellow,
+                    verify::Outcome::Failed => Color::Red,
+                },
+            ),
+        }
+    }
+}
+
 struct App {
     state: Arc<AppState>,
     policy: Policy,
@@ -342,7 +379,20 @@ struct App {
     hits: Hits,
     /// The last click, for spotting the second one of a pair.
     clicked: Option<(Instant, u16, u16)>,
+    /// What the last verification of each service found, by name.
+    verified: HashMap<String, Verification>,
+    /// Where a finished verification reports back. A verification is a network
+    /// call and sometimes a child process, so it runs on the runtime rather
+    /// than on this thread — the console cannot stop drawing for ten seconds,
+    /// because the thing it exists to draw is a request waiting on an answer.
+    inbox: (SendVerified, RecvVerified),
 }
+
+/// One finished verification on its way back to the console: the service it was
+/// about, and what it found.
+type Verified = (String, Result<verify::Report>);
+type SendVerified = tokio::sync::mpsc::UnboundedSender<Verified>;
+type RecvVerified = tokio::sync::mpsc::UnboundedReceiver<Verified>;
 
 impl App {
     fn new(state: Arc<AppState>, watcher: Arc<crate::reload::Watcher>) -> Result<Self> {
@@ -361,6 +411,8 @@ impl App {
             mouse: false,
             hits: Hits::default(),
             clicked: None,
+            verified: HashMap::new(),
+            inbox: tokio::sync::mpsc::unbounded_channel(),
         })
     }
 
@@ -377,6 +429,10 @@ impl App {
                     self.feed.pop_front();
                 }
                 self.feed.push_back(event);
+            }
+
+            while let Ok((name, result)) = self.inbox.1.try_recv() {
+                self.landed(name, result);
             }
 
             self.pending = self.state.broker.list();
@@ -435,8 +491,8 @@ impl App {
         match self.tab {
             Tab::Approvals => self.pending.len(),
             Tab::Agents => views::agents(&self.policy.inventory).len(),
-            Tab::Upstreams => views::upstreams(&self.policy.inventory).len(),
-            Tab::Mcp => views::mcp_servers(&self.policy.inventory).len(),
+            Tab::Upstreams => views::upstreams(&self.policy.inventory, &self.verified).len(),
+            Tab::Mcp => views::mcp_servers(&self.policy.inventory, &self.verified).len(),
             Tab::Acl => views::acl(&self.policy.inventory).len(),
             Tab::Credentials => self.policy.credentials.len(),
             Tab::Profiles => self.profiles.len(),
@@ -834,6 +890,18 @@ impl App {
                     self.modal = Some(Modal::Form(Box::new(upstream_edit_form(&upstream))));
                 }
             }
+            (Tab::Upstreams, KeyCode::Char('v')) => {
+                if let Some(name) = self.named_at_cursor(|inventory| {
+                    inventory
+                        .upstreams
+                        .iter()
+                        .flatten()
+                        .map(|row| row.name.clone())
+                        .collect()
+                }) {
+                    self.verify(name);
+                }
+            }
             (Tab::Upstreams, KeyCode::Char('x')) => {
                 if let Some(name) = self.named_at_cursor(|inventory| {
                     inventory
@@ -853,6 +921,18 @@ impl App {
             }
 
             (Tab::Mcp, KeyCode::Char('n')) => self.modal = Some(Modal::Form(Box::new(mcp_form()))),
+            (Tab::Mcp, KeyCode::Char('v')) => {
+                if let Some(name) = self.named_at_cursor(|inventory| {
+                    inventory
+                        .mcp_servers
+                        .iter()
+                        .flatten()
+                        .map(|row| row.name.clone())
+                        .collect()
+                }) {
+                    self.verify(name);
+                }
+            }
             (Tab::Mcp, KeyCode::Char('x')) => {
                 if let Some(name) = self.named_at_cursor(|inventory| {
                     inventory
@@ -908,6 +988,74 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Start a verification of one service, on the runtime rather than here.
+    ///
+    /// The credential is real and so is the call, so this is only ever on a
+    /// keystroke or on a write the operator asked to have verified — never on a
+    /// timer, and never twice at once for the same service.
+    fn verify(&mut self, name: String) {
+        if matches!(self.verified.get(&name), Some(Verification::Running)) {
+            return;
+        }
+        self.verified.insert(name.clone(), Verification::Running);
+        self.say(format!("verifying `{name}` — calling it now"));
+
+        let config = Arc::clone(&self.policy.config);
+        let resolver = Arc::clone(&self.state.resolver);
+        // The daemon's log, so a token minted to answer this question is
+        // recorded like any other token this process minted.
+        let audit = Arc::clone(&self.state.audit);
+        let post = self.inbox.0.clone();
+        tokio::spawn(async move {
+            let options = verify::Options {
+                timeout: verify::DEFAULT_TIMEOUT,
+                path: None,
+                audit: Some(audit),
+            };
+            let report = verify::target(&config, &resolver, &name, &options).await;
+            // The receiver is gone only when the console has already quit.
+            let _ = post.send((name, report));
+        });
+    }
+
+    /// A verification came back.
+    fn landed(&mut self, name: String, result: Result<verify::Report>) {
+        let held = match result {
+            Ok(report) => {
+                let headline = format!("`{name}`: {}", report.headline());
+                let failed = !report.ok();
+                let detail = report_text(&report);
+                // The whole report where there is room for it — a one-line
+                // summary of a failed handshake is not enough to act on. Never
+                // over something already on screen: a modal that appeared on
+                // its own over a half-typed form is the console taking the
+                // keyboard away.
+                if self.modal.is_none() {
+                    self.modal = Some(Modal::Show(Shown::plain(
+                        format!("{} `{}`", report.kind, report.target),
+                        detail,
+                    )));
+                }
+                self.flash = Some(Flash {
+                    message: headline,
+                    failed,
+                    at: Instant::now(),
+                });
+                Verification::Done(Box::new(report))
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.flash = Some(Flash {
+                    message: format!("could not verify `{name}`: {message}"),
+                    failed: true,
+                    at: Instant::now(),
+                });
+                Verification::Failed(message)
+            }
+        };
+        self.verified.insert(name, held);
     }
 
     fn agent_at_cursor(&self) -> Option<String> {
@@ -985,6 +1133,13 @@ impl App {
                         Ok(effect) => {
                             self.refresh();
                             self.say(effect.message);
+                            // Before the modals below, so the report lands on a
+                            // console that is not already showing a token: the
+                            // token is the one thing that is only on screen
+                            // once, and nothing may cover it.
+                            if let Some(name) = effect.verify {
+                                self.verify(name);
+                            }
                             if let Some((id, token)) = effect.token {
                                 let body = format!(
                                     "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
@@ -1323,13 +1478,13 @@ impl App {
                 "agents",
                 &mut self.cursor[index],
             ),
-            Tab::Upstreams => views::upstreams(&self.policy.inventory).render(
+            Tab::Upstreams => views::upstreams(&self.policy.inventory, &self.verified).render(
                 frame,
                 area,
                 "upstreams",
                 &mut self.cursor[index],
             ),
-            Tab::Mcp => views::mcp_servers(&self.policy.inventory).render(
+            Tab::Mcp => views::mcp_servers(&self.policy.inventory, &self.verified).render(
                 frame,
                 area,
                 "mcp servers",
@@ -1851,6 +2006,10 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ),
         ("e", "edit the upstream the cursor is on"),
         (
+            "v",
+            "verify the upstream or MCP server the cursor is on — call it, with its credential",
+        ),
+        (
             "ctrl-o",
             "on a credential field: pick the file, rather than typing its path",
         ),
@@ -1972,6 +2131,7 @@ fn upstream_form(catalogue: &[Profile], picked: &str) -> Form {
     match offered.into_iter().find(|profile| profile.id == picked) {
         Some(profile) => {
             fields.extend(profile_fields(profile));
+            fields.push(verify_field());
             Form::new(
                 Intent::Profile,
                 &format!("add an upstream — `{}`", profile.id),
@@ -1996,6 +2156,7 @@ fn upstream_form(catalogue: &[Profile], picked: &str) -> Form {
                 "headers",
                 "static headers to send upstream, NAME=VALUE — never a credential, that is what the secret is for",
             ));
+            fields.push(verify_field());
             Form::new(
                 Intent::Upstream,
                 "add an upstream",
@@ -2033,6 +2194,7 @@ fn upstream_edit_form(upstream: &UpstreamConfig) -> Form {
             .collect::<Vec<_>>()
             .join(", "),
     ));
+    fields.push(verify_field());
     Form::new(
         Intent::EditUpstream(upstream.name.clone()),
         &format!("edit upstream `{}`", upstream.name),
@@ -2057,12 +2219,45 @@ fn mcp_form() -> Form {
         Field::text("cwd", "cwd", "working directory for the child").when("transport", &["stdio"]),
     ];
     fields.extend(form::auth_fields());
+    fields.push(verify_field());
     Form::new(
         Intent::McpServer,
         "add an MCP server",
         "The proxy sees every JSON-RPC message either way, and the ACL rules on tool names.",
         fields,
     )
+}
+
+/// The last field on every form that writes a service: call it once it is
+/// written, and say what came back.
+///
+/// On by default. Adding a service you cannot reach is the mistake this catches
+/// and the one an operator has no other way of noticing until an agent is
+/// waiting on it — so it is a step of the form, there to be turned off with
+/// `space` rather than found.
+fn verify_field() -> Field {
+    Field::switch(
+        "verify",
+        "verify",
+        "after writing it, call the service with this credential and report what came back. Never undoes the write.",
+        true,
+    )
+}
+
+/// A report as a modal reads it. Pre-wrapped: `draw_show` sizes the box by
+/// counting lines, so a line it has to wrap is a line drawn past the bottom.
+fn report_text(report: &verify::Report) -> String {
+    let mut text = format!("{}\n", report.endpoint);
+    for step in &report.steps {
+        for (at, line) in verify::wrap(&step.detail, 54).into_iter().enumerate() {
+            let (outcome, name) = match at {
+                0 => (step.outcome.label(), step.name),
+                _ => ("", ""),
+            };
+            text.push_str(&format!("{outcome:<8} {name:<11} {line}\n"));
+        }
+    }
+    text
 }
 
 fn rule_form() -> Form {
@@ -2208,8 +2403,13 @@ action = "ask"
 "#;
 
     fn app_for_test(dir: &std::path::Path) -> App {
+        app_with(dir, POLICY)
+    }
+
+    /// The same, for a test that needs its own services in the file.
+    fn app_with(dir: &std::path::Path, policy: &str) -> App {
         std::env::set_var("AGENT_IAP_TEST_TOKEN", "sk-not-real");
-        let text = POLICY
+        let text = policy
             .replace("AUDIT", &dir.join("audit.jsonl").display().to_string())
             .replace("HASH", &crate::identity::token_hash("iap_test"));
         let path = dir.join("iap.toml");
@@ -2554,6 +2754,127 @@ action = "ask"
             Some("codex".to_string()),
             "an agent enrolled here has to be able to call before the next restart"
         );
+    }
+
+    /// `v` on a row calls the service and puts the answer in the pane.
+    ///
+    /// The whole point of the column: a service can be in the file, resolve its
+    /// credential and still be unreachable, and until this the console had no
+    /// way to say so.
+    #[tokio::test]
+    async fn verifying_from_the_console_fills_the_column_the_pane_shows() {
+        // A local service standing in for the upstream, so the test makes a
+        // real call and not a real internet call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(axum::routing::any(|| async { "hello" })),
+            )
+            .await
+            .unwrap()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(
+            dir.path(),
+            &format!(
+                r#"
+[audit]
+path = "AUDIT"
+stderr = false
+
+[[upstreams]]
+name = "local"
+base_url = "http://{addr}"
+
+[[acl]]
+name = "local-reads"
+kind = "http"
+target = "local"
+methods = ["GET"]
+paths = ["/**"]
+action = "allow"
+"#
+            ),
+        );
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+
+        // Before anyone asks, the column says nobody has — never a blank that
+        // could be read as a pass.
+        let before = render(&mut app, 160, 24);
+        assert!(before.contains("not checked"), "{before}");
+
+        app.handle(KeyEvent::from(KeyCode::Char('v'))).unwrap();
+        assert!(
+            matches!(app.verified.get("local"), Some(Verification::Running)),
+            "`v` starts one, and does not block the loop waiting for it"
+        );
+
+        let (name, result) = app
+            .inbox
+            .1
+            .recv()
+            .await
+            .expect("the verification reports back");
+        app.landed(name, result);
+
+        let after = render(&mut app, 160, 24);
+        assert!(after.contains("200 OK"), "{after}");
+        // And the whole report is put in front of the operator, because a
+        // one-line summary of a failure is not enough to act on.
+        assert!(
+            matches!(&app.modal, Some(Modal::Show(shown)) if shown.title.contains("local")),
+            "the report should be on screen"
+        );
+    }
+
+    /// The form's own step. On by default, and off is honoured — the flag
+    /// decides whether a network call happens at all.
+    #[tokio::test]
+    async fn the_add_form_verifies_what_it_wrote_unless_told_not_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+
+        let mut form = upstream_form(&app.profiles, NO_PROFILE);
+        assert!(
+            form.flag("verify"),
+            "verifying is a step of the form, not an extra on it"
+        );
+        set(&mut form, "name", "linear");
+        set(&mut form, "base-url", "https://api.linear.app");
+
+        let effect = actions::submit(&app.policy, &form).unwrap();
+        assert_eq!(effect.verify.as_deref(), Some("linear"));
+
+        // The same form with the switch off writes the same entry and calls
+        // nothing.
+        let mut form = upstream_form(&app.profiles, NO_PROFILE);
+        let field = form
+            .fields
+            .iter_mut()
+            .find(|field| field.key == "verify")
+            .unwrap();
+        field.value = form::Value::Flag(false);
+        set(&mut form, "name", "notion");
+        set(&mut form, "base-url", "https://api.notion.com");
+        assert_eq!(actions::submit(&app.policy, &form).unwrap().verify, None);
+    }
+
+    /// Editing is where a working upstream is most easily broken — a corrected
+    /// base URL with a typo in it looks exactly like one without.
+    #[tokio::test]
+    async fn the_edit_form_offers_the_same_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+        let upstream = app.policy.config.upstream("github").unwrap().clone();
+
+        let form = upstream_edit_form(&upstream);
+        assert!(form.flag("verify"));
+        let effect = actions::submit(&app.policy, &form).unwrap();
+        assert_eq!(effect.verify.as_deref(), Some("github"));
     }
 
     /// Types a whole form in, the way an operator does, and looks at the pane.

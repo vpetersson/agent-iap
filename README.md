@@ -235,10 +235,13 @@ agent-iap agent add claude-code --target anthropic
 export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
 agent-iap check
 
-# 4. See what the policy exposes, and to whom.
+# 4. Prove the other half: that Anthropic accepts that key.
+agent-iap upstream verify anthropic --path /v1/models
+
+# 5. See what the policy exposes, and to whom.
 agent-iap list
 
-# 5. Run it. On a terminal that is the approval console.
+# 6. Run it. On a terminal that is the approval console.
 agent-iap run
 ```
 
@@ -489,6 +492,64 @@ takes the scheme's documented constant. That constant is the one `literal:`
 the loader does not complain about, and only in that position: a `literal:` in
 `--username-secret` is still refused.
 
+### Verifying
+
+`check` asks the file a question: does it parse, does every reference resolve,
+do the rules make sense. That is half of what an operator wants to know after
+adding a service, and the other half is only answerable by the service:
+
+```bash
+agent-iap upstream verify github --path /user     # one upstream, at a real endpoint
+agent-iap upstream verify                         # every upstream in the file
+agent-iap mcp-server verify posthog               # the handshake, and the tool list
+```
+
+It makes the call. The credential is attached exactly the way the proxy attaches
+it — same injector, same URL construction — so an OAuth or service-account
+upstream is verified by *minting* the token rather than by assuming a mintable
+one, and a header scheme is verified by the service either accepting the header
+or not. What comes back is a step at a time, because "it failed" and "it failed
+at the credential" are different afternoons:
+
+```
+upstream `github` → https://api.github.com
+  ok       endpoint    GET https://api.github.com/user
+  ok       credential  bearer token resolved from op://Private/GitHub/token
+  FAILED   reach       the service rejected the credential — 401 Unauthorized in 94ms
+  warn     policy      no ACL rule reaches it — agent calls will be denied by
+                       `<default>`. Add one: agent-iap acl add --kind http
+                       --target github --methods GET --paths '/**'
+```
+
+The last step is the one that catches the enrolment that looked like it worked.
+A service can be in the file, resolve its credential, answer the probe — and
+still be unreachable by every agent, because nothing in the ACL names it and the
+default is deny. For an MCP server it also catches the narrower version: rules
+that scope `tools/call` and never admit `initialize`, so the session never opens
+and the agent sees a server that never starts.
+
+A 401 is a failure. A 404 on a base URL is not — it says the host is real and
+says nothing about the credential, which is why `--path` is worth giving. A
+redirect is reported rather than followed, since a 302 to a login page reads as
+a 200 to anything that follows it. Exit status is zero unless something failed.
+
+`--verify` runs the same thing as the last step of an enrolment:
+
+```bash
+agent-iap upstream add linear --profile linear --secret op://Private/Linear/key --verify
+agent-iap mcp-server add notes --command notes-mcp --env NOTES_TOKEN=op://… --verify
+```
+
+After the write, never instead of it: the entry is in the file whatever comes
+back, because the fix for a mistyped base URL is `upstream edit`, not doing the
+whole enrolment again. Only the exit status carries the verdict. Nothing is
+verified without being asked — the call is real and so is the credential, so it
+happens on a flag or a keystroke and never on a timer.
+
+In the console it is `v` on the upstreams or `mcp` pane, and a switch on the add
+and edit forms that is on by default. Results land in a `VERIFIED` column beside
+the row, the way the credentials pane reports what still resolves.
+
 ### Getting the token out
 
 Every command that mints a token — `init`, `agent add`, `agent rotate`,
@@ -700,8 +761,8 @@ from a shell is a form here, over the same functions with the same validation:
 | --- | --- | --- |
 | approvals | the queue, and the request in full | `enter` `a` `d` `f` |
 | agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
-| upstreams | base URL, scheme, credential reference | `n` add, from a profile or spelled out · `e` edit · `x` remove |
-| mcp | transport, command or URL, credential references | `n` `x` |
+| upstreams | base URL, scheme, credential reference, last verification | `n` add, from a profile or spelled out · `e` edit · `v` verify · `x` remove |
+| mcp | transport, command or URL, credential references, last verification | `n` add · `v` verify · `x` remove |
 | acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
@@ -763,10 +824,18 @@ changed. A file caught mid-rewrite is waited on rather than reported as broken,
 and a file edited into something that will not parse is reported once, with the
 proxy left running the last policy that did (§ Reloading).
 
+`v` on an upstream or an MCP server calls it, with the credential the file names,
+and puts the answer in the row's `VERIFIED` column — green, amber or red, and the
+whole report in a modal. It runs off the drawing thread, because the console
+cannot stop answering an `ask` for ten seconds while a vault wakes up. The add
+and edit forms carry the same thing as a switch, on by default, so a service
+written here reports whether it works before you look away (§ Verifying).
+
 A minted token is shown once, in a modal, and then only its sha256 exists. No
 credential *value* is ever displayed: the credentials pane shows references, and
 resolves them on `c` to answer the one question the file cannot — whether the
-vault is still unlocked and the variable still set.
+vault is still unlocked and the variable still set. The `VERIFIED` column is the
+same question one step further out: whether the service at the other end agrees.
 
 Everything written here is in force before you look away. Not just the rules and
 the roster: upstreams, MCP servers, credentials, timeouts, the audit log, and the
@@ -1592,8 +1661,9 @@ action = "allow"
 
 That first rule is the one everybody forgets, so `agent-iap check` warns when an
 MCP server has rules and none of them admits `initialize` — the failure it
-prevents is a `<default>` deny that names no rule to go and fix. Every
-`profile add` for an MCP server writes it for you.
+prevents is a `<default>` deny that names no rule to go and fix. `agent-iap
+mcp-server verify` says the same thing next to a live handshake, and every
+`profile add` for an MCP server writes the rule for you.
 
 `resources/read` matches on the URI instead. A denied call gets a JSON-RPC error
 (`-32001`); a denied notification is dropped. A batch is all-or-nothing, so ids
@@ -1862,7 +1932,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 378 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 425 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

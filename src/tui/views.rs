@@ -11,9 +11,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use std::collections::HashMap;
+
 use crate::config::Action;
 use crate::list::Inventory;
 use crate::profiles::Profile;
+use crate::tui::Verification;
 
 /// A credential reference and whether it currently resolves.
 ///
@@ -211,43 +214,76 @@ pub fn agents(inventory: &Inventory) -> Table {
     }
 }
 
-pub fn upstreams(inventory: &Inventory) -> Table {
+pub fn upstreams(inventory: &Inventory, verified: &Verifications) -> Table {
     Table {
-        headers: vec!["NAME", "BASE URL", "AUTH", "CREDENTIAL"],
+        headers: vec!["NAME", "BASE URL", "AUTH", "CREDENTIAL", "VERIFIED"],
         rows: inventory
             .upstreams
             .iter()
             .flatten()
             .map(|upstream| {
-                Row::new([
-                    upstream.name.clone(),
-                    upstream.base_url.clone(),
-                    upstream.auth.clone(),
-                    joined(&upstream.credentials, "—"),
-                ])
+                let (status, accent) = verdict(verified, &upstream.name);
+                Row::accented(
+                    [
+                        upstream.name.clone(),
+                        upstream.base_url.clone(),
+                        upstream.auth.clone(),
+                        joined(&upstream.credentials, "—"),
+                        status,
+                    ],
+                    accent,
+                )
             })
             .collect(),
         empty: "No upstreams.\n\nPress `n` to front an API, or pick one off the profiles pane.",
     }
 }
 
-pub fn mcp_servers(inventory: &Inventory) -> Table {
+pub fn mcp_servers(inventory: &Inventory, verified: &Verifications) -> Table {
     Table {
-        headers: vec!["NAME", "TRANSPORT", "COMMAND OR URL", "CREDENTIALS"],
+        headers: vec![
+            "NAME",
+            "TRANSPORT",
+            "COMMAND OR URL",
+            "CREDENTIALS",
+            "VERIFIED",
+        ],
         rows: inventory
             .mcp_servers
             .iter()
             .flatten()
             .map(|server| {
-                Row::new([
-                    server.name.clone(),
-                    server.transport.clone(),
-                    server.endpoint.clone(),
-                    joined(&server.credentials, "—"),
-                ])
+                let (status, accent) = verdict(verified, &server.name);
+                Row::accented(
+                    [
+                        server.name.clone(),
+                        server.transport.clone(),
+                        server.endpoint.clone(),
+                        joined(&server.credentials, "—"),
+                        status,
+                    ],
+                    accent,
+                )
             })
             .collect(),
         empty: "No MCP servers.\n\nPress `n` to add one, or pick one off the profiles pane.",
+    }
+}
+
+/// What the console knows about each service's last verification, by name.
+pub type Verifications = HashMap<String, Verification>;
+
+/// The `VERIFIED` cell.
+///
+/// The whole row takes the colour, not just this cell — a table where one
+/// column is coloured and the rest is grey reads as a typo, and the thing being
+/// reported is a fact about the row.
+fn verdict(verified: &Verifications, name: &str) -> (String, Color) {
+    match verified.get(name) {
+        // Deliberately not "ok": nobody has asked, and a blank that reads as a
+        // pass is worse than no column at all.
+        None => ("not checked".to_string(), Color::DarkGray),
+        Some(held) => held.cell(),
     }
 }
 

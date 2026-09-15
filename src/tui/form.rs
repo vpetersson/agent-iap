@@ -122,8 +122,20 @@ impl Field {
         label: impl Into<Cow<'static, str>>,
         hint: impl Into<Cow<'static, str>>,
     ) -> Self {
+        Field::switch(key, label, hint, false)
+    }
+
+    /// A `Flag` that starts on. For the one that is a step of the form rather
+    /// than an extra on it: `verify` is what the form does next, so it is there
+    /// to be turned off, not to be found.
+    pub fn switch(
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+        hint: impl Into<Cow<'static, str>>,
+        on: bool,
+    ) -> Self {
         Field {
-            value: Value::Flag(false),
+            value: Value::Flag(on),
             ..Field::text(key, label, hint)
         }
     }
