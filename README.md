@@ -794,10 +794,13 @@ shown, because the file holds none: what is prefilled is the reference.
 
 Every field that takes a credential *reference* — `secret`, `username ref`,
 `client secret`, `key file`, `private key` — will also go and find the file for
-you. `ctrl-o` on one, or a click on the `browse` the field grows while the
-cursor is on it, opens a picker: `enter` walks into a directory or chooses a
-file, `←` goes back up, typing filters the listing, `esc` leaves the field as it
-was. It opens wherever the half-typed path was headed — `file:/run/sec` starts
+you. `ctrl-o` on one opens a picker: `enter` walks into a directory or chooses
+a file, `←` goes back up, typing filters the listing, `esc` leaves the field as
+it was. The key is named twice while the cursor is on such a field — on the
+field's own line and in the dialogue's key row — and both are buttons, because
+the line that would otherwise be the only mention of it is also the line a
+failed save puts its error on, and being told a form `needs --secret <REF>` is
+exactly when you want to be told the console will go and find the file. It opens wherever the half-typed path was headed — `file:/run/sec` starts
 in `/run` — and on `$HOME` when the field says nothing about the filesystem.
 What lands in the field is the reference and not the bare path —
 `file:/run/secrets/anthropic` — which is what the config file takes. Dotted

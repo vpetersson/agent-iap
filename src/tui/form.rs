@@ -169,9 +169,10 @@ pub struct Hits {
     /// The whole dialogue, so a click outside it can be told from one inside.
     pub popup: Rect,
     pub fields: Vec<(Rect, usize)>,
-    /// Where `[browse]` was drawn beside the focused field, when that field
-    /// takes a path.
-    pub browse: Option<Rect>,
+    /// Everywhere `ctrl-o browse` was drawn for the focused field: once on the
+    /// field's own line, once in the key row. Clicking any of them opens the
+    /// picker.
+    pub browse: Vec<Rect>,
     /// The picker, when it is open over the form. Present means it owns the
     /// screen, and the fields underneath are not reachable.
     pub browser: Option<browse::Hits>,
@@ -568,7 +569,7 @@ impl Form {
         let mut hits = Hits {
             popup,
             fields: Vec::new(),
-            browse: None,
+            browse: Vec::new(),
             browser: None,
         };
         let lines: Vec<Line> = visible
@@ -612,20 +613,17 @@ impl Form {
                         },
                     ),
                 ];
-                // A field that names a file says so on the line, while the
-                // cursor is on it — and the words are a button, because the
-                // console has already promised that what it draws can be
-                // clicked.
+                // A field that names a file says so on its own line, while
+                // the cursor is on it — and says it the way every other
+                // affordance in this console does, as the key and then what
+                // the key does. A lone highlighted word reads as decoration:
+                // it tells you a picker exists without telling you how to
+                // reach it, which is worse than not drawing it at all.
                 if focused && field.browses {
                     let before = 4 + label_width + shown.chars().count();
-                    spans.push(Span::styled(BROWSE, key_style()));
-                    if before + BROWSE.len() <= line.width as usize {
-                        hits.browse = Some(Rect {
-                            x: line.x.saturating_add(before as u16),
-                            width: BROWSE.len() as u16,
-                            ..line
-                        });
-                    }
+                    spans.push(Span::styled(BROWSE_KEY, key_style()));
+                    spans.push(Span::raw(BROWSE_WHAT));
+                    hits.browse.extend(fits(line, before, BROWSE_WIDTH));
                 }
                 Line::from(spans)
             })
@@ -646,18 +644,35 @@ impl Form {
         };
         frame.render_widget(footer.wrap(Wrap { trim: true }), rows[2]);
 
+        // The key row, which is the one line of this dialogue that is always
+        // what it says it is. The line above it is the focused field's hint
+        // *or* the reason the last save failed — and a form you have just been
+        // told needs a `--secret <REF>` is exactly when you want to be told
+        // that the console will go and find the file for you. So the key lives
+        // down here as well, where an error cannot take it away.
+        let mut keys = vec![
+            Span::styled(" tab ", key_style()),
+            Span::raw(" next  "),
+            Span::styled(" ←/→ ", key_style()),
+            Span::raw(" choose  "),
+            Span::styled(" enter ", key_style()),
+            Span::raw(" save  "),
+            Span::styled(" esc ", key_style()),
+            Span::raw(" cancel"),
+        ];
+        if self
+            .fields
+            .get(self.focus)
+            .is_some_and(|field| field.browses)
+        {
+            let before: usize = keys.iter().map(|span| span.content.chars().count()).sum();
+            keys.push(Span::raw("  "));
+            keys.push(Span::styled(BROWSE_KEY, key_style()));
+            keys.push(Span::raw(BROWSE_WHAT));
+            hits.browse.extend(fits(rows[3], before + 2, BROWSE_WIDTH));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" tab ", key_style()),
-                Span::raw(" next  "),
-                Span::styled(" ←/→ ", key_style()),
-                Span::raw(" choose  "),
-                Span::styled(" enter ", key_style()),
-                Span::raw(" save  "),
-                Span::styled(" esc ", key_style()),
-                Span::raw(" cancel"),
-            ]))
-            .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Line::from(keys)).style(Style::default().fg(Color::DarkGray)),
             rows[3],
         );
 
@@ -671,9 +686,22 @@ impl Form {
     }
 }
 
-/// What a field that names a file is offered with, and the width the hit box
-/// is worked out from. ASCII, so `len` is the column count.
-const BROWSE: &str = " browse ";
+/// How the picker is offered, wherever it is offered: the key, then what the
+/// key does. ASCII, so `len` is the column count.
+const BROWSE_KEY: &str = " ctrl-o ";
+const BROWSE_WHAT: &str = " browse";
+const BROWSE_WIDTH: usize = BROWSE_KEY.len() + BROWSE_WHAT.len();
+
+/// The hit box for something `width` columns wide drawn `before` columns into
+/// `line` — or nothing at all, when the line was too narrow to have drawn it
+/// where the click would land.
+fn fits(line: Rect, before: usize, width: usize) -> Option<Rect> {
+    (before + width <= line.width as usize).then(|| Rect {
+        x: line.x.saturating_add(before as u16),
+        width: width as u16,
+        ..line
+    })
+}
 
 pub(super) fn key_style() -> Style {
     Style::default()

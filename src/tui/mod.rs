@@ -764,9 +764,9 @@ impl App {
         if !within(hits.popup, at) {
             return;
         }
-        // `browse` sits on the focused field's own line, so it has to be
-        // tested before the line it is drawn on.
-        if hits.browse.is_some_and(|rect| within(rect, at)) {
+        // `ctrl-o browse` sits on the focused field's own line, so it has to
+        // be tested before the line it is drawn on.
+        if hits.browse.iter().any(|rect| within(*rect, at)) {
             self.handle_modal(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
             return;
         }
@@ -3154,6 +3154,69 @@ action = "allow"
                 .expose(),
             "sk-not-real"
         );
+    }
+
+    /// The bug this replaces: the key that opens the picker was only ever
+    /// named on the hint line, and the hint line is also where a failed save
+    /// puts its error. So the state you actually reach it from — `n`, pick the
+    /// profile, `enter`, "needs `--secret <REF>`" — was the one state where
+    /// nothing on screen said how to get there.
+    #[tokio::test]
+    async fn the_key_that_opens_the_picker_survives_an_error_on_the_hint_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+
+        // Any profile whose credential is a file will do; this is the one the
+        // report came in on.
+        let wanted = "google-analytics-data";
+        for _ in 0..app.profiles.len() + 1 {
+            match &app.modal {
+                Some(Modal::Form(form)) if form.text("id") == wanted => break,
+                _ => app.handle(KeyEvent::from(KeyCode::Right)).unwrap(),
+            };
+        }
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // name
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            rendered.contains("needs `--secret <REF>`"),
+            "the state under test is the one with an error showing: {rendered}"
+        );
+        assert!(
+            rendered.matches("ctrl-o").count() >= 2,
+            "the key belongs on the field and in the key row, which an error \
+             cannot cover: {rendered}"
+        );
+    }
+
+    /// And both places it is drawn are buttons, because the console promises
+    /// that anything it draws with a key on it can be clicked instead.
+    #[tokio::test]
+    async fn every_drawn_browse_affordance_opens_the_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // auth
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
+        render(&mut app, 120, 34);
+
+        let targets = app.hits.form.as_ref().unwrap().browse.clone();
+        assert_eq!(targets.len(), 2, "the field's own line, and the key row");
+        for rect in targets {
+            app.click((rect.x + 1, rect.y), false).unwrap();
+            assert!(
+                matches!(&app.modal, Some(Modal::Form(form)) if form.browsing()),
+                "a click at {rect:?} left the picker shut"
+            );
+            app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+        }
     }
 
     /// Same form, from the pointer: a double-click opens the row.
