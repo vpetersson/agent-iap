@@ -251,6 +251,14 @@ struct Shown {
 }
 
 impl Shown {
+    /// Is this one holding something that will not be on screen again?
+    ///
+    /// The one question that decides how hard it is to close: a preview can go
+    /// on any key, because the thing it previewed is still there to look at.
+    fn irreplaceable(&self) -> bool {
+        self.secret
+    }
+
     /// A dry run, a preview — something to read and close.
     fn plain(title: String, body: String) -> Self {
         Shown {
@@ -279,10 +287,23 @@ impl Shown {
 /// Every outcome gets one, including the refusals: the operator pressed a key
 /// and is owed an answer, and "nothing happened" is indistinguishable from a
 /// console that has stopped responding.
+///
+/// `Sent` is the awkward one. The sequence left this process and that is all
+/// anybody can know — so when a multiplexer is in the way, the line also names
+/// the setting to go and check, because "paste it to be sure" is no help at all
+/// to the operator who just did and found nothing there.
 fn copy_note(outcome: crate::clipboard::Copied) -> String {
-    use crate::clipboard::Copied;
+    use crate::clipboard::{Copied, Relay};
     match outcome {
-        Copied::Sent => "copied — OSC 52 is one-way, so paste it somewhere to be sure".into(),
+        Copied::Sent => match crate::clipboard::relay() {
+            Relay::None => "copied — OSC 52 is one-way, so paste it somewhere to be sure".into(),
+            Relay::Tmux => "copied — paste it somewhere to be sure. If nothing arrived, tmux \
+                            swallowed it: `set -g set-clipboard on`."
+                .into(),
+            Relay::Screen => "copied — paste it somewhere to be sure. If nothing arrived, \
+                              screen swallowed it."
+                .into(),
+        },
         Copied::Declined => "not copied — IAP_NO_CLIPBOARD is set".into(),
         Copied::NoTerminal | Copied::Failed => "could not reach the terminal's clipboard".into(),
         Copied::TooLarge => "too long for OSC 52, so nothing was copied".into(),
@@ -529,6 +550,11 @@ impl App {
         self.cursor[self.tab.index()].selected()
     }
 
+    /// Is a modal holding something that will not be on screen again?
+    fn showing_a_secret(&self) -> bool {
+        matches!(&self.modal, Some(Modal::Show(shown)) if shown.irreplaceable())
+    }
+
     fn say(&mut self, message: impl Into<String>) {
         self.flash = Some(Flash {
             message: message.into(),
@@ -546,10 +572,39 @@ impl App {
     }
 
     /// Re-read the policy file into the console and into the running proxy.
-    fn refresh(&mut self) {
-        if let Err(error) = self.policy.rebuild(&self.state) {
-            self.blame(&error);
-        }
+    ///
+    /// The error is handed back rather than flashed here, because what it means
+    /// depends on what the caller just did. On `r` it is a refused reload and
+    /// nothing else. After a write it is something worse — see `stale`.
+    fn refresh(&mut self) -> Result<()> {
+        self.policy.rebuild(&self.state)
+    }
+
+    /// Report a write that landed in the file and a reload the proxy refused.
+    ///
+    /// Neither of the two obvious messages is true here. "enrolled `x`" is a lie
+    /// about the running policy, which is still the one from before; the bare
+    /// reload error is a lie about the file, which has the edit in it. And this
+    /// is not a rare corner: `AppState::reload` re-resolves every credential the
+    /// file names, so an unrelated `op://` reference whose vault relocked since
+    /// startup is enough to refuse a policy that is otherwise fine.
+    ///
+    /// Saying it matters more than it looks. These panes are built from the
+    /// config that is in force, so a refused reload leaves them showing the
+    /// policy from before the write — and without this line, that stale pane is
+    /// the *entire* symptom: the agent is in the file, the footer says it was
+    /// enrolled, and the list it should have appeared in has not changed.
+    fn stale(&mut self, error: &anyhow::Error) {
+        let file = self.file_name();
+        self.flash = Some(Flash {
+            message: format!(
+                "the edit is in {file}, but the proxy refused to reload it and is still serving \
+                 the previous policy — these panes with it, so what they show is not what was \
+                 just written: {error:#}"
+            ),
+            failed: true,
+            at: Instant::now(),
+        });
     }
 
     /// Catch up to a policy somebody else put in charge.
@@ -613,12 +668,10 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Char('r') => {
-                self.refresh();
-                if self.flash.as_ref().is_none_or(|flash| !flash.failed) {
-                    self.say("re-read the policy file");
-                }
-            }
+            KeyCode::Char('r') => match self.refresh() {
+                Ok(()) => self.say("re-read the policy file"),
+                Err(error) => self.blame(&error),
+            },
             // Reporting the pointer is what stops the terminal's own
             // selection working, and the one thing an operator most wants to
             // select out of this screen is a token — which `c` now copies
@@ -698,8 +751,13 @@ impl App {
             return Ok(false);
         }
         if let Some(popup) = self.hits.plain_modal {
-            if within(popup, at) {
-                // Anything dismisses these; the keyboard says so too.
+            // A click dismisses a preview, which is what the modal says. Not a
+            // token: a press of the left button over text is how a person
+            // starts selecting it, and the text they are reaching for is the
+            // one thing on this console that cannot be shown twice. Dismissing
+            // on it throws the token away on behalf of somebody trying to copy
+            // it, which is exactly what happened.
+            if within(popup, at) && !self.showing_a_secret() {
                 self.handle_modal(KeyEvent::from(KeyCode::Enter));
             }
             return Ok(false);
@@ -1107,13 +1165,25 @@ impl App {
     fn handle_modal(&mut self, key: KeyEvent) {
         match self.modal.take() {
             Some(Modal::Help) => {}
-            // Any key closes this one — except the one that copies, which
-            // would otherwise take the token off the screen at the same moment
-            // it says whether the clipboard got it.
             Some(Modal::Show(mut shown)) => {
                 let copying = key.code == KeyCode::Char('c') && key.modifiers.is_empty();
                 if let (true, Some(token)) = (copying, shown.copy.clone()) {
                     shown.note = Some(copy_note(crate::clipboard::copy(&token, true)));
+                    self.modal = Some(Modal::Show(shown));
+                    return;
+                }
+                // A preview goes on any key: whatever it was previewing is
+                // still there to look at. A token does not — it is on screen
+                // for the only time it will ever be on screen, and "any key"
+                // includes the `j` of somebody who thought the modal had
+                // already gone, or the second half of a two-character id typed
+                // a moment too late. So it takes a key that means it, and says
+                // which ones those are.
+                if shown.irreplaceable() && !closes_a_secret(key.code) {
+                    shown.note = Some(
+                        "still here — `esc`, `enter` or `q` closes it, and then it is gone"
+                            .to_string(),
+                    );
                     self.modal = Some(Modal::Show(shown));
                 }
             }
@@ -1144,8 +1214,13 @@ impl App {
                     Outcome::Cancel => {}
                     Outcome::Submit => match actions::submit(&self.policy, &form) {
                         Ok(effect) => {
-                            self.refresh();
-                            self.say(effect.message);
+                            // The write succeeded; the reload is a separate
+                            // question, and the answer to it must not be
+                            // written over by this form's own good news.
+                            match self.refresh() {
+                                Ok(()) => self.say(effect.message),
+                                Err(error) => self.stale(&error),
+                            }
                             // Before the modals below, so the report lands on a
                             // console that is not already showing a token: the
                             // token is the one thing that is only on screen
@@ -1158,7 +1233,8 @@ impl App {
                                     "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
                                  upstream key: it buys nothing anywhere else, and revoking it \
                                  rotates nothing. The file got only its sha256, so this is the \
-                                 last time anything can print it."
+                                 last time anything can print it — if it gets away, `t` on the \
+                                 agents pane mints another and retires this one."
                                 );
                                 self.modal = Some(Modal::Show(Shown::token(
                                     format!("token for `{id}` — shown once"),
@@ -1189,10 +1265,14 @@ impl App {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let prune = confirm.prune.unwrap_or(false);
                 let result = self.destroy(&confirm.intent, prune);
-                self.refresh();
-                match result {
-                    Ok(message) => self.say(message),
-                    Err(error) => self.blame(&error),
+                let reloaded = self.refresh();
+                // A `destroy` that failed wrote nothing, so its own error is
+                // the whole story and a reload that also failed is a second
+                // symptom of the same thing.
+                match (result, reloaded) {
+                    (Err(error), _) => self.blame(&error),
+                    (Ok(message), Ok(())) => self.say(message),
+                    (Ok(_), Err(error)) => self.stale(&error),
                 }
             }
             KeyCode::Char('p') if confirm.prune.is_some() => {
@@ -1220,7 +1300,8 @@ impl App {
                 let token = agent.token.clone();
                 let body = format!(
                     "{token}\n\nThe old token stopped working the moment this was written. \
-                     Nothing upstream rotated."
+                     Nothing upstream rotated. This is the only time it is printed — `t` again \
+                     mints another if it gets away."
                 );
                 self.modal = Some(Modal::Show(Shown::token(
                     format!("new token for `{id}` — shown once"),
@@ -1292,7 +1373,15 @@ impl App {
                 match self.write_rule(&reach.rule, word, at, ttl) {
                     Ok(landed) => {
                         self.state.broker.decide_scoped(&view.id, verdict, None);
-                        self.refresh();
+                        // The request in hand is answered either way — that
+                        // went to the broker, not to the file. What a refused
+                        // reload costs is the standing rule: it is in the file
+                        // and it is not governing anything, which is the last
+                        // thing to tell somebody who just chose "from now on".
+                        if let Err(error) = self.refresh() {
+                            self.stale(&error);
+                            return;
+                        }
                         let until = match ttl {
                             Some(ttl) => format!(
                                 "until {}",
@@ -1714,6 +1803,15 @@ fn hint_key(hint: &str) -> Option<KeyCode> {
     }
 }
 
+/// The keys that dismiss a modal holding something shown once.
+///
+/// Three rather than one, because each is what a different operator will
+/// already be reaching for — and none of them is a key that arrives by
+/// accident on the way to somewhere else.
+fn closes_a_secret(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
+}
+
 /// Is this cell inside that rectangle?
 fn within(rect: Rect, (column, row): (u16, u16)) -> bool {
     rect.width > 0
@@ -1980,9 +2078,12 @@ fn draw_show(frame: &mut Frame, area: Rect, shown: &Shown) -> Rect {
         )));
     }
     lines.push(Line::from(Span::styled(
-        match copy {
-            Some(_) => "`c` to copy it to your clipboard · any other key to close",
-            None => "any key to close",
+        match (copy, secret) {
+            (Some(_), true) => {
+                "`c` to copy it to your clipboard · `esc`, `enter` or `q` to close it for good"
+            }
+            (Some(_), false) => "`c` to copy it · any other key to close",
+            (None, _) => "any key to close",
         },
         Style::default().fg(Color::DarkGray),
     )));
@@ -2031,6 +2132,10 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         (
             "c",
             "copy the token a modal is showing — or, on credentials, re-resolve them",
+        ),
+        (
+            "esc / q",
+            "close a modal showing a token — it takes a named key, so a stray one cannot lose it",
         ),
         (
             "enter",
@@ -2621,7 +2726,7 @@ action = "ask"
             })
             .collect();
         std::fs::write(dir.path().join("iap.toml"), expired.join("\n")).unwrap();
-        app.refresh();
+        app.refresh().unwrap();
 
         assert_eq!(
             app.state.acl.evaluate(&view.request).action,
@@ -2758,7 +2863,7 @@ action = "ask"
         form.fields[2].value = form::Value::Text("github".into());
 
         let effect = actions::submit(&app.policy, &form).unwrap();
-        app.refresh();
+        app.refresh().unwrap();
         let (_, token) = effect.token.expect("a new agent is a new token");
 
         let authenticated = app.state.agents.authenticate(&token);
@@ -2962,7 +3067,7 @@ action = "allow"
         set(&mut form, "base-url", "https://api.linear.app");
 
         let effect = actions::submit(&app.policy, &form).unwrap();
-        app.refresh();
+        app.refresh().unwrap();
 
         assert!(
             !effect.message.contains("restart"),
@@ -3035,7 +3140,7 @@ action = "allow"
         type_in(&mut app, "env:AGENT_IAP_TEST_TOKEN");
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
         assert!(app.modal.is_none(), "a saved form closes");
-        app.refresh();
+        app.refresh().unwrap();
 
         let config = app.state.config();
         let upstream = config
@@ -3561,5 +3666,221 @@ action = "allow"
         // wants the log stream on it anyway.
         assert_eq!(choose(true, false, false), Console::Draw);
         assert_eq!(choose(false, true, true), Console::Headless);
+    }
+    // ---- a token is on screen once, and only a named key takes it off ------
+
+    fn token_modal(app: &mut App) -> Rect {
+        app.modal = Some(Modal::Show(Shown::token(
+            "token for `claude-code` — shown once".into(),
+            "iap_the_only_copy",
+            "iap_the_only_copy\n\nGive this to the agent as IAP_TOKEN.".into(),
+        )));
+        // Drawing is what records the hit box a click is tested against.
+        render(app, 120, 34);
+        app.hits
+            .plain_modal
+            .expect("the modal registered a hit box")
+    }
+
+    /// The report: `c` did not reach the clipboard under tmux, so the operator
+    /// reached for the mouse — and the click that starts a text selection over
+    /// the token is the click that threw the token away.
+    #[tokio::test]
+    async fn a_click_on_a_token_does_not_throw_it_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let popup = token_modal(&mut app);
+
+        app.click((popup.x + 4, popup.y + 2), false).unwrap();
+
+        assert!(
+            app.showing_a_secret(),
+            "a click over the token dismissed the one modal that can never be reopened"
+        );
+        assert!(render(&mut app, 120, 34).contains("iap_the_only_copy"));
+    }
+
+    /// The same for the keyboard: "any key" includes every key pressed by
+    /// somebody who thought the modal had already gone.
+    #[tokio::test]
+    async fn a_stray_key_does_not_throw_a_token_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        token_modal(&mut app);
+
+        for stray in ['j', 'n', 'x', '2'] {
+            app.handle(KeyEvent::from(KeyCode::Char(stray))).unwrap();
+            assert!(
+                app.showing_a_secret(),
+                "`{stray}` took the token off screen"
+            );
+        }
+
+        // And it says so, rather than looking like a console that has stopped
+        // responding to the keyboard.
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("still here"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_named_key_closes_the_token_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        for key in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+            let mut app = app_for_test(dir.path());
+            token_modal(&mut app);
+            app.handle(KeyEvent::from(key)).unwrap();
+            assert!(app.modal.is_none(), "{key:?} did not close the modal");
+        }
+    }
+
+    /// A preview is not a secret: whatever it was previewing is still there, so
+    /// it keeps the cheaper dismissal.
+    #[tokio::test]
+    async fn a_dry_run_still_closes_on_any_key_and_on_a_click() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.modal = Some(Modal::Show(Shown::plain(
+            "dry run — nothing was written".into(),
+            "[[upstreams]]".into(),
+        )));
+        app.handle(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        assert!(app.modal.is_none());
+
+        app.modal = Some(Modal::Show(Shown::plain("dry run".into(), "x".into())));
+        let popup = {
+            render(&mut app, 120, 34);
+            app.hits.plain_modal.unwrap()
+        };
+        app.click((popup.x + 2, popup.y + 2), false).unwrap();
+        assert!(app.modal.is_none());
+    }
+
+    // ---- a write that lands and a reload that does not --------------------
+
+    /// The reported symptom, and the reason it was only a symptom: the pane did
+    /// not refresh because the reload was refused, and the footer said the
+    /// enrolment had worked anyway.
+    #[tokio::test]
+    async fn a_refused_reload_after_a_write_is_not_reported_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        // A credential this proxy can read at startup and not afterwards —
+        // a stand-in for the `op://` vault that relocks while the console is
+        // open, which is the ordinary way this happens.
+        let secret = dir.path().join("upstream.key");
+        std::fs::write(&secret, "sk-not-real").unwrap();
+        let mut app = app_with(
+            dir.path(),
+            &POLICY.replace(
+                r#"secret = "env:AGENT_IAP_TEST_TOKEN""#,
+                &format!(r#"secret = "file:{}""#, secret.display()),
+            ),
+        );
+        app.tab = Tab::Agents;
+        assert_eq!(views::agents(&app.policy.inventory).len(), 1);
+
+        // Every reload re-resolves every reference the file names, so one that
+        // stopped resolving refuses a policy that is otherwise fine.
+        std::fs::remove_file(&secret).unwrap();
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        for ch in "new-agent".chars() {
+            app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        let written = std::fs::read_to_string(&app.policy.path).unwrap();
+        assert!(written.contains("new-agent"), "the write itself landed");
+        assert_eq!(
+            views::agents(&app.policy.inventory).len(),
+            1,
+            "the pane is showing the policy still in force, which is the old one"
+        );
+
+        let flash = app.flash.as_ref().expect("the console said something");
+        assert!(
+            flash.failed,
+            "reported as a success: `{}`, with a stale pane as the only hint",
+            flash.message
+        );
+        assert!(
+            flash.message.contains("the edit is in iap.toml")
+                && flash.message.contains("upstream.key"),
+            "the line has to name both halves — the file has it, the proxy does not: `{}`",
+            flash.message
+        );
+    }
+
+    /// And the ordinary case is untouched: the write lands, the reload takes,
+    /// and the pane has the new row before the operator looks away.
+    #[tokio::test]
+    async fn enrolling_puts_the_agent_in_the_pane_and_the_token_on_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Agents;
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        for ch in "new-agent".chars() {
+            app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert_eq!(views::agents(&app.policy.inventory).len(), 2);
+        assert!(app.showing_a_secret(), "the token is the modal that is up");
+        assert!(!app.flash.as_ref().unwrap().failed);
+    }
+    /// `t` on the agents pane — "new token" — end to end: the confirm, the
+    /// mint, and the one moment the token exists outside the file.
+    #[tokio::test]
+    async fn minting_a_new_token_leaves_it_on_screen_and_the_old_one_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Agents;
+        app.cursor[Tab::Agents.index()].select(Some(0));
+        assert!(app.state.agents.authenticate("iap_test").is_some());
+
+        app.handle(KeyEvent::from(KeyCode::Char('t'))).unwrap();
+        assert!(
+            matches!(app.modal, Some(Modal::Confirm(_))),
+            "it asks first"
+        );
+        app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+
+        assert!(app.showing_a_secret(), "the new token has to be on screen");
+        assert!(
+            app.state.agents.authenticate("iap_test").is_none(),
+            "and the old one has to be dead in the running proxy, not just in the file"
+        );
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("iap_"), "{rendered}");
+        assert!(rendered.contains("`t` again mints another"), "{rendered}");
+    }
+
+    /// The worst combination: the mint succeeded, the reload did not. The
+    /// token is still the only copy there will ever be, so the refusal is
+    /// reported *around* it rather than in place of it.
+    #[tokio::test]
+    async fn a_refused_reload_never_takes_the_minted_token_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("upstream.key");
+        std::fs::write(&secret, "sk-not-real").unwrap();
+        let mut app = app_with(
+            dir.path(),
+            &POLICY.replace(
+                r#"secret = "env:AGENT_IAP_TEST_TOKEN""#,
+                &format!(r#"secret = "file:{}""#, secret.display()),
+            ),
+        );
+        app.tab = Tab::Agents;
+        app.cursor[Tab::Agents.index()].select(Some(0));
+        std::fs::remove_file(&secret).unwrap();
+
+        app.handle(KeyEvent::from(KeyCode::Char('t'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+
+        assert!(
+            app.showing_a_secret(),
+            "the token went down with the reload"
+        );
+        assert!(app.flash.as_ref().unwrap().failed, "and nobody was told");
     }
 }
