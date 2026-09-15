@@ -719,6 +719,22 @@ naming the same thing — which `x` and `n` could not have managed between them.
 The name itself is not on the form for that reason. No credential *value* is
 shown, because the file holds none: what is prefilled is the reference.
 
+Every field that takes a credential *reference* — `secret`, `username ref`,
+`client secret`, `key file`, `private key` — will also go and find the file for
+you. `ctrl-o` on one, or a click on the `browse` the field grows while the
+cursor is on it, opens a picker: `enter` walks into a directory or chooses a
+file, `←` goes back up, typing filters the listing, `esc` leaves the field as it
+was. It opens wherever the half-typed path was headed — `file:/run/sec` starts
+in `/run` — and on `$HOME` when the field says nothing about the filesystem.
+What lands in the field is the reference and not the bare path —
+`file:/run/secrets/anthropic` — which is what the config file takes. Dotted
+files and dotted directories are listed like anything else, because `~/.ssh`,
+`~/.config` and `.env` are very nearly the whole answer to where such a file is
+kept. Nothing is read: the picker lists names, and the file is opened for
+the first time by the proxy resolving it — a picker that showed you the first
+line to tell two keys apart would be putting a credential on the one screen
+that has kept them off it.
+
 It answers the mouse, too. Click a tab to change pane, a row to select it,
 twice to open it — the same thing `enter` does there. The wheel scrolls the
 pane, and the scope list when the dialogue is up. The footer's key hints are

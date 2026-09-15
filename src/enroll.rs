@@ -192,6 +192,22 @@ impl AuthInput {
         }
     }
 
+    /// Which of `fields_for`'s keys hold a secret *reference* — `env:NAME`,
+    /// `file:/path`, `op://vault/item/field` — rather than a plain value.
+    ///
+    /// `--header x-api-key` is a header name and `--issuer` is a JWT claim;
+    /// neither is resolved against anything. These five are, which is why the
+    /// console offers its file picker on exactly these and why an error about
+    /// one of them has to be redacted before it is printed. The list is
+    /// checked against `AuthConfig::secret_fields` in the tests, so a scheme
+    /// that grows a sixth cannot quietly be left off it.
+    pub fn is_reference(key: &str) -> bool {
+        matches!(
+            key,
+            "secret" | "username-secret" | "client-secret" | "key-file" | "private-key"
+        )
+    }
+
     /// A credential already in the file, read back as the fields a human would
     /// have typed to produce it.
     ///
@@ -1569,6 +1585,68 @@ mod tests {
 
     fn load(path: &Path) -> Config {
         toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// `is_reference` is a list, and a list beside a `match` is a list that
+    /// goes stale. `AuthConfig::secret_fields` is the one that decides what
+    /// gets resolved, so it is the one this is held against: every scheme,
+    /// every field it fills, both ways.
+    #[test]
+    fn the_fields_that_hold_a_reference_are_the_ones_that_get_resolved() {
+        for auth in [
+            AuthConfig::Bearer {
+                secret: "env:A".into(),
+            },
+            AuthConfig::Header {
+                header: "x-api-key".into(),
+                secret: "env:B".into(),
+                prefix: Some("Token ".into()),
+            },
+            AuthConfig::Basic {
+                username: Some("someone".into()),
+                username_secret: Some("env:C".into()),
+                secret: "env:D".into(),
+            },
+            AuthConfig::Query {
+                param: "key".into(),
+                secret: "env:E".into(),
+            },
+            AuthConfig::Oauth2ClientCredentials {
+                token_url: "https://id.example.com/token".into(),
+                client_id: "iap".into(),
+                client_secret: "env:F".into(),
+                scope: Some("read".into()),
+                audience: Some("https://example.com".into()),
+            },
+            AuthConfig::ServiceAccountJwt {
+                key_file: Some("env:G".into()),
+                issuer: Some("iap@example.iam.gserviceaccount.com".into()),
+                private_key: Some("env:H".into()),
+                key_id: Some("abc".into()),
+                token_url: Some("https://oauth2.example.com/token".into()),
+                audience: None,
+                scopes: vec!["https://example.com/auth".into()],
+                subject: Some("person@example.com".into()),
+                lifetime_secs: Some(600),
+            },
+        ] {
+            let input = AuthInput::of(&auth);
+            let mut claimed: Vec<&str> = AuthInput::fields_for(&input.scheme)
+                .iter()
+                .copied()
+                .filter(|key| AuthInput::is_reference(key) && input.value(key).is_some())
+                .collect();
+            // `auth.username_secret` as the config file spells it is
+            // `username-secret` as a flag and a field.
+            let mut resolved: Vec<String> = auth
+                .secret_fields()
+                .into_iter()
+                .map(|(field, _)| field.trim_start_matches("auth.").replace('_', "-"))
+                .collect();
+            claimed.sort_unstable();
+            resolved.sort_unstable();
+            assert_eq!(claimed, resolved, "for `{}`", input.scheme);
+        }
     }
 
     /// The whole point of the change: `init` then three commands, no editor.

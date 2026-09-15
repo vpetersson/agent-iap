@@ -29,6 +29,7 @@
 
 mod actions;
 mod approve;
+mod browse;
 mod form;
 mod views;
 
@@ -620,7 +621,7 @@ impl App {
             return Ok(false);
         }
         if let Some(hits) = self.hits.form.clone() {
-            self.click_form(at, &hits);
+            self.click_form(at, double, &hits);
             return Ok(false);
         }
         if let Some((yes, no)) = self.hits.confirm {
@@ -693,8 +694,24 @@ impl App {
         }
     }
 
-    fn click_form(&mut self, at: (u16, u16), hits: &form::Hits) {
+    fn click_form(&mut self, at: (u16, u16), double: bool, hits: &form::Hits) {
+        // The picker is a modal over a modal: while it is up, a click is its
+        // own or it is nothing. The fields behind it are not reachable.
+        if let Some(picker) = &hits.browser {
+            if let (Some(Modal::Form(form)), true) = (&mut self.modal, within(picker.popup, at)) {
+                if let Some((_, row)) = picker.rows.iter().find(|(rect, _)| within(*rect, at)) {
+                    form.click_browse(*row, double);
+                }
+            }
+            return;
+        }
         if !within(hits.popup, at) {
+            return;
+        }
+        // `browse` sits on the focused field's own line, so it has to be
+        // tested before the line it is drawn on.
+        if hits.browse.is_some_and(|rect| within(rect, at)) {
+            self.handle_modal(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
             return;
         }
         let Some((_, index)) = hits.fields.iter().find(|(rect, _)| within(*rect, at)) else {
@@ -725,6 +742,10 @@ impl App {
                 let key = if up { KeyCode::Up } else { KeyCode::Down };
                 dialogue.handle(KeyEvent::from(key));
             }
+            // Over the form the wheel walks the fields; over the picker it
+            // scrolls the listing, which is what a wheel over a list of files
+            // has to do.
+            Some(Modal::Form(form)) if form.browsing() => form.scroll_browse(up),
             Some(Modal::Form(form)) => {
                 let key = if up { KeyCode::BackTab } else { KeyCode::Tab };
                 form.handle(KeyEvent::from(key));
@@ -1829,6 +1850,10 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
             "add — agent, upstream (from a profile, or spelled out), MCP server, rule",
         ),
         ("e", "edit the upstream the cursor is on"),
+        (
+            "ctrl-o",
+            "on a credential field: pick the file, rather than typing its path",
+        ),
         ("x", "remove what the cursor is on"),
         ("t", "mint a new token for the selected agent"),
         (
@@ -2111,7 +2136,12 @@ fn profile_fields(profile: &Profile) -> Vec<Field> {
         .collect();
     let mut fields = vec![
         Field::prefilled("as", "name", "name it takes in the policy file — how one proxy fronts two accounts of the same service", &profile.default_name),
-        Field::text("secret", "secret", "credential reference: env:NAME, file:/path, op://vault/item/field"),
+        Field::text(
+            "secret",
+            "secret",
+            "credential reference: env:NAME, file:/path, op://vault/item/field",
+        )
+        .browsable(),
         Field::choice("access", "access", "which bundle of scopes and rules to write", &levels),
     ];
 
@@ -2748,6 +2778,61 @@ action = "ask"
         let rendered = render(&mut app, 140, 30);
         assert!(rendered.contains("github.example.com"), "{rendered}");
         assert!(!rendered.contains("restart"), "{rendered}");
+    }
+
+    /// The path is the one thing on a credential form that nothing checks
+    /// until the proxy tries to resolve it, so it is the one worth not typing.
+    #[tokio::test]
+    async fn a_credential_can_be_pointed_at_a_file_by_walking_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        std::fs::write(dir.path().join("anthropic.key"), "sk-not-real").unwrap();
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // auth
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        type_in(&mut app, &format!("file:{}/", dir.path().display()));
+        app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        // The listing is drawn over the form, showing the directory the
+        // half-typed path named rather than one the operator has to walk to.
+        let rendered = render(&mut app, 140, 40);
+        assert!(rendered.contains("pick a file"), "{rendered}");
+        assert!(rendered.contains("anthropic.key"), "{rendered}");
+
+        type_in(&mut app, "anthropic");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(
+            matches!(app.modal, Some(Modal::Form(_))),
+            "picking a file returns to the form rather than saving it"
+        );
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(
+            app.modal.is_none(),
+            "and then the form saves as it always did"
+        );
+
+        let auth = app.state.config().upstream("github").unwrap().auth.clone();
+        assert!(
+            matches!(&auth, crate::config::AuthConfig::Bearer { secret }
+                     if secret == &format!("file:{}", dir.path().join("anthropic.key").display())),
+            "the field takes the reference, not the bare path: {auth:?}"
+        );
+        // And what was written resolves, which is the whole point of having
+        // chosen the file off the filesystem instead of typing its name.
+        assert_eq!(
+            app.state
+                .resolver
+                .resolve(auth.secret_refs()[0])
+                .unwrap()
+                .expose(),
+            "sk-not-real"
+        );
     }
 
     /// Same form, from the pointer: a double-click opens the row.
