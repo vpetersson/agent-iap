@@ -2409,11 +2409,19 @@ fn rule_form() -> Form {
                 "URL paths, or for MCP the tool name. * stops at /, ** crosses it.",
                 "**",
             ),
-            Field::choice(
+            // Opens on `ask`, not on the first option. Every other field in
+            // this form is prefilled with the widest thing it can mean, so a
+            // form walked through on its defaults writes one rule covering
+            // every agent, target, method and path — and `allow` there is
+            // `acl_default = deny` undone by the first rule in the file. `ask`
+            // makes that same walkthrough stop here, at this console, which is
+            // the answer a rule this wide deserves.
+            Field::choices(
                 "action",
                 "action",
                 "ask stops the request on a human at this console",
-                &["allow", "deny", "ask"],
+                vec!["allow".into(), "deny".into(), "ask".into()],
+                2,
             ),
             Field::text(
                 "position",
@@ -3429,6 +3437,29 @@ action = "allow"
                 other.is_some()
             ),
         }
+    }
+
+    /// Pressing enter through the rule form prompts; it does not grant.
+    ///
+    /// Every other field in that form opens on the widest thing it can mean —
+    /// every agent, every target, every method, every path — so the action is
+    /// the only thing between a form walked through on its defaults and one
+    /// rule that allows everything to everyone, ahead of the `acl_default =
+    /// deny` the file itself promises. It opened on `allow`, and this is the
+    /// test that was missing when it did.
+    #[test]
+    fn the_rule_form_opens_on_ask_because_its_other_defaults_are_wide_open() {
+        let form = rule_form();
+
+        assert_eq!(form.text("agent"), "*");
+        assert_eq!(form.text("target"), "*");
+        assert_eq!(form.list("methods"), vec!["*".to_string()]);
+        assert_eq!(form.list("paths"), vec!["**".to_string()]);
+        assert_eq!(
+            form.text("action"),
+            "ask",
+            "a rule this wide stops on a human, it does not wave the request through"
+        );
     }
 
     /// The daemon reloads; the console follows.

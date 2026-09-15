@@ -641,7 +641,15 @@ enum AclCommand {
         #[arg(long = "paths", value_name = "PATH", default_values_t = [String::from("**")])]
         paths: Vec<String>,
         /// `allow`, `deny`, or `ask` to prompt a human at the `run` console.
-        #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
+        ///
+        /// Defaults to `ask`, and deliberately. Every other flag here defaults
+        /// to the widest thing it can mean — every agent, every target, every
+        /// method, every path — so an `allow` default turned a bare `acl add`
+        /// into one rule that grants everything to everyone, sitting in front
+        /// of the `deny` that `acl_default` promises. The widest rule the
+        /// command can write now stops on a human instead of waving the
+        /// request through; `--action allow` is one word, and worth typing.
+        #[arg(long, value_enum, default_value_t = ActionArg::Ask)]
         action: ActionArg,
         /// How long this rule lasts: `30s`, `5m`, `1h`, `7d`. Past it the rule
         /// matches nothing and whatever is behind it decides instead. The
@@ -1651,7 +1659,9 @@ fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
         println!(
             "  agent-iap upstream add anthropic --base-url https://api.anthropic.com \\\n             \x20     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY"
         );
-        println!("  agent-iap acl add --target anthropic --methods POST --paths /v1/messages");
+        println!(
+            "  agent-iap acl add --target anthropic --methods POST --paths /v1/messages \\\n             \x20     --action allow"
+        );
         println!("  agent-iap agent add claude-code --target anthropic\n");
         println!("Then:");
         println!("  agent-iap check{flag}   # resolves every credential reference");
@@ -1872,7 +1882,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     if enroll::rule_count(&path)? == 0 {
         println!(
             "\nNo `[[acl]]` rules yet, so it is not reachable. Allow something with:\n  \
-             agent-iap acl add --target {name} --methods GET --paths '/**'"
+             agent-iap acl add --target {name} --methods GET --paths '/**' --action allow"
         );
     }
     verify_after_write(&path, &name, verify)
@@ -1982,8 +1992,10 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
             "\nNo `[[acl]]` rules yet, so it is not reachable — and an MCP server needs two \
              kinds of rule:\n  \
              agent-iap acl add --kind mcp --target {name} --methods initialize \\\n    \
-                 --methods 'notifications/*' --methods ping --methods 'tools/list' --paths '**'\n  \
-             agent-iap acl add --kind mcp --target {name} --methods 'tools/call' --paths 'get_*'"
+                 --methods 'notifications/*' --methods ping --methods 'tools/list' \\\n    \
+                 --paths '**' --action allow\n  \
+             agent-iap acl add --kind mcp --target {name} --methods 'tools/call' \\\n    \
+                 --paths 'get_*' --action allow"
         );
     }
     verify_after_write(&path, &name, verify)

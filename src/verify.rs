@@ -909,7 +909,10 @@ fn http_policy(config: &Config, name: &str, report: &mut Report) {
         config,
         name,
         "http",
-        &format!("agent-iap acl add --kind http --target {name} --methods GET --paths '/**'"),
+        &format!(
+            "agent-iap acl add --kind http --target {name} --methods GET --paths '/**' \
+             --action allow"
+        ),
     );
     report.noted(POLICY, outcome, brief, detail);
 }
@@ -927,7 +930,7 @@ fn mcp_policy(config: &Config, server: &McpServerConfig, report: &mut Report) {
                 "rules reach it, but none admits `initialize` — the handshake will be denied \
                  by `<default>` and the agent will see a server that never starts. Add a \
                  session rule in front of the tool rules: agent-iap acl add --kind mcp \
-                 --target {} --paths '**' {}",
+                 --target {} --paths '**' {} --action allow",
                 server.name,
                 session_methods()
             ),
@@ -935,7 +938,7 @@ fn mcp_policy(config: &Config, server: &McpServerConfig, report: &mut Report) {
         return;
     }
     let fix = format!(
-        "agent-iap acl add --kind mcp --target {} --paths '**' {}",
+        "agent-iap acl add --kind mcp --target {} --paths '**' {} --action allow",
         server.name,
         session_methods()
     );
@@ -1057,7 +1060,7 @@ fn mcp_handshake_warning(config: &Config, server: &McpServerConfig) -> Option<St
          The handshake will be denied by `<default>`, and the agent will see a\n\
          server that never starts. Add a session rule before the tool rules:\n\n\
          \x20 agent-iap acl add --kind mcp --target {name} --paths '**' \\\n\
-         \x20   {fix}",
+         \x20   {fix} --action allow",
         name = server.name,
         fix = session_methods(),
     ))

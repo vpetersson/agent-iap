@@ -226,7 +226,7 @@ agent-iap upstream add anthropic \
     --base-url https://api.anthropic.com \
     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY
 agent-iap acl add --target anthropic \
-    --methods POST --paths /v1/messages
+    --methods POST --paths /v1/messages --action allow
 agent-iap agent add claude-code --target anthropic
 #    ^ prints the agent's token once, and copies it to your clipboard. Only
 #      its sha256 goes in the file.
@@ -309,10 +309,19 @@ The enrolment commands compose the same way for everything else:
 ```bash
 agent-iap upstream add github --base-url https://api.github.com \
     --auth bearer --secret op://Private/GitHub/token
-agent-iap acl add --agent 'ci-*' --target github --methods GET --paths '/repos/**'
+agent-iap acl add --agent 'ci-*' --target github --methods GET --paths '/repos/**' \
+    --action allow
 agent-iap acl add --target github --methods DELETE --paths '/**' --action ask
 agent-iap agent add ci-runner --name "CI" --target github
 ```
+
+`--action` defaults to `ask`, not to `allow`. Every other flag on `acl add`
+defaults to the widest thing it can mean — every agent, every kind, every
+target, every method, every path — so a default `allow` would make the bare
+command write one rule granting everything to everyone, ahead of the
+`acl_default = deny` this whole file is built on. The widest rule the command
+can write stops on a human at the `run` console instead; to grant, say `--action
+allow`.
 
 Rules are **appended**, never inserted, because first match wins — a new rule can
 never silently shadow one already in the file, and `acl add` prints the position
@@ -541,7 +550,7 @@ upstream `github` → https://api.github.com
   FAILED   reach       the service rejected the credential — 401 Unauthorized in 94ms
   warn     policy      no ACL rule reaches it — agent calls will be denied by
                        `<default>`. Add one: agent-iap acl add --kind http
-                       --target github --methods GET --paths '/**'
+                       --target github --methods GET --paths '/**' --action allow
 ```
 
 The last step is the one that catches the enrolment that looked like it worked.
