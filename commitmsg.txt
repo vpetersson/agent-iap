@@ -1,0 +1,37 @@
+Ask Cloudflare for the account, not just the token
+
+The console's `cloudflare` form asked for a secret and nothing else, and a
+Cloudflare token is only half an address. Most of `client/v4` lives under
+`/accounts/<id>/…`, and an account-owned token — `cfat_`, the durable
+service-principal kind Cloudflare documents for exactly this sort of
+integration — can only be verified at its own account's endpoint:
+`/user/tokens/verify` is for user tokens and rejects it.
+
+So the profile takes `--var account_id=…`, which the form then asks for by
+name the way DataForSEO's `login` already does. The ID is a path parameter
+rather than a credential: it goes into the file in the clear while the token
+stays a reference.
+
+What makes it load-bearing rather than decorative is where it lands. Upstreams
+gain an optional `verify_path`, and the profile writes
+`/accounts/<id>/tokens/verify` into it, so every later verify — the one on the
+enrolment, `v` in the console, an `upstream verify` a year from now — calls the
+endpoint that answers "is this token good". The fallback it replaces is the
+root, and Cloudflare answers that with `7000 No route for that URI` whether the
+token is perfect or garbage: a probe that proves DNS and TLS and nothing about
+the credential. An explicit `--path` still wins, because that is a question
+about one endpoint rather than about the credential.
+
+`dataforseo` gets a probe too, `/v3/appendix/user_data`: free, and the call
+that tells a wrong API password from a wrong API login. Every other profile
+keeps `None` — a probe that 403s on half the accounts holding a good token
+would be worse than no probe at all.
+
+Tests: the console's cloudflare form has an `account_id` field and a form saved
+from it writes the expanded `verify_path`; `profile add` refuses the enrolment
+by name when the account is missing, and the dry run shows the same probe the
+write adds; and in `verify_e2e`, an upstream carrying a `verify_path` is probed
+there and passes where the same upstream probed at the root only warns, with
+`--path` overriding both.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

@@ -147,6 +147,11 @@ pub struct Profile {
     /// Anything true about this profile that would otherwise be found out the
     /// hard way — an auth flow the proxy cannot do, a call that costs money.
     pub note: Option<String>,
+    /// The endpoint `--verify` should call to prove the credential, `{var}`
+    /// expansion and all. `None` where the vendor documents nothing cheap,
+    /// safe and available to every plan — a probe that 403s on half the
+    /// accounts that hold a good token is worse than no probe at all.
+    pub probe: Option<String>,
 }
 
 impl Profile {
@@ -273,6 +278,14 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
 
     let service = substitute_service(&profile.service, &vars, &secret)?;
     let auth = build_auth(&service, &secret, &vars, &access.scopes)?;
+    // The probe names the same vars the service does — Cloudflare's is
+    // `/accounts/{account_id}/tokens/verify` — so it is expanded here, with
+    // the account already resolved, rather than left for `verify` to guess at.
+    let probe = profile
+        .probe
+        .as_deref()
+        .map(|probe| expand(probe, &vars, &secret))
+        .transpose()?;
 
     // Rules are named after the service as it was actually added, not after the
     // profile: two PostHog accounts on one proxy would otherwise produce two
@@ -312,14 +325,21 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
 
     if options.dry_run {
         return Ok(Added {
-            plan: Some(render_plan(&name, &service, &auth, &rules, &agent)),
+            plan: Some(render_plan(
+                &name,
+                &service,
+                &auth,
+                &rules,
+                &agent,
+                probe.as_deref(),
+            )),
             ..added
         });
     }
 
     match &service {
         Service::Http { base_url, .. } => {
-            enroll::add_upstream(path, &name, base_url, &auth, &[])?;
+            enroll::add_upstream_probing(path, &name, base_url, &auth, &[], probe.as_deref())?;
         }
         Service::McpHttp { url, .. } => {
             enroll::add_mcp_server(
@@ -357,9 +377,14 @@ fn render_plan(
     auth: &AuthSpec,
     rules: &[PlannedRule],
     agent: &str,
+    probe: Option<&str>,
 ) -> String {
     let mut plan = String::from("# would append to the policy file:\n");
-    plan.push_str(&enroll::render_service(name, service_spec(service), auth));
+    plan.push_str(&enroll::render_service(
+        name,
+        service_spec(service, probe),
+        auth,
+    ));
     plan.push('\n');
     for rule in rules {
         plan.push_str(&enroll::render_rule(&planned_spec(rule, agent, name)));
@@ -387,9 +412,12 @@ fn planned_spec<'a>(
     }
 }
 
-fn service_spec(service: &Service) -> enroll::ServiceSpec<'_> {
+fn service_spec<'a>(service: &'a Service, probe: Option<&'a str>) -> enroll::ServiceSpec<'a> {
     match service {
-        Service::Http { base_url, .. } => enroll::ServiceSpec::Upstream { base_url },
+        Service::Http { base_url, .. } => enroll::ServiceSpec::Upstream {
+            base_url,
+            verify_path: probe,
+        },
         Service::McpHttp { url, .. } => enroll::ServiceSpec::McpHttp { url },
         Service::McpStdio { command, args, env } => {
             enroll::ServiceSpec::McpStdio { command, args, env }
@@ -617,6 +645,7 @@ fn google(id: &str, title: &str, summary: &str, base_url: &str, levels: Vec<Acce
              act as a person instead."
                 .into(),
         ),
+        probe: None,
     }
 }
 
@@ -694,6 +723,7 @@ fn cloudflare_mcp(slug: &str, host: &str, title: &str, summary: &str) -> Profile
              the proxy does hold, use the `cloudflare` REST profile."
                 .into(),
         ),
+        probe: None,
     }
 }
 
@@ -758,6 +788,7 @@ fn bearer_api(spec: BearerApi<'_>) -> Profile {
             ),
         ],
         note: None,
+        probe: None,
     }
 }
 
@@ -999,6 +1030,7 @@ pub fn catalog() -> Vec<Profile> {
                  line in `agent-iap list`, and an agent scoped to one cannot reach the other."
                     .into(),
             ),
+            probe: None,
         },
         Profile {
             id: "posthog-mcp".into(),
@@ -1071,6 +1103,7 @@ pub fn catalog() -> Vec<Profile> {
                  posthog-<account>` and its own key."
                     .into(),
             ),
+            probe: None,
         },
         // ---------------- Cloudflare ----------------
         Profile {
@@ -1085,7 +1118,12 @@ pub fn catalog() -> Vec<Profile> {
                     .into(),
                 url: "https://dash.cloudflare.com/profile/api-tokens".into(),
             },
-            vars: vec![],
+            vars: vec![v(
+                "account_id",
+                "your Cloudflare account ID — the 32-hex string in the dashboard URL, or \
+                 under Manage Account",
+                None,
+            )],
             service: Service::Http {
                 base_url: "https://api.cloudflare.com/client/v4".into(),
                 auth: AuthTemplate::Bearer,
@@ -1122,10 +1160,20 @@ pub fn catalog() -> Vec<Profile> {
             note: Some(
                 "This is the profile that gives full coverage of Cloudflare's services: \
                  one base URL and one token reach all of them, and the token's own scopes \
-                 are a second limit under the ACL. Cloudflare's MCP servers are separate \
-                 profiles (`cloudflare-mcp-*`) and authenticate differently."
+                 are a second limit under the ACL. The account ID is asked for because a \
+                 Cloudflare token is only half an address: most of the API lives under \
+                 `/accounts/<id>/…`, and an account-owned token (`cfat_`, the durable \
+                 service-principal kind) can only be verified at that account's own \
+                 endpoint — `/user/tokens/verify` is for user tokens and rejects it. \
+                 Cloudflare's MCP servers are separate profiles (`cloudflare-mcp-*`) and \
+                 authenticate differently."
                     .into(),
             ),
+            // Documented as *the* "is this token good" call, and the reason the
+            // account ID is a var: without it the only path this profile could
+            // probe is the root, which answers `7000 No route for that URI` to
+            // a good token and a bad one alike.
+            probe: Some("/accounts/{account_id}/tokens/verify".into()),
         },
         // ---------------- DataForSEO ----------------
         Profile {
@@ -1173,6 +1221,10 @@ pub fn catalog() -> Vec<Profile> {
                  --target dataforseo` is the per-agent spend trail."
                     .into(),
             ),
+            // Free, and the one call that tells a wrong password from a wrong
+            // login: DataForSEO answers a bad pair with `40100 You are not
+            // authorized` rather than a 401 shaped like a routing mistake.
+            probe: Some("/v3/appendix/user_data".into()),
         },
         Profile {
             id: "dataforseo-mcp".into(),
@@ -1207,6 +1259,7 @@ pub fn catalog() -> Vec<Profile> {
                 ),
             ],
             note: None,
+            probe: None,
         },
         // ---------------- Graylog ----------------
         Profile {
@@ -1267,6 +1320,7 @@ pub fn catalog() -> Vec<Profile> {
                  A session token works the same way with `session` as the password."
                     .into(),
             ),
+            probe: None,
         },
         // ---------------- Semrush ----------------
         Profile {
@@ -1378,6 +1432,7 @@ pub fn catalog() -> Vec<Profile> {
                  separate profile (`semrush-v4`)."
                     .into(),
             ),
+            probe: None,
         },
         Profile {
             id: "semrush-trends".into(),
@@ -1422,6 +1477,7 @@ pub fn catalog() -> Vec<Profile> {
                  Trends and not the reports. Same v3 key, different endpoint."
                     .into(),
             ),
+            probe: None,
         },
         Profile {
             id: "semrush-v4".into(),
@@ -1478,6 +1534,7 @@ pub fn catalog() -> Vec<Profile> {
                  reviews are in scope."
                     .into(),
             ),
+            probe: None,
         },
         Profile {
             id: "semrush-mcp".into(),
@@ -1537,6 +1594,7 @@ pub fn catalog() -> Vec<Profile> {
                  Projects methods, and nothing that mutates."
                     .into(),
             ),
+            probe: None,
         },
         // ---------------- Common neighbours ----------------
         Profile {
@@ -1577,6 +1635,7 @@ pub fn catalog() -> Vec<Profile> {
                 ),
             ],
             note: None,
+            probe: None,
         },
         Profile {
             id: "openai".into(),
@@ -1616,6 +1675,7 @@ pub fn catalog() -> Vec<Profile> {
                 ),
             ],
             note: None,
+            probe: None,
         },
         bearer_api(BearerApi {
             id: "github",

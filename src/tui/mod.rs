@@ -3413,6 +3413,49 @@ action = "allow"
         );
     }
 
+    /// The same shape of gap, one service along: the console's `cloudflare`
+    /// form asked for a token and nothing else, and a Cloudflare token is half
+    /// an address — the account is what the API's paths and its own
+    /// token-verify endpoint are addressed by.
+    #[tokio::test]
+    async fn the_cloudflare_form_asks_for_the_account_and_saves_it_into_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+
+        let profile = crate::profiles::get("cloudflare").unwrap();
+        let mut form = profile_form(&profile);
+
+        let account = form
+            .fields
+            .iter()
+            .find(|field| field.key.as_ref() == "var:account_id")
+            .expect("the account has a field of its own");
+        assert_eq!(account.label.as_ref(), "account_id");
+
+        for field in &mut form.fields {
+            match field.key.as_ref() {
+                "var:account_id" => {
+                    field.value = form::Value::Text("9a7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d".into())
+                }
+                "secret" => field.value = form::Value::Text("env:AGENT_IAP_TEST_TOKEN".into()),
+                _ => {}
+            }
+        }
+
+        actions::submit(&app.policy, &form).unwrap();
+
+        // `v` on this row, now or in a year, calls the endpoint that answers
+        // "is this token good" rather than the root, which answers `7000 no
+        // route for that URI` to a good token and a bad one alike.
+        let written = std::fs::read_to_string(&app.policy.path).unwrap();
+        assert!(
+            written.contains(
+                r#"verify_path = "/accounts/9a7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d/tokens/verify""#
+            ),
+            "the account never reached the probe:\n{written}"
+        );
+    }
+
     /// `run` is the console, so a terminal is all it should take to get one —
     /// and a unit file, which has no terminal, must not get one by accident.
     #[test]

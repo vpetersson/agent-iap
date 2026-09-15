@@ -171,9 +171,9 @@ impl Report {
 pub struct Options {
     pub timeout: Duration,
     /// Path to probe on an HTTP upstream, relative to its base URL, query
-    /// string and all. The root when omitted — which for most APIs is a 404,
-    /// so an upstream whose credential you want actually exercised wants a real
-    /// endpoint here.
+    /// string and all. Omitted falls back to the upstream's own `verify_path`
+    /// and then to the root — which for most APIs is a 404, so an upstream
+    /// whose credential you want actually exercised wants one of the two.
     pub path: Option<String>,
     /// The daemon's audit log, when this is running inside one. Only the
     /// credential injector writes to it, and only for a token it minted.
@@ -244,7 +244,15 @@ async fn probe_upstream(
 ) -> Report {
     let mut report = Report::new(&upstream.name, "upstream", &upstream.base_url);
 
-    let (path, query) = split_query(options.path.as_deref().unwrap_or(ROOT));
+    // What the caller named wins — `--path` is how you ask a question about one
+    // endpoint. Otherwise the upstream's own `verify_path`, which is the answer
+    // its profile already knew, and only then the root.
+    let probe = options
+        .path
+        .as_deref()
+        .or(upstream.verify_path.as_deref())
+        .unwrap_or(ROOT);
+    let (path, query) = split_query(probe);
     let url = match crate::proxy::build_url(&upstream.base_url, &path, query.as_deref()) {
         Ok(url) => url,
         Err(error) => {

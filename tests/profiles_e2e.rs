@@ -203,6 +203,7 @@ async fn cloudflare_reads_are_allowed_and_deletes_never_reach_the_network() {
     let upstream = spawn_upstream().await;
     let mut opts = options("env:TEST_CF_TOKEN");
     opts.access = Some("ask-writes".into());
+    opts.vars = vec!["account_id=9a7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d".into()];
     let harness = harness_from_profiles(&[("cloudflare", opts)], upstream).await;
 
     let (status, seen) = call(&harness, "GET", "/cloudflare/zones").await;
@@ -662,6 +663,7 @@ fn a_dry_run_writes_nothing_and_prints_what_it_would_have() {
 
     let profile = profiles::get("cloudflare").unwrap();
     let mut opts = options("op://Vault/Cloudflare/token");
+    opts.vars = vec!["account_id=9a7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d".into()];
     opts.dry_run = true;
     let added = profiles::add(&path, &profile, &opts).unwrap();
 
@@ -824,4 +826,59 @@ fn spelling_a_service_out_still_needs_a_base_url() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--base-url"), "{stderr}");
+}
+
+/// Cloudflare needs two things, and a token is only one of them.
+///
+/// Most of `client/v4` lives under `/accounts/<id>/…`, and an account-owned
+/// token can only be verified at that account's own endpoint — so the profile
+/// asks for the account, writes it into the probe `verify` will call, and
+/// refuses the enrolment rather than writing an upstream nobody can check.
+#[test]
+fn cloudflare_asks_for_the_account_and_writes_the_probe_that_proves_the_token() {
+    let (dir, path) = minimal_policy();
+    let profile = profiles::get("cloudflare").unwrap();
+
+    let complaint = match profiles::add(&path, &profile, &options("env:TEST_CF_TOKEN")) {
+        Err(error) => format!("{error:#}"),
+        Ok(added) => panic!("`{}` was enrolled without an account", added.name),
+    };
+    assert!(
+        complaint.contains("account_id"),
+        "the account is required and the error has to name it: {complaint}"
+    );
+
+    let mut opts = options("env:TEST_CF_TOKEN");
+    opts.vars = vec!["account_id=9a7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d".into()];
+    profiles::add(&path, &profile, &opts).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written
+            .contains("verify_path = \"/accounts/9a7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d/tokens/verify\""),
+        "the account never reached the probe:\n{written}"
+    );
+    // The account is a path parameter, not a credential: it belongs in the
+    // file in the clear, while the token stays a reference.
+    assert!(written.contains("secret = \"env:TEST_CF_TOKEN\""));
+    drop(dir);
+}
+
+/// A probe is a promise about what will be written, so the dry run has to make
+/// the same one.
+#[test]
+fn the_probe_shows_up_in_a_dry_run_before_anything_is_written() {
+    let (dir, path) = minimal_policy();
+    let profile = profiles::get("dataforseo").unwrap();
+    let mut opts = options("env:TEST_DFS_PASSWORD");
+    opts.vars = vec!["login=v@example.com".into()];
+    opts.dry_run = true;
+
+    let added = profiles::add(&path, &profile, &opts).unwrap();
+    let plan = added.plan.expect("a dry run renders a plan");
+    assert!(
+        plan.contains("verify_path = \"/v3/appendix/user_data\""),
+        "the plan does not show the probe the write would add:\n{plan}"
+    );
+    drop(dir);
 }
