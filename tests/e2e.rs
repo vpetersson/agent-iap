@@ -33,6 +33,7 @@ async fn spawn_upstream() -> SocketAddr {
             "x-api-key": header("x-api-key"),
             "authorization": header("authorization"),
             "x-iap-token": header("x-iap-token"),
+            "user-agent": header("user-agent"),
         }))
     }
 
@@ -187,6 +188,38 @@ async fn an_allowed_call_reaches_the_upstream_with_the_real_credential() {
         "the agent token leaked upstream"
     );
     assert!(seen["x-iap-token"].is_null());
+}
+
+/// The upstream should be able to tell from its own logs that agent-iap is in
+/// the path, and where to go and read about it — without losing sight of the
+/// SDK that actually made the call.
+#[tokio::test]
+async fn the_upstream_is_told_which_proxy_forwarded_the_call() {
+    let harness = spawn_proxy("").await;
+    let ours = format!(
+        "agent-iap/{} (+https://github.com/vpetersson/agent-iap)",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let response = client()
+        .get(format!("http://{}/echo/v1/models", harness.proxy))
+        .bearer_auth(AGENT_TOKEN)
+        .header("user-agent", "anthropic-sdk/0.39.0")
+        .send()
+        .await
+        .unwrap();
+    let seen: Value = response.json().await.unwrap();
+    assert_eq!(seen["user-agent"], format!("anthropic-sdk/0.39.0 {ours}"));
+
+    // An SDK that sends no user agent still leaves the proxy named.
+    let response = client()
+        .get(format!("http://{}/echo/v1/models", harness.proxy))
+        .bearer_auth(AGENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let seen: Value = response.json().await.unwrap();
+    assert_eq!(seen["user-agent"], ours);
 }
 
 #[tokio::test]

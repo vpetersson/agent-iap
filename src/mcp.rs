@@ -402,7 +402,7 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
         .context("the daemon refused this agent's MCP session")?;
 
     // No audit log here: the bridge's records go to the daemon, which owns the log.
-    let injector = CredentialInjector::new(Arc::clone(&resolver), reqwest::Client::new(), None);
+    let injector = CredentialInjector::new(Arc::clone(&resolver), crate::http_client(), None);
 
     let stdout: SharedStdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut relay = None;
@@ -428,7 +428,7 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
             upstream
         }
         McpTransportKind::Http => Upstream::Http(Box::new(HttpUpstream {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             url: server
                 .url
                 .clone()

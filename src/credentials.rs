@@ -443,7 +443,7 @@ mod tests {
     fn injector() -> CredentialInjector {
         let resolver = Arc::new(SecretResolver::new("op"));
         resolver.preset("literal:sk-real", Secret::new("sk-real".into()));
-        CredentialInjector::new(resolver, reqwest::Client::new(), None)
+        CredentialInjector::new(resolver, crate::http_client(), None)
     }
 
     fn request() -> reqwest::Request {

@@ -435,12 +435,41 @@ fn forwarded_request_headers(incoming: &HeaderMap, upstream: &UpstreamConfig) ->
         }
         headers.append(name.clone(), value.clone());
     }
+    let announced = forwarded_user_agent(headers.get(http::header::USER_AGENT));
+    headers.insert(http::header::USER_AGENT, announced);
     for (name, value) in &upstream.headers {
         if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), value.parse()) {
             headers.insert(name, value);
         }
     }
     headers
+}
+
+/// Who the upstream is told is calling.
+///
+/// The agent's own product token with agent-iap's appended, never replaced: the
+/// upstream sees both the SDK that made the call and the proxy that carried it,
+/// and an operator looking at a request they do not recognise has a project to
+/// go and read. An `X-API-Key` says which account; this says which program.
+///
+/// A value that already ends in this exact token is left alone, so the bridge
+/// calling its own daemon is announced once rather than twice.
+pub(crate) fn forwarded_user_agent(incoming: Option<&http::HeaderValue>) -> http::HeaderValue {
+    let agent = incoming
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(agent) = agent else {
+        return http::HeaderValue::from_static(crate::USER_AGENT);
+    };
+    if agent.ends_with(crate::USER_AGENT) {
+        return incoming.cloned().expect("`agent` came out of `incoming`");
+    }
+    // Every byte came out of a header that already parsed, so this only fails
+    // if `agent` was not really a header value — in which case ours alone is
+    // still true, and still better than dropping the header.
+    http::HeaderValue::from_str(&format!("{agent} {}", crate::USER_AGENT))
+        .unwrap_or_else(|_| http::HeaderValue::from_static(crate::USER_AGENT))
 }
 
 fn build_response(response: reqwest::Response) -> Response {
@@ -555,5 +584,78 @@ mod tests {
             "hop-by-hop must not be forwarded"
         );
         assert_eq!(forwarded["content-type"], "application/json");
+    }
+
+    #[test]
+    fn the_upstream_is_told_the_proxy_is_in_the_path() {
+        let upstream = UpstreamConfig {
+            name: "u".into(),
+            base_url: "https://example.com".into(),
+            auth: crate::config::AuthConfig::None,
+            headers: Default::default(),
+        };
+
+        // The agent said who it was, so the upstream hears both.
+        let forwarded = forwarded_request_headers(
+            &headers(&[("user-agent", "anthropic-sdk/0.39.0")]),
+            &upstream,
+        );
+        assert_eq!(
+            forwarded["user-agent"],
+            format!("anthropic-sdk/0.39.0 {}", crate::USER_AGENT).as_str()
+        );
+
+        // It said nothing, so the upstream hears us.
+        let forwarded = forwarded_request_headers(&headers(&[]), &upstream);
+        assert_eq!(forwarded["user-agent"], crate::USER_AGENT);
+    }
+
+    #[test]
+    fn an_upstreams_own_user_agent_still_wins() {
+        let upstream: UpstreamConfig = toml::from_str(
+            r#"
+name = "u"
+base_url = "https://example.com"
+headers = { "user-agent" = "pinned/1.0" }
+"#,
+        )
+        .unwrap();
+        let forwarded = forwarded_request_headers(
+            &headers(&[("user-agent", "anthropic-sdk/0.39.0")]),
+            &upstream,
+        );
+        assert_eq!(forwarded["user-agent"], "pinned/1.0");
+    }
+
+    #[test]
+    fn a_hop_that_already_announced_us_is_not_announced_twice() {
+        let ours: http::HeaderValue = crate::USER_AGENT.parse().unwrap();
+        assert_eq!(forwarded_user_agent(Some(&ours)), crate::USER_AGENT);
+
+        let bridged: http::HeaderValue = format!("codex-cli/1.2 {}", crate::USER_AGENT)
+            .parse()
+            .unwrap();
+        assert_eq!(
+            forwarded_user_agent(Some(&bridged)),
+            format!("codex-cli/1.2 {}", crate::USER_AGENT).as_str()
+        );
+    }
+
+    #[test]
+    fn a_blank_user_agent_is_replaced_rather_than_prefixed() {
+        let blank: http::HeaderValue = "   ".parse().unwrap();
+        assert_eq!(forwarded_user_agent(Some(&blank)), crate::USER_AGENT);
+        assert_eq!(forwarded_user_agent(None), crate::USER_AGENT);
+    }
+
+    #[test]
+    fn the_announced_version_and_url_come_from_the_manifest() {
+        assert_eq!(
+            crate::USER_AGENT,
+            format!(
+                "agent-iap/{} (+https://github.com/vpetersson/agent-iap)",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 }

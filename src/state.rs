@@ -57,7 +57,7 @@ fn build_http_client(config: &Config) -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(
             config.server.upstream_connect_timeout_secs,
         ))
-        .user_agent(concat!("agent-iap/", env!("CARGO_PKG_VERSION")))
+        .user_agent(crate::USER_AGENT)
         .build()
         .context("building the upstream HTTP client")
 }

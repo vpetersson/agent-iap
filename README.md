@@ -589,7 +589,12 @@ sequenceDiagram
    default applies, and the default is `deny`.
 5. **Ask, if the rule says so.** The request is parked and the operator answers
    it. A timeout, or no one watching the queue, denies.
-6. **Inject.** The agent's own token is stripped. The real credential is added.
+6. **Inject.** The agent's own token is stripped. The real credential is added,
+   and agent-iap appends itself to the `User-Agent` —
+   `anthropic-sdk/0.39.0 agent-iap/2026.9.0 (+https://github.com/vpetersson/agent-iap)`.
+   The upstream's own logs then show the SDK that made the call *and* the proxy
+   that carried it; an upstream that pins its own `User-Agent` in
+   `[[upstreams]].headers` still wins.
 7. **Record.** One JSON line: who, what, which rule decided, the status, how long
    it took. Then the response is streamed straight back — token-by-token
    responses stay token-by-token.
