@@ -55,25 +55,38 @@ pub enum SecretRef {
 
 impl SecretRef {
     pub fn parse(raw: &str) -> Result<Self> {
-        if let Some(rest) = raw.strip_prefix("env:") {
+        // Whitespace *inside* a reference is part of it: a 1Password vault,
+        // item, section or field may be called `agent-iap tls` or `private
+        // key`, and `op read` takes the whole reference as one argument. The
+        // whitespace *around* one never is — a reference is a pointer, and a
+        // stray space in front of it is a typo rather than a different vault.
+        // Trimmed here so the policy file and the flags agree with the console,
+        // whose fields have always been trimmed on the way in.
+        let reference = raw.trim();
+
+        if let Some(rest) = reference.strip_prefix("env:") {
             if rest.is_empty() {
                 bail!("`env:` secret reference is missing a variable name");
             }
             Ok(SecretRef::Env(rest.to_string()))
-        } else if let Some(rest) = raw.strip_prefix("file:") {
+        } else if let Some(rest) = reference.strip_prefix("file:") {
             if rest.is_empty() {
                 bail!("`file:` secret reference is missing a path");
             }
             Ok(SecretRef::File(PathBuf::from(rest)))
-        } else if raw.starts_with("op://") {
-            Ok(SecretRef::OnePassword(raw.to_string()))
-        } else if let Some(rest) = raw.strip_prefix("literal:") {
+        } else if reference.starts_with("op://") {
+            Ok(SecretRef::OnePassword(reference.to_string()))
+        } else if let Some(rest) = raw.trim_start().strip_prefix("literal:") {
+            // The one scheme whose payload *is* the credential, so only the
+            // space in front of it comes off: a trailing one may be part of the
+            // value, and silently shortening a credential is not this parser's
+            // to do.
             Ok(SecretRef::Literal(rest.to_string()))
         } else {
             bail!(
                 "unrecognised secret reference `{}` — expected `env:NAME`, `file:/path`, \
                  `op://vault/item/field` or `literal:VALUE`",
-                redact_for_error(raw)
+                redact_for_error(reference)
             )
         }
     }
@@ -90,7 +103,10 @@ impl SecretRef {
 pub fn display_ref(raw: &str) -> String {
     match SecretRef::parse(raw) {
         Ok(SecretRef::Literal(_)) => "literal:***".to_string(),
-        Ok(_) => raw.to_string(),
+        // The reference as the resolver will use it, which is the trimmed one —
+        // an inventory that prints a stray space is an inventory nobody can
+        // match against the vault.
+        Ok(_) => raw.trim().to_string(),
         // Unparseable references never resolve, but a pasted credential is
         // exactly how one gets written, so mask it the way errors do.
         Err(_) => redact_for_error(raw),
@@ -228,6 +244,105 @@ mod tests {
         assert_eq!(
             SecretRef::parse("literal:hunter2").unwrap(),
             SecretRef::Literal("hunter2".into())
+        );
+    }
+
+    /// A 1Password vault, item, section or field is named by a human, so it has
+    /// spaces in it: `op://Infra/agent-iap tls/private key` is one reference,
+    /// not three words. The whole thing is the argument `op read` is handed.
+    #[test]
+    fn whitespace_inside_a_1password_reference_is_part_of_it() {
+        for raw in [
+            "op://Infra/agent-iap tls/private key",
+            "op://Private/Anthropic API/credential",
+            // vault / item / section / field, the four-segment form
+            "op://development/aws/Access Keys/access_key_id",
+        ] {
+            assert_eq!(
+                SecretRef::parse(raw).unwrap(),
+                SecretRef::OnePassword(raw.into()),
+                "`{raw}`"
+            );
+            assert_eq!(display_ref(raw), raw);
+        }
+    }
+
+    /// And the whitespace *around* one is not. A leading space used to make a
+    /// perfectly good reference "unrecognised" — reported as `op:***`, which
+    /// redacts away the only part that would have explained it — and a trailing
+    /// one used to be handed to `op` as part of the field name.
+    #[test]
+    fn whitespace_around_a_reference_is_a_typo_and_not_part_of_it() {
+        let wanted = "op://Infra/agent-iap tls/private key";
+        for raw in [
+            " op://Infra/agent-iap tls/private key",
+            "op://Infra/agent-iap tls/private key ",
+            "\top://Infra/agent-iap tls/private key\n",
+        ] {
+            assert_eq!(
+                SecretRef::parse(raw).unwrap(),
+                SecretRef::OnePassword(wanted.into()),
+                "`{raw}`"
+            );
+            assert_eq!(display_ref(raw), wanted, "`{raw}`");
+        }
+
+        assert_eq!(
+            SecretRef::parse(" env:TOKEN\n").unwrap(),
+            SecretRef::Env("TOKEN".into())
+        );
+        assert_eq!(
+            SecretRef::parse(" file:/run/secrets/x ").unwrap(),
+            SecretRef::File(PathBuf::from("/run/secrets/x"))
+        );
+    }
+
+    /// `literal:` is the credential rather than a pointer to one, so trimming
+    /// its payload would quietly change a secret. Only the space in front of
+    /// the scheme comes off.
+    #[test]
+    fn a_literal_keeps_the_value_it_was_given() {
+        assert_eq!(
+            SecretRef::parse("  literal:hunter2 ").unwrap(),
+            SecretRef::Literal("hunter2 ".into())
+        );
+    }
+
+    /// End to end, through a stand-in for the 1Password CLI: the reference
+    /// arrives as one argument with its spaces intact. `op read` is never run
+    /// through a shell, so nothing here needs quoting — this is the test that
+    /// says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_1password_reference_reaches_op_as_a_single_argument() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        // Echoes back the reference it was given, and refuses to be given two.
+        std::fs::write(
+            &op,
+            "#!/bin/sh\n\
+             [ \"$1\" = read ] || exit 2\n\
+             [ \"$2\" = --no-newline ] || exit 2\n\
+             [ $# -eq 3 ] || exit 3\n\
+             printf '%s' \"$3\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let reference = "op://Infra/agent-iap tls/private key";
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+        assert_eq!(resolver.resolve(reference).unwrap().expose(), reference);
+
+        // And the trimmed form is what a reference written with a stray space
+        // resolves to, rather than a field name with a space on the end.
+        assert_eq!(
+            resolver
+                .resolve(&format!(" {reference}\n"))
+                .unwrap()
+                .expose(),
+            reference
         );
     }
 

@@ -1418,11 +1418,17 @@ fn check(path: &Path) -> Result<()> {
     }
     let mut failed = 0;
     for reference in &references {
+        // `display_ref` rather than the raw string, for the same reason
+        // `agent-iap list` uses it: every scheme but one is a *pointer* and safe
+        // on a terminal, and `literal:` is the credential itself. It is also the
+        // reference as the resolver read it, so a stray space in the file is not
+        // echoed back as though it were part of the vault's name.
+        let shown = agent_iap::secrets::display_ref(reference);
         match resolver.resolve(reference) {
-            Ok(_) => println!("secrets     ok      {reference}"),
+            Ok(_) => println!("secrets     ok      {shown}"),
             Err(error) => {
                 failed += 1;
-                println!("secrets     FAILED  {reference}: {error:#}");
+                println!("secrets     FAILED  {shown}: {error:#}");
             }
         }
     }

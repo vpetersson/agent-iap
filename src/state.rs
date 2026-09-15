@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::config::WorkloadMode;
 use crate::credentials::CredentialInjector;
 use crate::identity::{AgentRegistry, AuthFailure, Caller};
-use crate::secrets::SecretResolver;
+use crate::secrets::{SecretRef, SecretResolver};
 use crate::workload::{WorkloadError, WorkloadIssuer};
 
 pub struct AppState {
@@ -97,7 +97,7 @@ fn preload_secrets(config: &Config, resolver: &SecretResolver) -> Result<()> {
     // and `op` is never even invoked unless a reference asks for it.
     let hint = if failures
         .iter()
-        .any(|(reference, _)| reference.starts_with("op://"))
+        .any(|(reference, _)| matches!(SecretRef::parse(reference), Ok(SecretRef::OnePassword(_))))
     {
         " — is `op` signed in?"
     } else {
