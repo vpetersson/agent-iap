@@ -302,6 +302,45 @@ async fn semrush_appends_the_key_to_a_url_the_agent_wrote_without_it() {
 }
 
 #[tokio::test]
+async fn semrush_trends_is_its_own_upstream_on_the_same_v3_key() {
+    std::env::set_var("TEST_SEMRUSH_TRENDS_KEY", "semrush-real-v3-key");
+    let upstream = spawn_upstream().await;
+    let harness = harness_from_profiles(
+        &[("semrush-trends", options("env:TEST_SEMRUSH_TRENDS_KEY"))],
+        upstream,
+    )
+    .await;
+
+    // Trends hangs off `/analytics/ta/api/v3`, which lives in the base URL: the
+    // agent writes the report name and nothing else. The key goes in the query
+    // string here too, appended to the parameters the agent wrote.
+    let (status, seen) = call(
+        &harness,
+        "GET",
+        "/semrush-trends/summary?targets=example.com&display_date=2026-01-01",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/analytics/ta/api/v3/summary");
+    let query = seen["query"].as_str().unwrap_or_default();
+    assert!(
+        query.contains("key=semrush-real-v3-key"),
+        "the proxy did not attach the key: {query}"
+    );
+    assert!(query.contains("targets=example.com"), "{query}");
+    assert!(seen["x-iap-token"].is_null(), "{seen}");
+
+    // The Trends API has no mutations, so the default level is GET and a write
+    // does not reach the network.
+    let (status, body) = call(&harness, "POST", "/semrush-trends/summary").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a write reached the upstream: {body}"
+    );
+}
+
+#[tokio::test]
 async fn semrush_v4_signs_with_apikey_and_keeps_the_version_prefix() {
     std::env::set_var("TEST_SEMRUSH_V4_KEY", "semrush-real-v4-key");
     let upstream = spawn_upstream().await;
