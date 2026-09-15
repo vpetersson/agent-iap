@@ -155,6 +155,13 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Declare the endpoint `verify` should call. For the profiles built by a
+    /// shared constructor, which has no literal to put it in.
+    fn probing(mut self, probe: &str) -> Self {
+        self.probe = Some(probe.to_string());
+        self
+    }
+
     pub fn default_access(&self) -> &Access {
         &self.access[0]
     }
@@ -828,7 +835,8 @@ pub fn catalog() -> Vec<Profile> {
                     vec![rule("all", &["*"], &["/webmasters/v3/**", "/v1/**"], "allow")],
                 ),
             ],
-        ),
+        )
+        .probing("/webmasters/v3/sites"),
         google(
             "google-analytics-data",
             "Google Analytics 4 — Data API",
@@ -860,7 +868,8 @@ pub fn catalog() -> Vec<Profile> {
                     vec![rule("all", &["*"], &["/v1beta/**", "/v1alpha/**"], "allow")],
                 ),
             ],
-        ),
+        )
+        .probing("/v1beta/accounts"),
         google(
             "google-indexing",
             "Google Indexing API",
@@ -905,7 +914,8 @@ pub fn catalog() -> Vec<Profile> {
                     vec![rule("all", &["*"], &["/bigquery/v2/**"], "allow")],
                 ),
             ],
-        ),
+        )
+        .probing("/bigquery/v2/projects"),
         google(
             "google-drive",
             "Google Drive",
@@ -925,7 +935,8 @@ pub fn catalog() -> Vec<Profile> {
                     vec![rule("all", &["*"], &["/drive/v3/**", "/upload/drive/v3/**"], "allow")],
                 ),
             ],
-        ),
+        )
+        .probing("/drive/v3/about?fields=user"),
         google(
             "google-sheets",
             "Google Sheets",
@@ -1635,7 +1646,7 @@ pub fn catalog() -> Vec<Profile> {
                 ),
             ],
             note: None,
-            probe: None,
+            probe: Some("/v1/models".into()),
         },
         Profile {
             id: "openai".into(),
@@ -1675,7 +1686,7 @@ pub fn catalog() -> Vec<Profile> {
                 ),
             ],
             note: None,
-            probe: None,
+            probe: Some("/v1/models".into()),
         },
         bearer_api(BearerApi {
             id: "github",
@@ -1689,7 +1700,8 @@ pub fn catalog() -> Vec<Profile> {
             },
             read_paths: &["/**"],
             write_paths: &["/**"],
-        }),
+        })
+        .probing("/user"),
         bearer_api(BearerApi {
             id: "linear",
             title: "Linear API",
@@ -1985,6 +1997,66 @@ mod tests {
                 .any(|rule| rule.paths.iter().any(|path| path == "/")),
             "the v3 read level does not allow the root path"
         );
+    }
+
+    /// A probe is a request fired at somebody's account on a keystroke, so the
+    /// table has rules. Two of them a machine can check: it is a path under the
+    /// profile's own base URL, and it is a GET the profile's *narrowest* access
+    /// level already allows — so the operator is verifying a call the agent
+    /// they are enrolling could also make. The third, that it is free and has
+    /// no side effect, is a judgement recorded beside each entry.
+    #[test]
+    fn every_declared_probe_is_a_get_the_narrowest_access_level_allows() {
+        for profile in catalog() {
+            let Some(probe) = &profile.probe else {
+                continue;
+            };
+            assert!(
+                probe.starts_with('/'),
+                "`{}`: a probe is relative to the base URL — `{probe}`",
+                profile.id
+            );
+            assert!(
+                matches!(profile.service, Service::Http { .. }),
+                "`{}`: only an HTTP upstream has a path to probe",
+                profile.id
+            );
+
+            // `{var}` stands in for a value the operator supplies, and a glob
+            // has to see something concrete to match a path segment.
+            let path = probe.split('?').next().unwrap_or(probe);
+            let concrete = regex_free_expand(path);
+            let allowed = profile.default_access().rules.iter().any(|rule| {
+                rule.action == "allow"
+                    && rule.methods.iter().any(|m| m == "GET" || m == "*")
+                    && rule.paths.iter().any(|pattern| {
+                        globset::Glob::new(pattern)
+                            .map(|glob| glob.compile_matcher().is_match(&concrete))
+                            .unwrap_or(false)
+                    })
+            });
+            assert!(
+                allowed,
+                "`{}`: probe `{concrete}` is not a GET the `{}` level allows, so an agent \
+                 could not make the call the operator just verified",
+                profile.id,
+                profile.default_access().name
+            );
+        }
+    }
+
+    /// `{account_id}` → a value, so the path can be matched against a glob.
+    fn regex_free_expand(path: &str) -> String {
+        let mut out = String::new();
+        let mut rest = path;
+        while let Some(open) = rest.find('{') {
+            let close = rest[open..].find('}').map(|at| open + at).unwrap_or(open);
+            out.push_str(&rest[..open]);
+            out.push_str("VALUE");
+            rest = &rest[close + 1..];
+        }
+        out.push_str(rest);
+        out
     }
 
     #[test]

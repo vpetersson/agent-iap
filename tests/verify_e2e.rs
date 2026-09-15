@@ -217,6 +217,54 @@ auth = {{ type = "bearer", secret = "env:AGENT_IAP_VERIFY_DEFINITELY_UNSET" }}
     );
 }
 
+/// The bug this is the regression test for: a fleet of perfectly good upstreams,
+/// every row amber, because almost no API serves anything at its root and the
+/// probe had nowhere better to aim. Four healthy services, four warnings, and a
+/// column the operator learns to skip.
+#[tokio::test]
+async fn a_working_upstream_with_nothing_at_its_root_is_not_reported_as_a_problem() {
+    let api = spawn_api().await;
+    std::env::set_var("AGENT_IAP_VERIFY_KEY", KEY);
+    let config = config(&format!(
+        r#"
+[[upstreams]]
+name = "api"
+base_url = "http://{api}"
+auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_KEY" }}
+
+[[acl]]
+name = "api-reads"
+kind = "http"
+target = "api"
+methods = ["GET"]
+paths = ["/**"]
+action = "allow"
+"#
+    ));
+
+    // No `--path` and no `verify_path`, so this is the root — and the stand-in
+    // API 404s its root exactly as the real ones do.
+    let report = verify::upstream(&config, &resolver(), "api", &options(None))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        steps(&report),
+        vec![
+            ("endpoint", Outcome::Passed),
+            ("credential", Outcome::Passed),
+            ("reach", Outcome::Passed),
+            ("policy", Outcome::Passed),
+        ],
+        "a working upstream must not be reported as a warning: {report:?}"
+    );
+    // Passed without overclaiming: the credential went out and came back
+    // untested, and the report has to say so in the same breath.
+    let reach = detail(&report, "reach");
+    assert!(reach.contains("not exercised"), "{reach}");
+    assert!(reach.contains("--path"), "{reach}");
+}
+
 /// The base URL is right, the credential is right, and nothing can get through.
 #[tokio::test]
 async fn an_upstream_no_rule_reaches_still_reports_the_call_and_warns() {
@@ -240,6 +288,17 @@ auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_
         "the service answered; the policy is the problem"
     );
     assert_eq!(report.verdict(), Outcome::Warned);
+    // And the amber is the policy's, not the probe's — everything else passed,
+    // which is what makes it worth looking at.
+    assert_eq!(
+        steps(&report)
+            .iter()
+            .filter(|(_, outcome)| *outcome == Outcome::Warned)
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>(),
+        vec!["policy"],
+        "{report:?}"
+    );
     let policy = detail(&report, "policy");
     assert!(policy.contains("no ACL rule reaches it"), "{policy}");
     // And it says what to type, because "add a rule" is not an instruction.
@@ -467,20 +526,36 @@ auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_
     assert!(detail(&report, "endpoint").ends_with("/me"), "{report:?}");
     assert!(detail(&report, "reach").contains("200 OK"));
 
-    // Without one, the same upstream is probed at the root and comes back with
-    // a 404 that says nothing about the credential — a warning, not a pass.
+    // Without one, the same upstream is probed at the root, gets a 404, and the
+    // report says what that is worth: the host is there, the credential was
+    // never put to the question. A pass, because nothing is wrong — but a pass
+    // that does not pretend to be the one above.
     let bare = config(&format!(
         r#"
 [[upstreams]]
 name = "api"
 base_url = "http://{api}"
 auth = {{ type = "header", header = "x-api-key", secret = "env:AGENT_IAP_VERIFY_PROBE" }}
+
+[[acl]]
+name = "api-reads"
+kind = "http"
+target = "api"
+methods = ["GET"]
+paths = ["/**"]
+action = "allow"
 "#
     ));
     let report = verify::upstream(&bare, &resolver(), "api", &options(None))
         .await
         .unwrap();
-    assert_eq!(report.verdict(), Outcome::Warned, "{report:?}");
+    assert_eq!(report.verdict(), Outcome::Passed, "{report:?}");
+    let reach = detail(&report, "reach");
+    assert!(reach.contains("404"), "{reach}");
+    assert!(reach.contains("not exercised"), "{reach}");
+    // The two reports must not read alike: one proved the credential, the
+    // other proved DNS.
+    assert!(!reach.contains("credential was accepted"), "{reach}");
 
     // And an operator asking about one endpoint still gets that endpoint: the
     // argument is the question being asked, the file is only the default.

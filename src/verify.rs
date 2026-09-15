@@ -41,9 +41,24 @@ use crate::secrets::{display_ref, SecretResolver};
 /// for rather than walk away from.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What gets probed when nobody named a path: the root, which is the one path
-/// every base URL has.
+/// What gets probed when nobody named a path and the upstream carries no
+/// `verify_path`: the root, which is the one path every base URL has.
 const ROOT: &str = "/";
+
+/// What the probe was aimed at, which is what decides what its answer is worth.
+///
+/// The distinction the report lives or dies on. A 404 from an endpoint that
+/// should exist means something is wrong. A 404 from the root of an API means
+/// the API serves nothing at its root — true of very nearly all of them, and it
+/// says nothing whatsoever about the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aim {
+    /// `/`, because there was nothing better to try.
+    Root,
+    /// A real endpoint: `--path`, or the upstream's own `verify_path`. A
+    /// credential either works against one of those or it does not.
+    Endpoint,
+}
 
 /// How many tool names a report prints before it starts counting.
 const TOOLS_NAMED: usize = 8;
@@ -247,11 +262,10 @@ async fn probe_upstream(
     // What the caller named wins — `--path` is how you ask a question about one
     // endpoint. Otherwise the upstream's own `verify_path`, which is the answer
     // its profile already knew, and only then the root.
-    let probe = options
-        .path
-        .as_deref()
-        .or(upstream.verify_path.as_deref())
-        .unwrap_or(ROOT);
+    let (probe, aim) = match options.path.as_deref().or(upstream.verify_path.as_deref()) {
+        Some(probe) => (probe, Aim::Endpoint),
+        None => (ROOT, Aim::Root),
+    };
     let (path, query) = split_query(probe);
     let url = match crate::proxy::build_url(&upstream.base_url, &path, query.as_deref()) {
         Ok(url) => url,
@@ -321,7 +335,7 @@ async fn probe_upstream(
     let started = Instant::now();
     match http.execute(request).await {
         Ok(response) => {
-            let (outcome, detail) = classify(&response, started.elapsed(), options.path.is_some());
+            let (outcome, detail) = classify(&response, started.elapsed(), aim);
             report.step(REACH, outcome, detail);
         }
         Err(error) => report.failed(REACH, describe(&error)),
@@ -333,16 +347,27 @@ async fn probe_upstream(
 
 /// What the status code says about the two things being verified: that the host
 /// is the one that was meant, and that the credential is one it accepts.
-fn classify(
-    response: &reqwest::Response,
-    elapsed: Duration,
-    path_was_given: bool,
-) -> (Outcome, String) {
+///
+/// Only a probe of a real endpoint can speak to the second, and a report must
+/// never claim more than its probe went and asked. Dressing a root probe up as
+/// an answer about the credential turns every healthy upstream amber — and a
+/// status column that is amber for a working fleet is one an operator learns
+/// within a day to stop reading, which is worse than not having it.
+fn classify(response: &reqwest::Response, elapsed: Duration, aim: Aim) -> (Outcome, String) {
     let status = response.status();
     let took = format!("in {}ms", elapsed.as_millis());
 
     if status.is_success() {
-        return (Outcome::Passed, format!("answered {status} {took}"));
+        return match aim {
+            Aim::Endpoint => (
+                Outcome::Passed,
+                format!("answered {status} {took} — the credential was accepted"),
+            ),
+            Aim::Root => (
+                Outcome::Passed,
+                format!("the host answered {status} {took}{NOT_EXERCISED}"),
+            ),
+        };
     }
     if status.is_redirection() {
         let to = response
@@ -358,28 +383,38 @@ fn classify(
             format!("answered {status} → {to} — the base URL may be the wrong one"),
         );
     }
-    match status.as_u16() {
-        401 => (
+    match (status.as_u16(), aim) {
+        // A credential the service actively rejected, wherever it was aimed. An
+        // API that 401s its own root has still 401ed a request carrying this
+        // key, and that is worth failing on.
+        (401, _) => (
             Outcome::Failed,
             format!("the service rejected the credential — {status} {took}"),
         ),
-        // Authenticated and not entitled. The credential got in; what it may do
-        // is a scope question, and on a probe of the root it is usually not
-        // even a real one.
-        403 => (
+        // Authenticated and not entitled. Against a real endpoint that is a
+        // scope problem worth naming — a service-account key with no binding to
+        // the property is exactly this shape.
+        (403, Aim::Endpoint) => (
             Outcome::Warned,
             format!(
-                "answered {status} {took} — the credential was accepted but is not allowed here"
+                "answered {status} {took} — the credential is accepted but not entitled here. \
+                 Check the scopes, and that the account has been granted the resource."
             ),
         ),
-        404 | 405 if !path_was_given => (
+        // Every other 4xx from the root: it answered, which is the whole of
+        // what the root was asked. Nothing is wrong, so nothing is amber.
+        (_, Aim::Root) if status.is_client_error() => (
+            Outcome::Passed,
+            format!("the host answered {status} {took}{NOT_EXERCISED}"),
+        ),
+        (404 | 405, Aim::Endpoint) => (
             Outcome::Warned,
             format!(
-                "the host answered {status} {took} — reachable, but its root says nothing \
-                 about the credential. Pass --path with a real endpoint to exercise it."
+                "answered {status} {took} for an endpoint that should exist — the base URL \
+                 may be wrong, or the API has moved"
             ),
         ),
-        429 => (
+        (429, _) => (
             Outcome::Warned,
             format!("the service is rate-limiting this credential — {status} {took}"),
         ),
@@ -389,6 +424,12 @@ fn classify(
         ),
     }
 }
+
+/// The sentence a root probe owes the reader. Without it a pass here would
+/// imply the report proved something it never went near.
+const NOT_EXERCISED: &str =
+    " — reachable. The credential was attached but not exercised: this upstream has no \
+     `verify_path`, so pass --path with a real endpoint to prove it.";
 
 // ---- mcp servers ----------------------------------------------------------
 
@@ -1165,13 +1206,8 @@ mod tests {
         reqwest::Response::from(builder.body("").unwrap())
     }
 
-    fn verdict_of(status: u16, path_was_given: bool) -> Outcome {
-        classify(
-            &response(status, &[]),
-            Duration::from_millis(1),
-            path_was_given,
-        )
-        .0
+    fn verdict_of(status: u16, aim: Aim) -> Outcome {
+        classify(&response(status, &[]), Duration::from_millis(1), aim).0
     }
 
     /// The distinction the whole command rests on: a service that refused the
@@ -1180,13 +1216,50 @@ mod tests {
     /// (everything passes) or unusable (every 404 fails a deploy).
     #[test]
     fn a_rejected_credential_fails_and_an_unhelpful_answer_only_warns() {
-        assert_eq!(verdict_of(200, false), Outcome::Passed);
-        assert_eq!(verdict_of(204, false), Outcome::Passed);
-        assert_eq!(verdict_of(401, false), Outcome::Failed);
-        assert_eq!(verdict_of(403, false), Outcome::Warned);
-        assert_eq!(verdict_of(404, false), Outcome::Warned);
-        assert_eq!(verdict_of(429, false), Outcome::Warned);
-        assert_eq!(verdict_of(503, false), Outcome::Warned);
+        assert_eq!(verdict_of(200, Aim::Endpoint), Outcome::Passed);
+        assert_eq!(verdict_of(204, Aim::Endpoint), Outcome::Passed);
+        assert_eq!(verdict_of(401, Aim::Endpoint), Outcome::Failed);
+        assert_eq!(verdict_of(403, Aim::Endpoint), Outcome::Warned);
+        assert_eq!(verdict_of(404, Aim::Endpoint), Outcome::Warned);
+        assert_eq!(verdict_of(429, Aim::Endpoint), Outcome::Warned);
+        assert_eq!(verdict_of(503, Aim::Endpoint), Outcome::Warned);
+    }
+
+    /// The regression this exists for. Every upstream in the console showed
+    /// amber and every one of them worked, because almost no API serves
+    /// anything at its root — so the probe that had nowhere better to aim got a
+    /// 404 and the column called it a warning. A status column that is amber
+    /// for a healthy fleet teaches the operator to stop reading it, which is
+    /// the one outcome worse than not having it.
+    #[test]
+    fn a_root_that_answers_at_all_is_a_pass_whatever_it_answers() {
+        for status in [200, 400, 403, 404, 405, 410, 418] {
+            assert_eq!(
+                verdict_of(status, Aim::Root),
+                Outcome::Passed,
+                "a root probe answering {status}"
+            );
+        }
+        // The exception: the service looked at this credential and said no.
+        // Where it was pointed does not soften that.
+        assert_eq!(verdict_of(401, Aim::Root), Outcome::Failed);
+        // And a server-side fault is still worth an eyebrow.
+        assert_eq!(verdict_of(503, Aim::Root), Outcome::Warned);
+    }
+
+    /// A pass from the root must not read as a pass for the credential.
+    #[test]
+    fn a_root_probe_says_what_it_did_not_prove() {
+        for status in [200, 404] {
+            let (outcome, detail) =
+                classify(&response(status, &[]), Duration::from_millis(1), Aim::Root);
+            assert_eq!(outcome, Outcome::Passed);
+            assert!(detail.contains("not exercised"), "{detail}");
+            assert!(detail.contains("--path"), "{detail}");
+        }
+        let (_, detail) = classify(&response(200, &[]), Duration::from_millis(1), Aim::Endpoint);
+        assert!(detail.contains("credential was accepted"), "{detail}");
+        assert!(!detail.contains("not exercised"), "{detail}");
     }
 
     #[test]
@@ -1194,7 +1267,7 @@ mod tests {
         let (outcome, detail) = classify(
             &response(302, &[("location", "https://login.example.com/")]),
             Duration::from_millis(1),
-            false,
+            Aim::Root,
         );
         assert_eq!(outcome, Outcome::Warned);
         assert!(
@@ -1206,8 +1279,8 @@ mod tests {
     /// The suggestion only makes sense when nobody has taken it yet.
     #[test]
     fn a_404_stops_suggesting_a_path_once_one_was_given() {
-        let asked = classify(&response(404, &[]), Duration::from_millis(1), true).1;
-        let unasked = classify(&response(404, &[]), Duration::from_millis(1), false).1;
+        let asked = classify(&response(404, &[]), Duration::from_millis(1), Aim::Endpoint).1;
+        let unasked = classify(&response(404, &[]), Duration::from_millis(1), Aim::Root).1;
         assert!(!asked.contains("--path"), "{asked}");
         assert!(unasked.contains("--path"), "{unasked}");
     }
