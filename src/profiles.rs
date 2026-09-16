@@ -825,6 +825,92 @@ fn bearer_api(spec: BearerApi<'_>) -> Profile {
     }
 }
 
+/// What `read`, `triage` and `write` mean for the Sentry REST API.
+///
+/// Shared by the hosted and self-hosted profiles because it is one API: the
+/// deployment decides the host, not the paths, and a level that meant something
+/// different depending on where Sentry runs would be a level nobody could
+/// reason about.
+fn sentry_rest_access() -> Vec<Access> {
+    // Sentry's issue endpoints come in three spellings and always have: the
+    // organization-wide one, the project-scoped one that predates it and is all
+    // a 9.x install has, and the bare `/issues/<id>/` an issue's own URL
+    // resolves to. A rule naming only the first works on sentry.io and covers
+    // nothing on an older self-hosted instance.
+    const ISSUES: &[&str] = &[
+        "/organizations/*/issues/**",
+        "/projects/*/*/issues/**",
+        "/issues/**",
+    ];
+    vec![
+        access(
+            "read",
+            "GET across the whole v0 API — `org:read`, `project:read` and `event:read`",
+            &[],
+            vec![rule("reads", &["GET"], &["/**"], "allow")],
+        ),
+        access(
+            "triage",
+            "reads, plus resolving, ignoring and assigning issues; DELETE denied, \
+             anything else prompts",
+            &[],
+            vec![
+                rule("reads", &["GET"], &["/**"], "allow"),
+                // Resolve, ignore, assign and mute are one PUT with different
+                // bodies, and they are the whole of what an agent watching
+                // errors needs to write. `event:write` on the token; the ACL is
+                // what keeps the same token from editing a project.
+                rule("triage", &["PUT"], ISSUES, "allow"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every method across the whole API",
+            &[],
+            vec![rule("all", &["*"], &["/**"], "allow")],
+        ),
+    ]
+}
+
+/// The same three levels for the MCP server, so `--access triage` means the
+/// same thing whichever of the four Sentry profiles it is given to.
+fn sentry_mcp_access() -> Vec<Access> {
+    // The catalog moves — tools arrive with products — so `read` allows the
+    // read-shaped verbs and sends the rest to `ask` rather than denying them.
+    // `analyze_issue_with_seer` matches none of these on purpose: it is the one
+    // read here that spends, so it prompts with the writes.
+    const READS: &[&str] = &["whoami", "find_*", "get_*", "search_*", "*_details"];
+    vec![
+        access(
+            "read",
+            "the tools that look things up; everything else prompts",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "triage",
+            "also `update_issue` — resolve, ignore and assign — and nothing else",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("triage", &["tools/call"], &["update_issue"], "allow"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every tool the server exposes",
+            &[],
+            vec![rule("tools", &["tools/call"], &["**"], "allow")],
+        ),
+    ]
+}
+
 pub fn catalog() -> Vec<Profile> {
     let mut profiles = vec![
         // ---------------- Google ----------------
@@ -1633,6 +1719,186 @@ pub fn catalog() -> Vec<Profile> {
             ),
             probe: None,
         },
+        // ---------------- Sentry ----------------
+        Profile {
+            id: "sentry".into(),
+            title: "Sentry API (sentry.io)".into(),
+            vendor: "Sentry".into(),
+            summary: "Issues, events, releases, alerts and Discover, on Sentry's own cloud."
+                .into(),
+            default_name: "sentry".into(),
+            credential: Credential {
+                about: "a user auth token (`sntryu_…`), or an internal-integration token, \
+                        with the scopes you want reachable"
+                    .into(),
+                url: "https://sentry.io/settings/account/api/auth-tokens/".into(),
+            },
+            vars: vec![v(
+                "region",
+                "the region your organization is in: `us` or `de` — its settings page says which",
+                Some("us"),
+            )],
+            service: Service::Http {
+                base_url: "https://{region}.sentry.io/api/0".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: sentry_rest_access(),
+            note: Some(
+                "Sentry has shipped one version of this API and the `0` in `/api/0` is it — \
+                 there is no `v1` to move to, which is why the same rules front sentry.io \
+                 and an install of your own. What does differ is the region. Every \
+                 organization lives in one, `us` or `de`, and an organization auth token \
+                 (`sntrys_…`) carries its own region inside it, so pointing one at the \
+                 other host is a 401 or a redirect from a token that is perfectly good. \
+                 Plain `sentry.io` routes to either; the region host is what this profile \
+                 writes because it is the one that does not, and a wrong region is better \
+                 found by `verify` than by an agent. Organization tokens are CI \
+                 credentials — releases and source maps — so a token for reading issues \
+                 should be a user one. For an install of your own, use \
+                 `sentry-self-hosted`."
+                    .into(),
+            ),
+            // Free, on every plan and every version, and the call that separates
+            // a rejected token from an unentitled one: a good token with no
+            // `org:read` gets a 403 here, which `verify` reports as a warning
+            // rather than a failure.
+            probe: Some("/organizations/".into()),
+        },
+        Profile {
+            id: "sentry-self-hosted".into(),
+            title: "Sentry API (self-hosted)".into(),
+            vendor: "Sentry".into(),
+            summary: "The same v0 API on an install of your own — no regions, and whatever \
+                      endpoints your version has."
+                .into(),
+            default_name: "sentry".into(),
+            credential: Credential {
+                about: "an auth token from *your* install — a sentry.io token is not valid \
+                        against it"
+                    .into(),
+                url: "https://develop.sentry.dev/self-hosted/".into(),
+            },
+            vars: vec![
+                v(
+                    "host",
+                    "your Sentry host, e.g. `sentry.example.com` — no scheme, no `/api/0`",
+                    None,
+                ),
+                v(
+                    "scheme",
+                    "`https`, or `http` for an install that terminates TLS nowhere — the \
+                     token crosses that wire in a header",
+                    Some("https"),
+                ),
+            ],
+            service: Service::Http {
+                base_url: "{scheme}://{host}/api/0".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: sentry_rest_access(),
+            note: Some(
+                "Self-hosted Sentry has been on calendar versions since 20.6.0 — `YY.MM.PATCH`, \
+                 cut monthly — and the API you get is that release's, not sentry.io's. The \
+                 paths these rules name have been there throughout, but what answers them \
+                 has not: anything sentry.io shipped after the version you run 404s rather \
+                 than being denied, and Seer is not in self-hosted at all. Older than the \
+                 calendar versions, a 9.x install predates the organization-wide issue and \
+                 event endpoints and has only the project-scoped ones \
+                 (`/projects/{org}/{project}/issues/`); both spellings are inside the rules \
+                 here, so the access level means the same thing on either — only the \
+                 answers change. There are no regions and no `sntrys_` organization tokens \
+                 here: the token comes from your own instance, under Settings → Auth Tokens \
+                 (Settings → Account → API → Auth Tokens on the 9.x line)."
+                    .into(),
+            ),
+            probe: Some("/organizations/".into()),
+        },
+        Profile {
+            id: "sentry-mcp".into(),
+            title: "Sentry MCP server".into(),
+            vendor: "Sentry".into(),
+            summary: "Sentry's hosted MCP server, fronted with a token instead of a browser."
+                .into(),
+            default_name: "sentry-mcp".into(),
+            credential: Credential {
+                about: "a user auth token (`sntryu_…`) — the same one the REST profile takes"
+                    .into(),
+                url: "https://sentry.io/settings/account/api/auth-tokens/".into(),
+            },
+            vars: vec![],
+            service: Service::McpHttp {
+                url: "https://mcp.sentry.dev/mcp".into(),
+                // The remote server's documented alternative to its OAuth flow:
+                // `Sentry-Bearer`, not `Bearer`, in the ordinary authorization
+                // header. It is what lets the proxy hold this credential rather
+                // than hand the whole exchange to `mcp-remote`.
+                auth: AuthTemplate::Header {
+                    header: "authorization".into(),
+                    prefix: Some("Sentry-Bearer ".into()),
+                },
+            },
+            access: sentry_mcp_access(),
+            note: Some(
+                "Sentry's hosted MCP server offers OAuth first, and every client that takes \
+                 the plain URL does the browser flow. It also accepts a token in the \
+                 authorization header as `Sentry-Bearer <token>`, and that is what this \
+                 profile enrols — so the credential stays in the proxy, the way it does for \
+                 the REST profiles, rather than in a child process's cache the way the \
+                 `cloudflare-mcp-*` profiles have to. `analyze_issue_with_seer` is left out \
+                 of the `read` level's allow list on purpose: Seer is the one tool here \
+                 that spends against the organization's budget, so it lands on `ask` with \
+                 the writes. The server can be scoped to one organization or project by \
+                 adding it to the URL (`/mcp/<org>/<project>`); edit the `url` this writes \
+                 if you want that. Self-hosted Sentry has no hosted MCP — use \
+                 `sentry-mcp-self-hosted`."
+                    .into(),
+            ),
+            probe: None,
+        },
+        Profile {
+            id: "sentry-mcp-self-hosted".into(),
+            title: "Sentry MCP server (self-hosted)".into(),
+            vendor: "Sentry".into(),
+            summary: "The same MCP server as a child process, pointed at an install of your own."
+                .into(),
+            default_name: "sentry-mcp".into(),
+            credential: Credential {
+                about: "an auth token from your own install, with `org:read`, `project:read` \
+                        and `event:write`"
+                    .into(),
+                url: "https://develop.sentry.dev/self-hosted/".into(),
+            },
+            vars: vec![v(
+                "host",
+                "your Sentry host, e.g. `sentry.example.com` — no scheme, no `/api/0`",
+                None,
+            )],
+            service: Service::McpStdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "@sentry/mcp-server@latest".into(),
+                    "--host={host}".into(),
+                    // Seer is not part of self-hosted, and a skill whose tools
+                    // 404 on every call is worse than one that is not offered.
+                    "--disable-skills=seer".into(),
+                ],
+                env: vec![("SENTRY_ACCESS_TOKEN".into(), "{secret}".into())],
+            },
+            access: sentry_mcp_access(),
+            note: Some(
+                "There is no hosted MCP endpoint for an install of your own, so this one runs \
+                 `@sentry/mcp-server` as a child and points it at your host. The token goes \
+                 to the child in `SENTRY_ACCESS_TOKEN` as the same `--secret` reference every \
+                 other profile takes, and the proxy still rules on and logs every JSON-RPC \
+                 message. Two things the flags cover and the rules cannot: Seer is disabled \
+                 because self-hosted does not have it, and an install that terminates TLS \
+                 nowhere needs `--insecure-http` added to `args` by hand. Tools that name a \
+                 product your version predates fail as tool errors, not as denials."
+                    .into(),
+            ),
+            probe: None,
+        },
         // ---------------- Common neighbours ----------------
         Profile {
             id: "anthropic".into(),
@@ -1740,19 +2006,6 @@ pub fn catalog() -> Vec<Profile> {
             },
             read_paths: &["/graphql"],
             write_paths: &["/graphql"],
-        }),
-        bearer_api(BearerApi {
-            id: "sentry",
-            title: "Sentry API",
-            vendor: "Sentry",
-            summary: "Issues, events and releases.",
-            base_url: "https://sentry.io/api/0",
-            credential: Credential {
-                about: "an auth token".into(),
-                url: "https://sentry.io/settings/account/api/auth-tokens/".into(),
-            },
-            read_paths: &["/**"],
-            write_paths: &["/**"],
         }),
         bearer_api(BearerApi {
             id: "slack",
@@ -2104,6 +2357,139 @@ mod tests {
         // A known service with no free read-only route stays unprobed.
         assert_eq!(probe_for("https://api.semrush.com/apis/v4"), None);
         assert_eq!(probe_for("https://api.example.com"), None);
+    }
+
+    /// The reason there is a Sentry MCP profile at all rather than another
+    /// `mcp-remote` child: the hosted server takes a token in the ordinary
+    /// authorization header, so the proxy can hold the credential.
+    #[test]
+    fn sentry_mcp_holds_the_token_instead_of_delegating_the_oauth_flow() {
+        let profile = get("sentry-mcp").unwrap();
+        let auth = build_auth(
+            &profile.service,
+            "op://Private/Sentry/token",
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
+        match auth {
+            AuthSpec::Header {
+                header,
+                secret,
+                prefix,
+            } => {
+                assert_eq!(header, "authorization");
+                assert_eq!(secret, "op://Private/Sentry/token");
+                // `Sentry-Bearer`, not `Bearer` — the plain one is the OAuth
+                // access token's scheme and this is not that.
+                assert_eq!(prefix.as_deref(), Some("Sentry-Bearer "));
+            }
+            other => panic!("sentry-mcp should front the hosted server directly: {other:?}"),
+        }
+    }
+
+    /// Self-hosted has no hosted endpoint, so the credential goes to a child
+    /// process — still as the reference the operator gave, never as a value.
+    #[test]
+    fn the_self_hosted_mcp_passes_a_reference_to_the_child_and_points_it_at_the_host() {
+        let profile = get("sentry-mcp-self-hosted").unwrap();
+        let vars = BTreeMap::from([("host".to_string(), "sentry.example.com".to_string())]);
+        let service = substitute_service(&profile.service, &vars, "env:SENTRY_TOKEN").unwrap();
+        let Service::McpStdio { args, env, .. } = service else {
+            panic!("self-hosted Sentry has no hosted MCP endpoint to front");
+        };
+        assert!(args.contains(&"--host=sentry.example.com".to_string()));
+        // Seer is not part of a self-hosted install, and a skill whose every
+        // tool fails is worse than one that was never offered.
+        assert!(args.contains(&"--disable-skills=seer".to_string()));
+        assert_eq!(
+            env,
+            vec![(
+                "SENTRY_ACCESS_TOKEN".to_string(),
+                "env:SENTRY_TOKEN".to_string()
+            )]
+        );
+    }
+
+    /// Seer is the one tool on the MCP server that spends, so it sits with the
+    /// writes rather than with the reads whose shape it otherwise shares.
+    #[test]
+    fn the_sentry_mcp_read_level_holds_back_the_tool_that_bills() {
+        let read = get("sentry-mcp").unwrap().default_access().clone();
+        let matches = |tool: &str| {
+            read.rules
+                .iter()
+                .find(|rule| {
+                    rule.paths.iter().any(|pattern| {
+                        globset::Glob::new(pattern)
+                            .map(|glob| glob.compile_matcher().is_match(tool))
+                            .unwrap_or(false)
+                    })
+                })
+                .map(|rule| rule.action.as_str())
+        };
+        assert_eq!(matches("whoami"), Some("allow"));
+        assert_eq!(matches("find_organizations"), Some("allow"));
+        assert_eq!(matches("search_issues"), Some("allow"));
+        assert_eq!(matches("get_issue_details"), Some("allow"));
+        assert_eq!(matches("analyze_issue_with_seer"), Some("ask"));
+        assert_eq!(matches("update_issue"), Some("ask"));
+        // The generic escape hatch runs whatever it is handed, so it cannot be
+        // read-shaped however it is spelled.
+        assert_eq!(matches("execute_sentry_tool"), Some("ask"));
+    }
+
+    /// Four profiles, one vocabulary: `--access triage` has to mean the same
+    /// thing whichever Sentry you are pointing at, or it means nothing.
+    #[test]
+    fn every_sentry_profile_offers_the_same_three_levels() {
+        for id in [
+            "sentry",
+            "sentry-self-hosted",
+            "sentry-mcp",
+            "sentry-mcp-self-hosted",
+        ] {
+            let names: Vec<_> = get(id)
+                .unwrap()
+                .access
+                .iter()
+                .map(|level| level.name.clone())
+                .collect();
+            assert_eq!(names, ["read", "triage", "write"], "`{id}`");
+        }
+    }
+
+    /// The issue endpoint has three spellings and a self-hosted install may
+    /// only have the oldest of them.
+    #[test]
+    fn sentry_triage_covers_the_issue_paths_every_version_has() {
+        let triage = get("sentry-self-hosted")
+            .unwrap()
+            .find_access("triage")
+            .unwrap()
+            .clone();
+        let put = triage
+            .rules
+            .iter()
+            .find(|rule| rule.methods == ["PUT"])
+            .expect("`triage` is the level that writes to issues");
+        for path in [
+            // sentry.io and a current self-hosted install
+            "/organizations/acme/issues/4242/",
+            // the project-scoped one a 9.x install has instead
+            "/projects/acme/web/issues/4242/",
+            // and the one an issue's own URL resolves to
+            "/issues/4242/",
+        ] {
+            assert!(
+                put.paths.iter().any(|pattern| {
+                    globset::Glob::new(pattern)
+                        .map(|glob| glob.compile_matcher().is_match(path))
+                        .unwrap_or(false)
+                }),
+                "`triage` does not reach `{path}`"
+            );
+        }
     }
 
     #[test]

@@ -412,7 +412,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Four levels are worth knowing about because they exist for reasons that are not
+Five levels are worth knowing about because they exist for reasons that are not
 about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
@@ -430,6 +430,13 @@ about permissions:
   rather than Standard API units, so the split is what lets one agent have
   Trends and not the reports, and what puts the two budgets on separate rows in
   the audit log.
+- **`sentry --access triage`** allows every read and exactly one write: the PUT
+  that resolves, ignores or assigns an issue. That is the whole of what an agent
+  watching errors needs, and `write` — which would also let it edit projects,
+  alert rules and members — is not a level anybody should have to accept to get
+  it. DELETE is denied rather than prompted. All four Sentry profiles offer the
+  same three levels, so `--access triage` means the same thing whichever Sentry
+  you point at.
 
 ### What is in the catalog
 
@@ -444,7 +451,8 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | DataForSEO | `dataforseo`, `dataforseo-mcp` |
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
 | Graylog | `graylog` |
-| Others | `anthropic`, `openai`, `github`, `linear`, `sentry`, `slack`, `stripe` |
+| Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
+| Others | `anthropic`, `openai`, `github`, `linear`, `slack`, `stripe` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
@@ -469,6 +477,18 @@ Three honest limits, all printed by `profile show`:
   `read` level allows the read verbs and sends everything else to `ask` rather
   than denying it. Watch the audit log for `ask` rows and promote the ones you
   want.
+- **A Sentry region is part of the address.** Every sentry.io organization lives
+  in `us` or `de`, and an organization auth token (`sntrys_…`) carries its own
+  region inside it — point one at the other host and a perfectly good token gets
+  a 401 or a redirect. So `sentry` writes the region host (`--var region=de`)
+  rather than plain `sentry.io`, which routes to either and would therefore hide
+  the mistake until an agent hit it. What does *not* vary is the API version:
+  Sentry has shipped one, the `0` in `/api/0`, so `sentry-self-hosted` is the
+  same rules at your own host. What varies there is the release — self-hosted
+  has been on calendar versions (`YY.MM.PATCH`) since 20.6.0, and an endpoint
+  your version predates 404s rather than being denied. The `triage` rules name
+  the project-scoped issue path as well as the organization-wide one for that
+  reason: a 9.x install only has the former.
 - **A path the ACL cannot split.** Semrush's v3 analytics puts every report at
   the same path and names it in a query parameter — `/?type=domain_ranks` — so
   rules can say "reports, read-only" and nothing finer. The credential goes in
