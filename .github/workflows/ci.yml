@@ -70,6 +70,26 @@ jobs:
       - run: cargo test --all-features --locked
       - run: cargo build --release --locked
 
+  formula:
+    name: homebrew formula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The tap is this repository (README.md § Install), so a formula that does
+      # not parse is a broken `brew install` for everyone who tapped it, and
+      # nothing else in CI would catch it — nothing else here is Ruby. The
+      # formula is generated (scripts/update-formula.sh), so what this really
+      # guards is the script.
+      #
+      # `brew` is on the runner image but deliberately off PATH, which is what
+      # the eval is for. `brew style` is rubocop with Homebrew's own cops: it
+      # catches the stanza order and the hash alignment that `ruby -c` would
+      # wave through.
+      - name: brew style
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew style Formula/agent-iap.rb
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
