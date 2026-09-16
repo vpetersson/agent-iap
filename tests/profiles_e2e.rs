@@ -534,6 +534,24 @@ async fn two_accounts_of_one_service_are_kept_apart() {
     );
 }
 
+/// A value for every variable a profile declares, for the tests that walk the
+/// whole catalog.
+///
+/// A declared default is used in preference to a made-up string, because some
+/// variables are a closed set rather than free text — a scheme is `https` or
+/// `http` and nothing else, and `placeholder://host` is not a base URL any
+/// proxy would load. Only a variable with no default gets the stand-in.
+fn stand_in_vars(profile: &profiles::Profile) -> Vec<String> {
+    profile
+        .vars
+        .iter()
+        .map(|var| {
+            let value = var.default.clone().unwrap_or_else(|| "placeholder".into());
+            format!("{}={value}", var.name)
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn every_mcp_profile_admits_the_handshake_it_would_otherwise_deny() {
     // `initialize` names no tool, so a tool-scoped rule never matches it. Every
@@ -557,11 +575,7 @@ async fn every_mcp_profile_admits_the_handshake_it_would_otherwise_deny() {
 
             let mut opts = options("env:UNUSED");
             opts.access = Some(level.name.clone());
-            opts.vars = profile
-                .vars
-                .iter()
-                .map(|var| format!("{}=placeholder", var.name))
-                .collect();
+            opts.vars = stand_in_vars(&profile);
             profiles::add(&path, &profile, &opts)
                 .unwrap_or_else(|error| panic!("{}/{}: {error:#}", profile.id, level.name));
 
@@ -607,11 +621,7 @@ fn every_profile_produces_a_policy_file_the_proxy_would_load() {
 
             let mut opts = options("op://Vault/Item/field");
             opts.access = Some(level.name.clone());
-            opts.vars = profile
-                .vars
-                .iter()
-                .map(|var| format!("{}=placeholder", var.name))
-                .collect();
+            opts.vars = stand_in_vars(&profile);
             profiles::add(&path, &profile, &opts)
                 .unwrap_or_else(|error| panic!("{}/{}: {error:#}", profile.id, level.name));
 
@@ -670,6 +680,136 @@ fn a_dry_run_writes_nothing_and_prints_what_it_would_have() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     assert_eq!(added.name, "cloudflare");
     assert!(!added.rules.is_empty());
+}
+
+#[tokio::test]
+async fn sentry_triage_resolves_an_issue_and_can_do_nothing_else() {
+    std::env::set_var("TEST_SENTRY_TOKEN", "sntryu_real-token");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SENTRY_TOKEN");
+    opts.access = Some("triage".into());
+    opts.vars = vec!["region=de".into()];
+    let harness = harness_from_profiles(&[("sentry", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/sentry/organizations/acme/issues/").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["authorization"], "Bearer sntryu_real-token");
+    assert!(seen["x-iap-token"].is_null());
+
+    // Resolving, ignoring and assigning are one PUT with different bodies, and
+    // they are the whole point of the level.
+    let (status, seen) = call(&harness, "PUT", "/sentry/organizations/acme/issues/4242/").await;
+    assert_eq!(status, 200, "a triage agent cannot resolve an issue");
+    assert_eq!(seen["method"], "PUT");
+
+    // The same method one path over is a project setting, not a triage action.
+    // `ask` with nobody watching resolves to a denial, which is the safe end.
+    let (status, body) = call(&harness, "PUT", "/sentry/projects/acme/web/").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a project edit reached Sentry from the triage level: {body}"
+    );
+
+    // Deleting an issue is denied outright rather than parked for a human:
+    // there is nothing to weigh, and the events are gone when it succeeds.
+    let (status, body) = call(
+        &harness,
+        "DELETE",
+        "/sentry/organizations/acme/issues/4242/",
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(body["path"].is_null(), "a DELETE reached Sentry: {body}");
+}
+
+/// The same three levels front sentry.io and an install of your own, and the
+/// issue rules cover the endpoint spelling an older self-hosted version has.
+#[tokio::test]
+async fn the_self_hosted_profile_is_the_hosted_one_with_a_different_host() {
+    std::env::set_var("TEST_SENTRY_ONPREM", "onprem-token");
+    let (dir, path) = minimal_policy();
+
+    let mut hosted = options("env:TEST_SENTRY_ONPREM");
+    hosted.vars = vec!["region=de".into()];
+    profiles::add(&path, &profiles::get("sentry").unwrap(), &hosted).unwrap();
+
+    let mut onprem = options("env:TEST_SENTRY_ONPREM");
+    onprem.name = Some("sentry-onprem".into());
+    onprem.vars = vec!["host=sentry.example.com".into()];
+    profiles::add(
+        &path,
+        &profiles::get("sentry-self-hosted").unwrap(),
+        &onprem,
+    )
+    .unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    // A region is a host, not a path: getting it wrong has to be visible in the
+    // base URL rather than in a 401 an agent reports later.
+    assert!(
+        written.contains("base_url = \"https://de.sentry.io/api/0\""),
+        "{written}"
+    );
+    // And an install of your own is the same API at your own address, `https`
+    // unless the operator says otherwise.
+    assert!(
+        written.contains("base_url = \"https://sentry.example.com/api/0\""),
+        "{written}"
+    );
+    // Both get the same probe, because it is the same API.
+    assert_eq!(
+        written.matches("verify_path = \"/organizations/\"").count(),
+        2
+    );
+    drop(dir);
+
+    // `triage` on a self-hosted upstream has to reach the project-scoped issue
+    // endpoint too: a 9.x install predates the organization-wide one, so rules
+    // that knew only the modern spelling would grant nothing there.
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SENTRY_ONPREM");
+    opts.access = Some("triage".into());
+    opts.vars = vec!["host=sentry.example.com".into()];
+    let harness = harness_from_profiles(&[("sentry-self-hosted", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "PUT", "/sentry/projects/acme/web/issues/4242/").await;
+    assert_eq!(
+        status, 200,
+        "the older project-scoped issue path is not reachable"
+    );
+    assert_eq!(seen["path"], "/api/0/projects/acme/web/issues/4242/");
+}
+
+/// A plain-HTTP install is reachable, and saying so is a decision the operator
+/// makes rather than one the profile makes for them.
+#[test]
+fn a_self_hosted_sentry_without_tls_is_an_explicit_choice() {
+    let (dir, path) = minimal_policy();
+    let profile = profiles::get("sentry-self-hosted").unwrap();
+
+    let mut opts = options("env:TEST_SENTRY_ONPREM");
+    opts.vars = vec!["host=sentry.internal".into(), "scheme=http".into()];
+    opts.dry_run = true;
+    let plan = profiles::add(&path, &profile, &opts).unwrap().plan.unwrap();
+    assert!(
+        plan.contains("base_url = \"http://sentry.internal/api/0\""),
+        "{plan}"
+    );
+
+    // …and the default is not that.
+    let mut secure = options("env:TEST_SENTRY_ONPREM");
+    secure.vars = vec!["host=sentry.internal".into()];
+    secure.dry_run = true;
+    let plan = profiles::add(&path, &profile, &secure)
+        .unwrap()
+        .plan
+        .unwrap();
+    assert!(
+        plan.contains("base_url = \"https://sentry.internal/api/0\""),
+        "{plan}"
+    );
+    drop(dir);
 }
 
 fn base64_encode(value: &str) -> String {
