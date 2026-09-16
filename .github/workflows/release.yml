@@ -231,6 +231,84 @@ jobs:
           provenance: mode=max
           sbom: true
 
+  # The tap is this repository (README.md § Install), so a release has to leave
+  # the formula pointing at the assets it has just published — a stale sha256 is
+  # not something anyone notices. After `release` rather than beside it: a
+  # formula whose URLs 404 is worse than one that is a minute behind.
+  homebrew:
+    name: homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # master, not the tag: a tap reads a branch. Full history, because the
+      # newest-tag check below reads every tag.
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+
+      # The same guard as the `latest` image tag, for the same reason: a
+      # backport cut after a newer release must not walk the formula backwards.
+      - name: is this the newest tag
+        id: newest
+        run: |
+          newest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          echo "newest tag is $newest, this is $GITHUB_REF_NAME"
+          if [ "$newest" = "$GITHUB_REF_NAME" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Formula left at \`$newest\` — \`$GITHUB_REF_NAME\` is older." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v8
+        if: steps.newest.outputs.latest == 'true'
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Hashed here, over the artifacts the release uploaded, so the formula and
+      # the SHA256SUMS asset beside it describe the same bytes by construction
+      # rather than by both being right.
+      - name: regenerate
+        if: steps.newest.outputs.latest == 'true'
+        run: |
+          (cd dist && sha256sum agent-iap-*.tar.gz > SHA256SUMS)
+          ./scripts/update-formula.sh "$GITHUB_REF_NAME" --checksums dist/SHA256SUMS
+
+      # Committed through the API rather than pushed: GitHub signs what it
+      # commits there, and a push authenticated with `github.token` would land
+      # unsigned. It also cannot trigger another workflow run, so a tag does not
+      # loop back into CI.
+      - name: commit
+        if: steps.newest.outputs.latest == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          path=Formula/agent-iap.rb
+          if git diff --quiet -- "$path"; then
+            echo "Formula already describes \`$GITHUB_REF_NAME\`." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          args=(
+            -f "message=chore: homebrew formula for $GITHUB_REF_NAME"
+            -f "branch=master"
+            -f "content=$(base64 -w0 "$path")"
+          )
+          # Absent only before the first release ever made one.
+          if sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=master" \
+                     --jq .sha 2>/dev/null); then
+            args+=(-f "sha=$sha")
+          fi
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            "${args[@]}" > /dev/null
+          echo "Formula on master now installs \`$GITHUB_REF_NAME\`." \
+            >> "$GITHUB_STEP_SUMMARY"
+
   # Dormant until someone decides crates.io is wanted and adds the token: the
   # crate packages cleanly today, but `cargo install agent-iap` cannot work until
   # a version is actually published, and publishing is irreversible. Skipping

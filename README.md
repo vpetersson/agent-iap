@@ -157,7 +157,40 @@ rather than yours. The agent never sees those at all.
 
 Every `v…` tag builds a binary for each platform, checksums it, and attaches it
 to a GitHub Release — plus a container image on ghcr.io from the same bytes.
-Pick whichever suits the box:
+Pick whichever suits the box.
+
+With Homebrew, on a Mac or on Linux — the tap is this repository, so there is no
+second `homebrew-` repo to go stale beside it:
+
+```bash
+brew tap vpetersson/agent-iap https://github.com/vpetersson/agent-iap
+brew trust vpetersson/agent-iap
+brew install agent-iap
+```
+
+`brew trust` is the middle step because Homebrew 7 refuses to load a formula
+from a third-party tap until someone says so once — a formula is Ruby that runs
+on the machine installing it, and this one is a credential broker. It is asking
+whether you meant this repository, and the answer is worth looking at the URL
+for.
+
+[`Formula/agent-iap.rb`](Formula/agent-iap.rb) installs the release tarball the
+recipe below downloads by hand, against the sha256 that release published, so
+nothing is compiled and there is no toolchain to install first. The release
+workflow rewrites the formula from the checksums of the assets it has just
+uploaded, which is what keeps `brew upgrade` and the tag in step.
+`brew install --HEAD agent-iap` builds master instead — for a fix that is merged
+but not yet tagged, and the only form there is before the first release, since a
+formula cannot pin a checksum against an asset that does not exist yet.
+
+`brew services start agent-iap` then runs it as a launchd or systemd service
+against `$(brew --prefix)/etc/agent-iap/iap.toml`, with `IAP_STATE_DIR` pointed
+at `$(brew --prefix)/var/lib/agent-iap` for the audit log. There is no approval
+console on a service, so an `ask` rule is answered over the control plane
+(§ Control plane) or it denies — [§ Deployment](#deployment) is the same
+arrangement spelled out, and `agent-iap run` in a terminal is the console.
+
+Or by hand, which is the same bytes:
 
 ```bash
 # linux-x86_64 · linux-aarch64 · macos-arm64 · macos-x86_64
