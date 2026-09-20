@@ -90,10 +90,7 @@ answered without the agent ever holding the thing that makes the call work.
 
 ### What the proxy changes
 
-The agent gets a token minted by the proxy. It is not an API key: it buys
-nothing anywhere else, it names one agent, and one command revokes it without
-rotating anything real. The credential stays on the proxy's side of the
-boundary and is attached on the way out, after policy has already said yes.
+The same agent, before and after:
 
 ```mermaid
 flowchart TB
@@ -118,8 +115,7 @@ flowchart TB
 
 So a leaked agent context leaks a token whose entire power is the ACL, and the
 blast radius of a compromised agent is that rule set rather than the API key's
-own scope. That is the whole argument; § Security model is the same claim with
-its limits attached.
+own scope. § Security model is the same claim with its limits attached.
 
 ### Where it sits
 
@@ -130,34 +126,51 @@ manager's answer is resolved inside the proxy and never handed to the caller,
 and the per-connection question Little Snitch asks gets asked per credentialed
 call instead, with the answer written down.
 
-It is deliberately none of the following. It is not a secrets manager — it
-reads from yours. It is not a firewall — allowing a call is not opening the
-network, and the agent VLAN still needs its own rules. It is not a sandbox — it
-constrains what an agent can *reach*, never what it can compute.
+It is not a secrets manager — it reads from yours. Not a firewall — allowing a
+call is not opening the network, and the agent VLAN still needs its own rules.
+Not a sandbox — it constrains what an agent can *reach*, never what it can
+compute.
 
 ### How long a grant lasts
 
-Policy is not a clock, and it is not trying to be: a rule is true until you
-change it, an `ask` is answered per call, and "remember for this session" dies
-with the process. Two things here do expire, and between them they are what
-"give it Google Analytics for the next hour" means.
+Policy is not a clock: a rule is true until you change it, an `ask` is answered
+per call, and "remember for this session" dies with the process. Two things do
+expire, and between them they are what "give it Google Analytics for the next
+hour" means.
 
-The agent's own credential expires under § Workload identity. The agent trades
-its standing token for one scoped to the work actually in front of it, valid for
-an hour at most, and once that lapses the copy left behind in a context window
-buys nothing. The default mode is `optional`, so until you set `required` the
-standing agent token still works and the bound is one the agent opted into —
-`required` is what turns it into a bound you imposed.
+The agent's own credential expires under § Workload identity — it trades its
+standing token for one scoped to the work in front of it, valid for an hour at
+most, so the copy left in a context window buys nothing once it lapses. The
+default mode is `optional`; `required` is what turns that bound into one you
+imposed rather than one the agent opted into.
 
 The credentials the proxy mints *upstream* expire too
-(`oauth2_client_credentials`, `service_account_jwt`), on the provider's clock
-rather than yours. The agent never sees those at all.
+(`oauth2_client_credentials`, `service_account_jwt`), on the provider's clock.
+The agent never sees those at all.
 
 ## Install
 
 Every `v…` tag builds a binary for each platform, checksums it, and attaches it
 to a GitHub Release — plus a container image on ghcr.io from the same bytes.
-Pick whichever suits the box:
+
+Homebrew, on macOS or Linux. The tap is this repository, so there is no second
+`homebrew-` repo to keep in step:
+
+```bash
+brew tap vpetersson/agent-iap https://github.com/vpetersson/agent-iap
+brew trust vpetersson/agent-iap   # Homebrew 7 loads no third-party formula until you do
+brew install agent-iap
+```
+
+[`Formula/agent-iap.rb`](Formula/agent-iap.rb) installs the release tarball
+against the sha256 that release published, so nothing is compiled; the release
+workflow rewrites the formula from the checksums of the assets it just uploaded.
+`brew install --HEAD agent-iap` builds master instead, and is the only form
+there is before the first tag. `brew services start agent-iap` runs it as a
+launchd or systemd service against `$(brew --prefix)/etc/agent-iap/iap.toml`,
+with no approval console — see [§ Deployment](#deployment).
+
+Or by hand:
 
 ```bash
 # linux-x86_64 · linux-aarch64 · macos-arm64 · macos-x86_64
@@ -173,28 +186,23 @@ sudo install -m0755 "agent-iap-$v-$platform/agent-iap" /usr/local/bin/agent-iap
 agent-iap --version
 ```
 
-The Linux binaries are statically linked against musl: no glibc floor, so the
-same file runs on a current Ubuntu and on whatever the box in the rack is
-running, and there is no runtime to install beside it. The TLS roots are
-compiled in too, so it needs nothing from `/etc/ssl` either. The macOS builds
-are not signed or notarised — `curl` sets no quarantine attribute so this works,
-but a binary downloaded through a browser needs
-`xattr -d com.apple.quarantine agent-iap` first.
+The Linux binaries are static musl: no glibc floor, no runtime to install
+beside them, TLS roots compiled in. The macOS builds are not signed or
+notarised — `curl` sets no quarantine attribute, but a binary downloaded through
+a browser needs `xattr -d com.apple.quarantine agent-iap` first.
 
-Or the image, which is the same binary on a distroless base — no shell, no
-package manager, nothing to run but the proxy:
+Or the image — the same binary on a distroless base, no shell and no package
+manager:
 
 ```bash
 docker run --rm ghcr.io/vpetersson/agent-iap:2026.9.1 --version
 ```
 
-Tags are `2026.9.1`, the floating `2026.9` within a month, and `latest` — which
-moves only when the tag being built really is the newest one, so a backport does
+Tags are `2026.9.1`, the floating `2026.9` within a month, and `latest`, which
+moves only when the tag being built really is the newest — so a backport does
 not walk it backwards. There is no `2026` tag: the year is the major only
-because semver needs one (§ Versioning), and a year-wide alias would imply a
-promise nothing here makes.
-[§ Deployment](#deployment) has what to mount and what the image deliberately
-cannot do.
+because semver needs one (§ Versioning). [§ Deployment](#deployment) has what to
+mount and what the image cannot do.
 
 With a Rust toolchain, from source:
 
@@ -202,19 +210,16 @@ With a Rust toolchain, from source:
 cargo install --locked --git https://github.com/vpetersson/agent-iap
 ```
 
-`cargo install agent-iap` — the crates.io form — does not work yet: nothing is
-published there. The crate packages cleanly and the release workflow already
-carries the job, dormant until a `CARGO_REGISTRY_TOKEN` secret exists, because
-publishing cannot be undone and is worth deciding on rather than defaulting
-into. Until then `--git` is the toolchain path.
+`cargo install agent-iap` does not work yet — nothing is published to
+crates.io. The release workflow carries the job, dormant until a
+`CARGO_REGISTRY_TOKEN` secret exists.
 
 ## Quickstart
 
-Everything below writes `~/.config/agent-iap/iap.toml`, so it needs no root and
-nothing installed anywhere: this is the proxy on a laptop, in front of one
-upstream. [§ Deployment](#deployment) is the same thing as a daemon.
-[§ Where things live](#where-things-live) has the full set of paths, and how to
-move them.
+Everything below writes `~/.config/agent-iap/iap.toml`: no root, nothing
+installed anywhere — the proxy on a laptop, in front of one upstream.
+[§ Deployment](#deployment) is the same thing as a daemon, and
+[§ Where things live](#where-things-live) has the full set of paths.
 
 ```bash
 # 1. Write a policy file. No agents, no upstreams, default deny — it starts a
@@ -245,10 +250,10 @@ agent-iap list
 agent-iap run
 ```
 
-Every command there found the policy file on its own. `--config` names another
-one, `IAP_CONFIG` names one for a whole shell, and a `./iap.toml` in the
-directory you are standing in still wins over the user-level file — which is
-what makes a repository or a demo able to carry a policy of its own.
+Every command there found the policy file on its own. `--config` names another,
+`IAP_CONFIG` names one for a whole shell, and a `./iap.toml` in the current
+directory wins over the user-level file — so a repository or a demo can carry a
+policy of its own.
 
 Point the agent at the proxy:
 
@@ -278,11 +283,11 @@ export IAP_URL=http://127.0.0.1:8080
 ```
 
 `init` writes the proxy and nothing else, on purpose: a starter file that
-guesses at an upstream is a file you have to read before you can trust it, and a
-token minted for an agent you may never create is a live credential sitting in
-your scrollback with nobody knowing to revoke it. Everything else is added by
-the command that names it, and each edit is validated against the same schema
-the proxy loads before it is saved — a rejected flag leaves the file untouched.
+guesses at an upstream has to be read before it can be trusted, and a token
+minted for an agent you may never create is a live credential in your
+scrollback. Everything else is added by the command that names it, validated
+against the same schema the proxy loads — a rejected flag leaves the file
+untouched.
 
 If you would rather start from something already filled in, two templates do:
 
@@ -315,22 +320,19 @@ agent-iap acl add --target github --methods DELETE --paths '/**' --action ask
 agent-iap agent add ci-runner --name "CI" --target github
 ```
 
-`--action` defaults to `ask`, not to `allow`. Every other flag on `acl add`
-defaults to the widest thing it can mean — every agent, every kind, every
-target, every method, every path — so a default `allow` would make the bare
-command write one rule granting everything to everyone, ahead of the
-`acl_default = deny` this whole file is built on. The widest rule the command
-can write stops on a human at the `run` console instead; to grant, say `--action
-allow`.
+`--action` defaults to `ask`, not `allow`. Every other flag on `acl add`
+defaults to the widest thing it can mean — every agent, kind, target, method and
+path — so a default `allow` would let the bare command grant everything to
+everyone, ahead of the `acl_default = deny` this is all built on. The widest
+rule it can write stops on a human instead; to grant, say `--action allow`.
 
 Rules are **appended**, never inserted, because first match wins — a new rule can
 never silently shadow one already in the file, and `acl add` prints the position
 it landed in. `agent add --target` refuses a target that names no upstream or MCP
-server: that mistake leaves a file that is valid, an agent that looks scoped, and
-every one of its calls denied by a rule that never mentions it.
+server: that mistake leaves a valid file, an agent that looks scoped, and every
+one of its calls denied by a rule that never mentions it.
 
-Each of those has an `rm` — see [§ Revoking and removing](#revoking-and-removing),
-which is the command you want at 2am rather than an editor.
+Each of those has an `rm` — see [§ Revoking and removing](#revoking-and-removing).
 
 `agent-iap gen-token <id>` still prints an `[[agents]]` block to paste, for the
 cases where the policy file is generated by something other than this CLI.
@@ -375,28 +377,23 @@ That last command knows three things you would otherwise have to look up:
 Graylog's API hangs off `/api`, it authenticates an access token as basic
 `<token>:token` with the *token in the user field*, and its searches are POSTs
 so a GET-only "read" level cannot read anything. Getting any of those wrong
-fails late — a 401 with no detail, or a rule that quietly grants more than you
-meant.
+fails late — a 401 with no detail, or a rule that grants more than you meant.
 
-`upstream add` takes the same thing from the other direction, for when the name
-you want is the thing you started from:
+`upstream add` takes the same thing from the other direction:
 
 ```bash
 agent-iap upstream add gh --profile github --secret op://Private/GitHub/token
 ```
 
-That is `profile add github --as gh` — the upstream and its rules — and it is
-there because "add an upstream" is what somebody sets out to do; having to know
-that profiles exist before finding out that one covers their service was the
-whole problem. `--access`, `--var`, `--agent` and `--dry-run` mean what they do
-below. The credential flags do not: the profile supplies the scheme, so anything
-beyond `--secret` is refused rather than silently ignored. In the console, `n`
-on the upstreams pane opens on the same picker (§ The approval console).
+That is `profile add github --as gh` — the upstream and its rules — because "add
+an upstream" is what somebody sets out to do, rather than having to know
+profiles exist first. `--access`, `--var`, `--agent` and `--dry-run` mean what
+they do below; the credential flags do not, since the profile supplies the
+scheme, so anything beyond `--secret` is refused rather than ignored. In the
+console, `n` on the upstreams pane opens the same picker (§ The approval
+console).
 
-`--secret` is the same credential reference every other command takes, and
-`profile add` never asks for a credential itself. `--dry-run` prints the exact
-TOML it would append and writes nothing, because a policy you have not read is
-not a policy you can rely on.
+`--dry-run` prints the exact TOML it would append and writes nothing.
 
 | Flag | |
 | --- | --- |
@@ -412,8 +409,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Five levels are worth knowing about because they exist for reasons that are not
-about permissions:
+Five levels exist for reasons that are not about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
   parks everything else for a human. The ACL cannot tell a reasonable POST from
@@ -425,18 +421,15 @@ about permissions:
   reports exist and prompts for `execute_report`, the one that runs them and
   bills. Same reasoning as `dataforseo`, except here the expensive call has a
   name you can write a rule against.
-- **`semrush-trends`** is the same v3 key as `semrush`, pointed at the Trends
-  endpoint on its own upstream. Trends bills against its own monthly allowance
-  rather than Standard API units, so the split is what lets one agent have
-  Trends and not the reports, and what puts the two budgets on separate rows in
-  the audit log.
+- **`semrush-trends`** is the same v3 key as `semrush` on its own upstream.
+  Trends bills against its own monthly allowance rather than Standard API units,
+  so the split lets one agent have Trends and not the reports, and puts the two
+  budgets on separate rows in the audit log.
 - **`sentry --access triage`** allows every read and exactly one write: the PUT
-  that resolves, ignores or assigns an issue. That is the whole of what an agent
-  watching errors needs, and `write` — which would also let it edit projects,
-  alert rules and members — is not a level anybody should have to accept to get
-  it. DELETE is denied rather than prompted. All four Sentry profiles offer the
-  same three levels, so `--access triage` means the same thing whichever Sentry
-  you point at.
+  that resolves, ignores or assigns an issue — the whole of what an agent
+  watching errors needs, without `write` also letting it edit projects, alert
+  rules and members. DELETE is denied rather than prompted. All four Sentry
+  profiles offer the same three levels.
 
 ### What is in the catalog
 
@@ -457,7 +450,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
 
-Three honest limits, all printed by `profile show`:
+The honest limits, all printed by `profile show`:
 
 - **A Cloudflare token is half an address.** Most of `client/v4` lives under
   `/accounts/<id>/…`, and an account-owned token (`cfat_`, the durable
@@ -468,34 +461,30 @@ Three honest limits, all printed by `profile show`:
   parameter rather than a credential: it goes in the file in the clear, while
   the token stays a reference.
 - **Cloudflare's hosted MCP servers speak OAuth, not API tokens.** The
-  `cloudflare-mcp-*` profiles therefore run them through `npx mcp-remote`, which
-  does the browser flow and caches the grant. The proxy still rules on and logs
-  every JSON-RPC message, but the credential lives in the child's cache rather
-  than in the proxy. For a credential the proxy actually holds, the `cloudflare`
-  REST profile covers the same services.
+  `cloudflare-mcp-*` profiles run them through `npx mcp-remote`, which does the
+  browser flow and caches the grant. The proxy still rules on and logs every
+  JSON-RPC message, but the credential lives in the child's cache rather than in
+  the proxy. The `cloudflare` REST profile covers the same services with a
+  credential the proxy holds.
 - **Tool catalogs move.** PostHog exposes well over a thousand tools, so its
   `read` level allows the read verbs and sends everything else to `ask` rather
   than denying it. Watch the audit log for `ask` rows and promote the ones you
   want.
 - **A Sentry region is part of the address.** Every sentry.io organization lives
-  in `us` or `de`, and an organization auth token (`sntrys_…`) carries its own
-  region inside it — point one at the other host and a perfectly good token gets
-  a 401 or a redirect. So `sentry` writes the region host (`--var region=de`)
-  rather than plain `sentry.io`, which routes to either and would therefore hide
-  the mistake until an agent hit it. What does *not* vary is the API version:
-  Sentry has shipped one, the `0` in `/api/0`, so `sentry-self-hosted` is the
-  same rules at your own host. What varies there is the release — self-hosted
-  has been on calendar versions (`YY.MM.PATCH`) since 20.6.0, and an endpoint
-  your version predates 404s rather than being denied. The `triage` rules name
-  the project-scoped issue path as well as the organization-wide one for that
-  reason: a 9.x install only has the former.
+  in `us` or `de`, and an organization auth token (`sntrys_…`) carries its region
+  inside it — point one at the other host and a good token gets a 401 or a
+  redirect. So `sentry` writes the region host (`--var region=de`) rather than
+  plain `sentry.io`, which routes to either and would hide the mistake. The API
+  version does not vary — the `0` in `/api/0` — so `sentry-self-hosted` is the
+  same rules at your own host. The release does: an endpoint your version
+  predates 404s rather than being denied, which is why the `triage` rules name
+  the project-scoped issue path as well as the organization-wide one.
 - **A path the ACL cannot split.** Semrush's v3 analytics puts every report at
   the same path and names it in a query parameter — `/?type=domain_ranks` — so
   rules can say "reports, read-only" and nothing finer. The credential goes in
-  the query string too, which the `semrush` profile enrols as `query` auth: the
-  proxy appends the key on the way out, so it is still never in a URL the agent
-  wrote. v4 is a separate key on a separate profile, and puts both in the
-  ordinary places.
+  the query string too, enrolled as `query` auth: the proxy appends the key on
+  the way out, so it is still never in a URL the agent wrote. v4 is a separate
+  key on a separate profile, with both in the ordinary places.
 
 ## Enrolling anything else
 
@@ -529,26 +518,23 @@ agent-iap acl add --name migration-window --agent claude-code \
 ```
 
 `--expires-in` takes `30s`, `5m`, `1h`, `7d` — never a bare number, because
-"allow this for 5" is a question about units nobody should have to stop and ask,
-and being wrong by a factor of sixty only goes one way. The deadline is written
-into the rule as a UTC timestamp, checked against the clock on every request,
-and so survives a restart. Nothing sweeps expired rules out of the file: they
-stay visible, listed as `expired`, because a grant that was made and has run out
-is a thing to have a record of.
+being wrong about the unit by a factor of sixty only goes one way. The deadline
+is written into the rule as a UTC timestamp and checked on every request, so it
+survives a restart. Expired rules are not swept out of the file: they stay
+listed as `expired`, because a grant that was made and has run out is worth a
+record.
 
 `--username-secret` is for the APIs that put the credential in the user half of
-basic auth — Graylog's `<token>:token`, and its session-token variant. Spelling
-that with a plain `--username` would mean the token itself living in a file
-meant to be committable, so the user field takes a reference and the password
-takes the scheme's documented constant. That constant is the one `literal:`
-the loader does not complain about, and only in that position: a `literal:` in
-`--username-secret` is still refused.
+basic auth — Graylog's `<token>:token`. A plain `--username` would mean the token
+living in a file meant to be committable, so the user field takes a reference
+and the password takes the scheme's documented constant. That constant is the
+one `literal:` the loader does not complain about, and only there: a `literal:`
+in `--username-secret` is still refused.
 
 ### Verifying
 
 `check` asks the file a question: does it parse, does every reference resolve,
-do the rules make sense. That is half of what an operator wants to know after
-adding a service, and the other half is only answerable by the service:
+do the rules make sense. The other half is only answerable by the service:
 
 ```bash
 agent-iap upstream verify github --path /user     # one upstream, at a real endpoint
@@ -559,9 +545,8 @@ agent-iap mcp-server verify posthog               # the handshake, and the tool 
 It makes the call. The credential is attached exactly the way the proxy attaches
 it — same injector, same URL construction — so an OAuth or service-account
 upstream is verified by *minting* the token rather than by assuming a mintable
-one, and a header scheme is verified by the service either accepting the header
-or not. What comes back is a step at a time, because "it failed" and "it failed
-at the credential" are different afternoons:
+one. What comes back is a step at a time, because "it failed" and "it failed at
+the credential" are different problems:
 
 ```
 upstream `github` → https://api.github.com
@@ -573,36 +558,30 @@ upstream `github` → https://api.github.com
                        --target github --methods GET --paths '/**' --action allow
 ```
 
-The last step is the one that catches the enrolment that looked like it worked.
-A service can be in the file, resolve its credential, answer the probe — and
-still be unreachable by every agent, because nothing in the ACL names it and the
-default is deny. For an MCP server it also catches the narrower version: rules
-that scope `tools/call` and never admit `initialize`, so the session never opens
-and the agent sees a server that never starts.
+The last step catches the enrolment that looked like it worked. A service can be
+in the file, resolve its credential, answer the probe — and still be unreachable
+by every agent, because nothing in the ACL names it and the default is deny. For
+an MCP server it catches the narrower version: rules that scope `tools/call` and
+never admit `initialize`, so the session never opens.
 
-Where the probe was aimed is what decides what its answer is worth, so the
-verdicts split on it:
+What the answer is worth depends on where the probe was aimed, so the verdicts
+split on it:
 
 - **A 401 fails, wherever it was aimed.** The service looked at this credential
   and said no; being pointed at the root does not soften that.
 - **Any other 4xx from the root passes**, reported as *reachable, credential not
   exercised*. Almost no API serves anything at its root, so that 404 proves the
-  host is real and proves nothing else — and it must not be dressed up as
-  proving more. The earlier version of this called it a warning, which turned
-  every healthy upstream amber; a status column that is amber for a working
-  fleet is one you stop reading, and then it is worse than not being there.
-- **A 404 from a real endpoint warns.** Something that should have been there
-  was not: the base URL is wrong, or the API moved.
-- **A 403 from a real endpoint warns** — accepted but not entitled, which is
-  usually a missing scope or an account that was never granted the resource.
+  host is real and nothing else.
+- **A 404 from a real endpoint warns.** The base URL is wrong, or the API moved.
+- **A 403 from a real endpoint warns** — accepted but not entitled, usually a
+  missing scope.
 
 A redirect is reported rather than followed, since a 302 to a login page reads
 as a 200 to anything that follows it. Exit status is zero unless something
 failed.
 
-The way to get a conclusive answer is to aim at something real, and giving
-`--path` every time is the part nobody remembers — so an upstream can carry the
-answer:
+A conclusive answer needs a real endpoint, and passing `--path` every time is
+the part nobody remembers — so an upstream can carry it:
 
 ```toml
 [[upstreams]]
@@ -613,10 +592,9 @@ verify_path = "/accounts/3f1c…/tokens/verify"
 
 `verify_path` is what a verify calls when nobody passed `--path` — on the
 enrolment, on `v` in the console, and on an `upstream verify` months later. An
-explicit `--path` still wins, because that is a question about one endpoint
-rather than about the credential. An upstream carrying none — enrolled before
-its profile had a probe, or written by hand — falls back to the profile whose
-base URL matches it, so nothing has to be re-enrolled to become verifiable.
+explicit `--path` still wins. An upstream carrying none falls back to the
+profile whose base URL matches it, so nothing has to be re-enrolled to become
+verifiable.
 
 Profiles write it for the services that have somewhere safe to send it, and
 `agent-iap profile show` says which those are:
@@ -628,13 +606,11 @@ verify      nothing cheap and safe on file — `upstream verify` will reach this
 ```
 
 An endpoint earns that line by being a **GET**, being **free**, and having **no
-side effect** — a verify runs on a keystroke and after every `--verify`
-enrolment, so a probe that bills a unit or writes something is far worse than no
-probe at all. Several vendors have nothing that qualifies: the GA4 Data API is
-POST-only, Semrush bills per call, Slack answers `200 OK` with `"ok": false` in
-the body so status codes cannot speak for it. Those are left blank on purpose.
-There is no shame in an inconclusive verification; there is real harm in a
-confident wrong one.
+side effect** — a verify runs on a keystroke, so a probe that bills a unit or
+writes something is worse than no probe at all. Several vendors have nothing
+that qualifies: the GA4 Data API is POST-only, Semrush bills per call, Slack
+answers `200 OK` with `"ok": false` in the body. Those are left blank on
+purpose.
 
 `--verify` runs the same thing as the last step of an enrolment:
 
@@ -644,15 +620,14 @@ agent-iap mcp-server add notes --command notes-mcp --env NOTES_TOKEN=op://… --
 ```
 
 After the write, never instead of it: the entry is in the file whatever comes
-back, because the fix for a mistyped base URL is `upstream edit`, not doing the
-whole enrolment again. Only the exit status carries the verdict. Nothing is
-verified without being asked — the call is real and so is the credential, so it
-happens on a flag or a keystroke and never on a timer.
+back, because the fix for a mistyped base URL is `upstream edit`, not the whole
+enrolment again. Only the exit status carries the verdict. Nothing is verified
+without being asked — the call is real and so is the credential, so it happens
+on a flag or a keystroke and never on a timer.
 
 In the console it is `v` on the upstreams or `mcp` pane, and a switch on the add
 and edit forms that is on by default. The answer lands in a `VERIFIED` column
-beside the row — a glyph and two words, because a column is scanned rather than
-read:
+beside the row:
 
 ```
 NAME                   BASE URL                             VERIFIED
@@ -664,26 +639,24 @@ linear                 https://api.linear.app               · not checked
 ```
 
 `✓` passed, `!` worth a look, `✗` broken, `·` nobody has asked yet — by shape
-before colour, so the column still works for anyone who cannot tell the green
-from the red. `✓ credential ok` means the service accepted it; `✓ reachable`
-means the host answered and the credential was never put to the question. The
-sentence behind any of them is one keystroke away, in the report.
+before colour, so the column works for anyone who cannot tell the green from the
+red. `✓ credential ok` means the service accepted it; `✓ reachable` means the
+host answered and the credential was never put to the question.
 
 ### Getting the token out
 
 Every command that mints a token — `init`, `agent add`, `agent rotate`,
-`gen-token` — prints it once and also puts it on your clipboard, so the step
-between "the proxy minted this" and "the agent has it" is a paste rather than a
-careful drag with a mouse. A token with one character missing authenticates
-nothing, and the plaintext it came from is already gone.
+`gen-token` — prints it once and puts it on your clipboard: a token with one
+character missing authenticates nothing, and the plaintext it came from is
+already gone.
 
-It uses OSC 52: the escape sequence that asks the *terminal* to set the
-clipboard. The point of doing it that way is where it works — over SSH, from
-inside a container, from a tmux pane on a jump host, none of which have a
-clipboard of their own for `pbcopy` to reach. Every terminal in common use
-implements it; tmux and screen forward it. In the console, the modal that shows
-a token copies it on `c`, and closes on `esc`, `enter` or `q` — a named key
-rather than any key, because it is the only time that token is on a screen.
+It uses OSC 52, the escape sequence that asks the *terminal* to set the
+clipboard, which is what makes it work over SSH, from inside a container, or
+from a tmux pane on a jump host — none of which have a clipboard for `pbcopy` to
+reach. Every terminal in common use implements it; tmux and screen forward it.
+In the console, the modal that shows a token copies it on `c` and closes on
+`esc`, `enter` or `q` — a named key rather than any key, because it is the only
+time that token is on a screen.
 
 Inside tmux the sequence is sent both ways it can be sent: bare, which tmux
 forwards when `set-clipboard` is `on` or `external` (the default), and wrapped
@@ -700,16 +673,15 @@ agent-iap agent rotate ci-runner --no-clipboard   # just print it
 export IAP_NO_CLIPBOARD=1                         # never copy, any command
 ```
 
-Two things worth knowing. The sequence is one-way, so nothing here can confirm
-the clipboard actually changed — paste it somewhere before you close the
-terminal. And a desktop clipboard is shared with everything else on that
-desktop, and is often kept in a history by a clipboard manager; that is a fair
-trade for a token that buys nothing off this proxy and rotates with one command,
-but it is your trade to refuse. Nothing is copied when neither stream is a
-terminal — a pipe, a file, a unit's journal — and nothing is ever copied without
-a line saying so. The sequence goes to the terminal itself rather than to
-stdout, so `agent-iap gen-token > token.txt` still writes a file with a token in
-it and nothing else.
+The sequence is one-way, so nothing here can confirm the clipboard changed —
+paste it somewhere before closing the terminal. And a desktop clipboard is
+shared with everything else on that desktop, often kept in a history by a
+clipboard manager; a fair trade for a token that buys nothing off this proxy and
+rotates with one command, but yours to refuse. Nothing is copied when neither
+stream is a terminal — a pipe, a file, a unit's journal — and never without a
+line saying so. The sequence goes to the terminal rather than to stdout, so
+`agent-iap gen-token > token.txt` still writes a file with a token in it and
+nothing else.
 
 ### Revoking and removing
 
@@ -740,15 +712,15 @@ means *any* target rather than none. A removal must not widen a grant on its way
 past.
 
 Without `--prune`, whatever named the removed thing stays and is printed by
-number, so a rule matching nothing is something you were told about rather than
-something you find later. Only rules that name it *outright* are pruned:
-`agent = "ci-*"` covers a fleet, and one member leaving is not that rule ending.
+number, so a rule matching nothing is something you were told about. Only rules
+that name it *outright* are pruned: `agent = "ci-*"` covers a fleet, and one
+member leaving is not that rule ending.
 
 **With a console attached, these land within a second** — it watches the policy
-file and puts the whole of it in charge. Without one, nothing is reading the
-file, and a rotated token is not yet a revoked one until the proxy restarts:
-every one of these commands says which you are getting, because a revocation
-that has not taken effect is worse than one you know is pending.
+file. Without one, nothing is reading the file, and a rotated token is not a
+revoked one until the proxy restarts: every one of these commands says which you
+are getting, because a revocation that has not taken effect is worse than one
+you know is pending.
 
 ## What happens to a request
 
@@ -801,8 +773,8 @@ sequenceDiagram
 
 `agent-iap run` *is* the console. Step 5 parks a request until a human answers
 it, and the one thing that must never happen is parking it in a queue nobody is
-looking at — so the console is what `run` opens wherever there is a terminal to
-draw it on, and no flag asks for it:
+watching — so `run` opens the console wherever there is a terminal to draw it
+on, and no flag asks for it:
 
 ```bash
 agent-iap run                             # the console, on a terminal
@@ -810,11 +782,11 @@ agent-iap run --no-tui                    # the log stream on stderr instead
 agent-iap run --tui                       # insist, for a terminal we did not recognise
 ```
 
-Where there is no terminal — a unit file, a container, a pipe into `tee` —
-`run` is the log stream it has always been, so nothing already deployed has to
-learn a flag. What it gives up is the keyboard: unless something is polling the
-control plane, an `ask` denies immediately rather than parking, and the startup
-banner says which of the two you are getting.
+Where there is no terminal — a unit file, a container, a pipe into `tee` — `run`
+is the log stream it has always been, so nothing deployed has to learn a flag.
+What it gives up is the keyboard: unless something is polling the control plane,
+an `ask` denies immediately rather than parking, and the startup banner says
+which of the two you are getting.
 
 The console owns the terminal, so diagnostics go to `agent-iap.log` beside the
 audit log instead of to stdout, and the bottom pane is a live tail of the audit
@@ -822,11 +794,11 @@ log — what the agent has been doing while you decide what to allow next.
 
 #### The dialogue
 
-A parked request raises a dialogue of its own, unprompted, because a request
-sitting behind a pane nobody happens to be looking at will time out and a
-timeout denies. It is Little Snitch's dialogue, and for Little Snitch's reason:
-"may this connect" is unanswerable on its own, and what an operator *can* answer
-is may this agent do this much, for how long.
+A parked request raises a dialogue of its own, unprompted: one sitting behind a
+pane nobody is looking at will time out, and a timeout denies. It is Little
+Snitch's dialogue, for Little Snitch's reason — "may this connect" is
+unanswerable on its own, and what an operator *can* answer is may this agent do
+this much, for how long.
 
 ```
 ┌ Claude Code is asking ───────────────────────────────────────┐
@@ -851,10 +823,8 @@ is may this agent do this much, for how long.
 ```
 
 `←`/`→` picks how long, `↑`/`↓` picks how far, and the line above the buttons
-says what the pair of them will actually do. All of it is clickable — the
-segments, the radio rows, and Deny and Allow — which is how the dialogue this
-copies was always driven. The durations are four different
-mechanisms:
+says what the pair of them will do. All of it is clickable. The durations are
+four different mechanisms:
 
 - **Once** answers this request. The next identical call asks again.
 - **5 min / 1 hour / 1 day** write an ACL rule that carries its own deadline.
@@ -869,18 +839,16 @@ Everything that writes a rule writes it *in front of* the `ask` that raised the
 question, because first match wins and an appended rule would sit behind it and
 never be reached. All of them are live in this process immediately.
 
-The TTLs are the ones worth having. Most of what an operator wants to say is
-not "yes" and not "no" but *yes, while I am doing this* — and a console that
-cannot spell that leaves them choosing between a grant that outlives the reason
-for it and being asked again in thirty seconds. Both of those end with somebody
-holding the key down. Because the deadline is in the file rather than in this
-process's memory, a restart in the middle does not hand the grant back, and
-nothing has to remember to take it away.
+Most of what an operator wants to say is not "yes" and not "no" but *yes, while
+I am doing this*; without a way to spell that, the choice is between a grant
+that outlives its reason and being asked again in thirty seconds, and both end
+with somebody holding the key down. The deadline lives in the file rather than
+in this process's memory, so a restart does not hand the grant back and nothing
+has to remember to take it away.
 
-The cursor starts on the narrowest row and on `Once`: a dialogue whose default
-hands out more than was asked for is a dialogue that hands out more than was
-asked for. `a`/`d` on the queue itself answer once, at that narrowest scope,
-without opening anything.
+The cursor starts on the narrowest row and on `Once`, so the default hands out
+no more than was asked for. `a`/`d` on the queue itself answer once, at that
+scope, without opening anything.
 
 #### The other panes
 
@@ -897,60 +865,41 @@ from a shell is a form here, over the same functions with the same validation:
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
 
-`n` on the upstreams pane opens on a profile picker rather than on a blank
-form. `←`/`→` walks the catalogue, and landing on one replaces the form with
-that profile's: no base URL to type, no scheme to pick, its own variables and
-access levels as named fields, and the credential reference the only thing left
-to fill in. Left where it starts — *none* — it is the form it always was. The
-two were separate panes before, so an operator who came here to add GitHub had
-no way of learning from this form that a `github` profile existed, and typed out
-a base URL, a scheme and a set of ACL paths nobody reviewed. Only the HTTP
-profiles are offered here; an MCP profile is not an upstream and belongs to the
-`mcp` pane.
+`n` on the upstreams pane opens on a profile picker rather than a blank form.
+`←`/`→` walks the catalogue, and landing on one replaces the form with that
+profile's: no base URL to type, no scheme to pick, its variables and access
+levels as named fields, and the credential reference the only thing left to fill
+in. Left where it starts — *none* — it is the form it always was. Only the HTTP
+profiles are offered here; an MCP profile belongs to the `mcp` pane.
 
 `e` on an upstream — or `enter`, or a double-click — opens that entry rather
 than a blank one: the base URL it has, the scheme it uses, the references it
-names, ready to be corrected. An API that moved, a credential that now lives in
-a different vault item, a header the vendor started requiring. Saving writes the
-entry in place, so the ACL rules aimed at it and the agents scoped to it go on
-naming the same thing — which `x` and `n` could not have managed between them.
-The name itself is not on the form for that reason. No credential *value* is
-shown, because the file holds none: what is prefilled is the reference.
+names, ready to be corrected. Saving writes the entry in place, so the ACL rules
+aimed at it and the agents scoped to it go on naming the same thing — which `x`
+and `n` could not have managed between them, and why the name is not on the
+form. No credential *value* is shown, because the file holds none: what is
+prefilled is the reference.
 
 Every field that takes a credential *reference* — `secret`, `username ref`,
 `client secret`, `key file`, `private key` — will also go and find the file for
-you. `ctrl-o` on one opens a picker: `enter` walks into a directory or chooses
-a file, `←` goes back up, typing filters the listing, `esc` leaves the field as
-it was. An empty field offers it on its own line, and the dialogue's key row
-carries it for as long as the cursor is on the field — both are buttons. Two
-places rather than one because the line that would otherwise be the only
-mention of it is also the line a failed save puts its error on, and being told
-a form `needs --secret <REF>` is exactly when you want to be told the console
-will go and find the file. The offer on the field goes the moment you type:
-sitting just past the caret it reads as part of the value, and an `op://`
-reference being typed does not want to be asked about files. It opens wherever the half-typed path was headed — `file:/run/sec` starts
-in `/run` — and on `$HOME` when the field says nothing about the filesystem.
-What lands in the field is the reference and not the bare path —
-`file:/run/secrets/anthropic` — which is what the config file takes. Dotted
-files and dotted directories are listed like anything else, because `~/.ssh`,
-`~/.config` and `.env` are very nearly the whole answer to where such a file is
-kept. Nothing is read: the picker lists names, and the file is opened for
-the first time by the proxy resolving it — a picker that showed you the first
-line to tell two keys apart would be putting a credential on the one screen
-that has kept them off it.
+you. `ctrl-o` opens a picker: `enter` walks into a directory or chooses a file,
+`←` goes back up, typing filters the listing, `esc` leaves the field as it was.
+It opens wherever the half-typed path was headed — `file:/run/sec` starts in
+`/run` — and on `$HOME` when the field says nothing about the filesystem. What
+lands in the field is the reference rather than the bare path,
+`file:/run/secrets/anthropic`. Dotted files and directories are listed like
+anything else, since `~/.ssh`, `~/.config` and `.env` are nearly the whole
+answer to where such a file is kept. Nothing is read: the picker lists names,
+and the file is opened for the first time by the proxy resolving it.
 
-It answers the mouse, too. Click a tab to change pane, a row to select it,
-twice to open it — the same thing `enter` does there. The wheel scrolls the
-pane, and the scope list when the dialogue is up. The footer's key hints are
-buttons: if it names a key, clicking it presses that key. Every one of these
-ends in the handler the keyboard uses, because a click that could grant
-something a keystroke could not would be a second policy surface on the one
-screen that cannot afford one.
+It answers the mouse. Click a tab to change pane, a row to select it, twice to
+open it. The wheel scrolls the pane, and the scope list when the dialogue is up.
+The footer's key hints are buttons. All of it ends in the handler the keyboard
+uses, so a click can never grant what a keystroke could not.
 
-Reporting the pointer is what stops the terminal's own text selection working,
-and the thing most worth selecting off this screen is a token. So `m` turns it
-off and back on, and most terminals will also let you hold ⇧ to select through
-it.
+Reporting the pointer stops the terminal's own text selection working, and the
+thing most worth selecting off this screen is a token — so `m` turns it off and
+back on, and most terminals let you hold ⇧ to select through it.
 
 `?` lists the keys, and `q` quits the console and stops the proxy with it. `r`
 re-reads the policy file, though it rarely has to: the file is watched, so an
@@ -960,24 +909,21 @@ changed. A file caught mid-rewrite is waited on rather than reported as broken,
 and a file edited into something that will not parse is reported once, with the
 proxy left running the last policy that did (§ Reloading).
 
-`v` on an upstream or an MCP server calls it, with the credential the file names,
-and puts the answer in the row's `VERIFIED` column — a glyph and two words — with
-the whole report in a modal behind it. It runs off the drawing thread, because
-the console cannot stop answering an `ask` for ten seconds while a vault wakes
-up. The add and edit forms carry the same thing as a switch, on by default, so a
-service written here reports whether it works before you look away
-(§ Verifying).
+`v` on an upstream or an MCP server calls it with the credential the file names,
+and puts the answer in the row's `VERIFIED` column, the whole report in a modal
+behind it. It runs off the drawing thread, because the console cannot stop
+answering an `ask` while a vault wakes up. The add and edit forms carry the same
+as a switch, on by default (§ Verifying).
 
 A minted token is shown once, in a modal, and then only its sha256 exists. No
 credential *value* is ever displayed: the credentials pane shows references, and
 resolves them on `c` to answer the one question the file cannot — whether the
-vault is still unlocked and the variable still set. The `VERIFIED` column is the
-same question one step further out: whether the service at the other end agrees.
+vault is still unlocked and the variable still set.
 
-Everything written here is in force before you look away. Not just the rules and
-the roster: upstreams, MCP servers, credentials, timeouts, the audit log, and the
-address this proxy listens on. There is nothing the console can write that waits
-for a restart — see § Reloading.
+Everything written here is in force before you look away — rules, roster,
+upstreams, MCP servers, credentials, timeouts, the audit log, and the address
+this proxy listens on. Nothing the console writes waits for a restart
+(§ Reloading).
 
 ## Reloading
 
@@ -1000,9 +946,7 @@ scratch copies: the secrets resolve, the rules compile, the agents enrol, the
 credential schemes parse, the client builds, the new socket binds. Only then is
 anything installed, and installing cannot fail. So an edit that would not have
 *started* this process does not stop it either — it is refused, the reason goes
-on the console's footer, and the proxy carries on serving the policy it already
-had. A proxy running half of one policy and half of another is running a policy
-nobody wrote.
+on the console's footer, and the proxy carries on with the policy it had.
 
 ### What triggers one
 
@@ -1017,15 +961,14 @@ systemctl reload agent-iap                    # SIGHUP, for the impatient
 kill -HUP "$MAINPID"                          # and what that actually sends
 ```
 
-A changed file has to hold still for 250ms before it is read, because a rewrite
-is a truncate and then a write and there is a moment in between when the file is
-half a policy. `SIGHUP` skips the wait, which is what makes it the right trigger
-for a config-management tool that has just finished writing. The console's `r`
-is the same call again.
+A changed file has to hold still for 250ms before it is read: a rewrite is a
+truncate and then a write, and in between the file is half a policy. `SIGHUP`
+skips the wait, which makes it the right trigger for a config-management tool
+that has just finished writing. The console's `r` is the same call.
 
-Every reload is logged, and written to the audit log as a `reload` record naming
-which of the three caused it and what the policy became — a rule appearing ten
-seconds before a call it allowed is a thing the log should be able to show you.
+Every reload is written to the audit log as a `reload` record naming which of
+the three caused it and what the policy became — a rule appearing ten seconds
+before a call it allowed is something the log should be able to show you.
 
 One thing this does not do: the signing key behind § Workload identity is not
 rotated, because that would invalidate every token already handed out — a
@@ -1043,12 +986,12 @@ the policy file and the audit log live under your own directories instead:
 | Audit log, `admin-token`, `agent-iap.log` | `$XDG_STATE_HOME/agent-iap/`, else `~/.local/state/agent-iap/` | `%LOCALAPPDATA%\agent-iap\` |
 
 Two directories rather than one, because the files age differently. The policy
-file is configuration — small, hand-edited, reviewed, safe to commit, the sort
-of thing that ends up in a dotfile repository. The audit log is state:
-append-only, unbounded, and the last thing anyone wants synced to a second
-machine. macOS gets the same layout rather than `~/Library/Application Support`,
-because this is a terminal tool whose config file is meant to be read and edited
-by hand, next to every other one in `~/.config`.
+file is configuration — small, hand-edited, safe to commit, the sort of thing
+that ends up in a dotfile repository. The audit log is state: append-only,
+unbounded, and the last thing anyone wants synced to a second machine. macOS
+gets the same layout rather than `~/Library/Application Support`, because this
+is a terminal tool whose config file is meant to be edited by hand next to every
+other one in `~/.config`.
 
 Four ways to move things, narrowest first:
 
@@ -1061,7 +1004,7 @@ export IAP_CONFIG_DIR=/etc/agent-iap             # where `iap.toml` is looked fo
 
 `[audit].path` in the policy file moves the log on its own. An absolute path is
 taken as it stands; a relative one is taken from the state directory, never from
-the working directory — which is the point of all of this.
+the working directory.
 
 A `./iap.toml` in the current directory is still what `--config` falls back to
 when one is there, so a repository, a demo or one of the walkthroughs above can
@@ -1168,8 +1111,8 @@ lifetime_secs = 3600                    # clamped to an hour, Google's ceiling
 The key is parsed at startup, so a malformed or passphrase-encrypted key stops
 the process with a message naming the problem rather than turning into a 502 on
 the first call. PKCS#1 keys (`BEGIN RSA PRIVATE KEY`) are rejected with the
-`openssl` command that converts them. Every mint is recorded in the audit log
-with the issuer, scopes and expiry — never the token.
+`openssl` command that converts them. Every mint is logged with the issuer,
+scopes and expiry — never the token.
 
 ### Timeouts
 
@@ -1193,10 +1136,9 @@ IAP_LISTEN=0.0.0.0:8080 agent-iap run     # same, for a container or a unit file
 
 A flag beats `IAP_LISTEN` / `IAP_ADMIN_LISTEN`, which beat the file. A bare port
 moves the port and never the interface — `--listen 9000` against a loopback
-config stays on loopback — because a process holding live credentials should
-reach every interface only when someone spells that out. The proxy and the
-control plane may not share an address; that is rejected at startup rather than
-arriving later as whichever bind happened to lose.
+config stays on loopback — because a process holding live credentials reaches
+every interface only when someone spells that out. The proxy and the control
+plane may not share an address; that is rejected at startup.
 
 ### Where secrets come from
 
@@ -1206,11 +1148,10 @@ startup, so a locked vault fails the process rather than the tenth request.
 A bare value that is not one of these forms is rejected, and the error never
 echoes what you pasted.
 
-1Password vaults, items, sections and fields are named by humans, so they have
-spaces in them — `op://Private/Anthropic API/credential` is one reference, and
-it is handed to `op` as one argument, never through a shell. In the policy file
-it needs nothing special. On a command line it needs the quotes any string with
-a space needs:
+1Password vaults, items and fields are named by humans, so they have spaces in
+them — `op://Private/Anthropic API/credential` is one reference, handed to `op`
+as one argument and never through a shell. The policy file needs nothing
+special; a command line needs the quotes any string with a space needs:
 
 ```shell
 agent-iap upstream add anthropic --base-url https://api.anthropic.com \
@@ -1232,19 +1173,18 @@ key  = "op://Infra/agent-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
 ca   = "file:/etc/agent-iap/root_ca.crt"       # optional: the CA that signed it
 ```
 
-All three are *references*, resolved the same way every other credential is — a
-key is a credential, and this file stays safe to commit. All three are resolved
+All three are *references*, resolved the way every other credential is — a key
+is a credential, and this file stays safe to commit. All three are resolved
 **and parsed** at startup, before anything binds: a mismatched pair, a malformed
-PEM or a locked vault stops the process, rather than coming up healthy and
-failing the first handshake. `agent-iap check` runs the same load.
+PEM or a locked vault stops the process rather than failing the first handshake.
+`agent-iap check` runs the same load.
 
 `ca` is for the one client this project runs itself — `agent-iap mcp`, dialling
 the control plane. Public CAs need nothing here. A private CA wants its root
 named, so the trust anchor is the CA rather than whatever the served chain
-happens to contain. Leave it out and the bridge falls back to verifying against
-`cert` itself, which is exactly right for a self-signed certificate and is what
-every existing config does today. It buys agents nothing: they are other
-processes on other hosts, and they get the root the way they get everything
+happens to contain. Leave it out and the bridge verifies against `cert` itself,
+which is right for a self-signed certificate. It buys agents nothing: they are
+other processes on other hosts, and get the root the way they get everything
 else — see § Small Step below.
 
 The control plane follows the proxy onto TLS without being named twice — it
@@ -1264,32 +1204,27 @@ no knob for them: a policy file that can select TLS 1.0 is a liability.
 
 The MCP bridge reads the same policy file, so `agent-iap mcp` finds the control
 plane on `https://` by itself and verifies it against `ca`, or against `cert`
-when there is no `ca` — a self-signed loopback certificate needs no extra step,
-and verification is never turned off in either case. Which is why the
+when there is no `ca`. Verification is never turned off — which is why the
 certificate the control plane serves has to name the address it is reached at;
 see below.
 
 Renewal does not mean a restart. A reload re-reads `cert` and `key` from source
-— past the cache, the way every reference in this file is re-read on reload, so
-a certificate renewed or a credential rotated behind an unchanged reference
-takes effect without bouncing the process — and serves the new one from the
-next handshake; connections already up keep what they negotiated. What
-it needs is something to *trigger* the reload, and the trigger is the policy
-file changing or a `SIGHUP`, not the certificate file itself: so pair the
-renewal with `systemctl reload agent-iap` (§ Reloading). Client certificates are
-not an identity here either — agents are still the bearer token.
+and serves the new one from the next handshake; connections already up keep what
+they negotiated. What it needs is a *trigger*, and the trigger is the policy file
+changing or a `SIGHUP`, not the certificate file itself — so pair the renewal
+with `systemctl reload agent-iap` (§ Reloading). Client certificates are not an
+identity here either: agents are still the bearer token.
 
 #### Where the certificate comes from
 
 Nothing above is provider-specific. `cert` and `key` are a PEM chain and a PEM
-key, and `ca` is a PEM bundle, so ACME, an internal CA, a corporate PKI or a
+key, `ca` is a PEM bundle, so ACME, an internal CA, a corporate PKI or a
 certificate someone handed you on a USB stick all work identically — the proxy
-never asks who signed it. If your company already runs a CA, that is the
-provider, and this section is only what someone else's commands look like.
+never asks who signed it.
 
-Two are worth writing down, because between them they are the two shortest paths
-from "loopback only" to "an agent on another host", and they differ on the one
-thing that actually costs you anything: who has to be told to trust the result.
+Two are worth writing down: they are the shortest paths from "loopback only" to
+"an agent on another host", and they differ on the thing that actually costs you
+something — who has to be told to trust the result.
 
 | | Tailscale | Small Step (`step-ca`) |
 | --- | --- | --- |
@@ -1300,19 +1235,15 @@ thing that actually costs you anything: who has to be told to trust the result.
 | Lifetime | 90 days | 24 hours by default, and yours to set |
 | Also answers | how the agent reaches the host at all | nothing — bring your own network |
 
-Tailscale is the one to reach for when you want an agent off this host talking
-to the proxy this afternoon: the certificate is trusted everywhere with no
-client-side step at all, and the tailnet disposes of the separate question of
-how an agent on a laptop reaches a proxy in a rack. Small Step is the one that
-looks like the rest of a company's internal x509 — you run the CA, you set the
-lifetimes and the naming, and every client is pointed at your root. That extra
-step is the whole difference, and it is also the reason the second one scales to
-things other than this proxy.
+Tailscale is for getting an agent off this host talking to the proxy this
+afternoon: trusted everywhere with no client-side step, and the tailnet also
+answers how an agent on a laptop reaches a proxy in a rack. Small Step looks
+like the rest of a company's internal x509 — you run the CA, set the lifetimes
+and the naming, and point every client at your root. That extra step is the
+difference, and the reason it scales to things other than this proxy.
 
-A self-signed certificate is a third path and a legitimate one for a single
-host. It costs the same client-side work as a private CA — every agent must be
-given the certificate — while buying none of the CA's reach, so it is worth it
-for one machine and stops being worth it at two.
+A self-signed certificate is a third path, legitimate for a single host: the
+same client-side work as a private CA, none of its reach.
 
 #### Tailscale
 
@@ -1340,14 +1271,12 @@ No `ca`: Let's Encrypt is already in every trust store there is.
 
 Agents use `https://iap.tailnet-name.ts.net:8080` and need nothing else: the
 chain ends at a public root, so `curl`, `requests` and `node` verify it with no
-configuration, no `--cacert` and no bundle to distribute. That is the entire
-argument for this option.
+configuration and no bundle to distribute.
 
 Bind `listen` to the tailnet address rather than `0.0.0.0`. The certificate is
-valid for the `ts.net` name only, so a LAN client gets a name mismatch rather
-than a connection — and the process holding every upstream credential has no
-reason to be accepting connections on an interface whose callers it cannot even
-serve.
+valid for the `ts.net` name only, so a LAN client gets a name mismatch — and the
+process holding every upstream credential has no reason to accept connections on
+an interface whose callers it cannot serve.
 
 The certificate lasts 90 days. Re-running the same `tailscale cert` command
 renews it; the renewal and whatever makes the proxy pick it up belong in one
@@ -1386,17 +1315,14 @@ ca   = "file:/etc/agent-iap/root_ca.crt"
 ```
 
 `step ca certificate` writes the leaf *and* the issuing intermediate into the
-crt file — that is what step-ca returns, and `cert` wants exactly it, because
-the intermediate is what lets an agent build a path from the leaf to your root.
-Serving a bare leaf you extracted from that file is the mistake to avoid.
+crt file, which is exactly what `cert` wants: the intermediate is what lets an
+agent build a path from the leaf to your root. Serving a bare leaf extracted
+from that file is the mistake to avoid.
 
-`ca` is separate and is about verifying rather than serving: it names the root
-that `agent-iap mcp` checks the control plane against. Without it the bridge falls
-back to treating the served chain as its own anchor, which works by coincidence
-— the intermediate happens to be in there — and stops working the moment
-someone splits the file or a provider hands over a leaf on its own. Naming the
-root says which certificate is the trust anchor instead of inferring it from
-whatever was bundled.
+`ca` is about verifying rather than serving: it names the root that
+`agent-iap mcp` checks the control plane against. Without it the bridge treats
+the served chain as its own anchor, which works by coincidence and stops working
+the moment someone splits the file.
 
 Then the half Tailscale does not have, and the one `ca` does not help with:
 `ca` is read by this process, and agents are other processes on other hosts.
@@ -1415,10 +1341,10 @@ step certificate install /etc/agent-iap/root_ca.crt
 ```
 
 The failure mode to plan for is an agent that cannot verify and is "fixed" with
-`curl -k` or `verify=False`. That agent is now handing its bearer token to
-whatever answers the address, which is the attack TLS was added here to stop —
-so ship the root with the agent's image or its config, and treat a verification
-failure as a deployment bug rather than a flag to add.
+`curl -k` or `verify=False`. It is now handing its bearer token to whatever
+answers the address, which is the attack TLS was added to stop — so ship the
+root with the agent's image or its config, and treat a verification failure as a
+deployment bug rather than a flag to add.
 
 `step-ca` issues short certificates on purpose — 24 hours by default, and the
 provisioner caps what you may ask for. At that rate you want a reload rather
@@ -1433,12 +1359,10 @@ step ca renew --daemon \
 #### The control plane's certificate has to match the address
 
 The control plane inherits `[server.tls]` when `[server.admin_tls]` is absent,
-and that is usually what you want — but it is *reached* at `admin_listen`, which
-is `127.0.0.1:8081`. A certificate issued for `iap.tailnet-name.ts.net` or
-`iap.internal.example.com` is not valid for `127.0.0.1`, and `agent-iap mcp` dials
-the address from the policy file. It trusts the certificate that file names and
-still checks the name against it — verification is never turned off — so the
-mismatch surfaces as a refused handshake, not a quiet downgrade.
+but it is *reached* at `admin_listen`, usually `127.0.0.1:8081`. A certificate
+issued for `iap.tailnet-name.ts.net` or `iap.internal.example.com` is not valid
+for `127.0.0.1`, and `agent-iap mcp` still checks the name — so the mismatch
+surfaces as a refused handshake, not a quiet downgrade.
 
 Give the control plane a certificate that names the address it is actually
 reached at:
@@ -1463,9 +1387,9 @@ tailnet to save a certificate. Prefer the certificate.
 
 ## What is exposed
 
-`check` validates; `list` inventories. At twenty service accounts and MCP servers
-on one proxy, "what does this thing front, and with whose credential?" is its own
-question, and the answer is one row per thing rather than a comma-joined line.
+`check` validates; `list` inventories. At twenty service accounts and MCP
+servers on one proxy, "what does this front, and with whose credential?" is its
+own question:
 
 ```console
 $ agent-iap list upstreams
@@ -1508,17 +1432,16 @@ stripe  https://api.stripe.com  bearer  op://Private/Stripe/key    none
 reads like a grant, but no rule names it — every call falls through to the
 default and is denied.
 
-`--output json` gives the same inventory for a fleet that gets inventoried by
-something other than a human. This reads only the policy file: it needs no
-running daemon, it never contacts 1Password, and it prints credential
-*references*, never a resolved secret. A `literal:` reference is the credential
-rather than a pointer to one, so it prints as `literal:***`.
+`--output json` gives the same inventory to something other than a human. All of
+it reads only the policy file: no running daemon, no call to 1Password, and
+credential *references* rather than resolved secrets. A `literal:` reference is
+the credential rather than a pointer to one, so it prints as `literal:***`.
 
 ## Multiple agents
 
-One proxy fronts many agents. That is the shape this is built for — the agents
-are the tenants, the upstream credential is the shared thing they are kept away
-from, and the policy file is where the difference between them is written.
+One proxy fronts many agents: they are the tenants, the upstream credential is
+the shared thing they are kept away from, and the policy file is where the
+difference between them is written.
 
 ```toml
 [[agents]]
@@ -1558,9 +1481,8 @@ expires = "2026-09-15T09:00:00Z"
 ```
 
 Each agent has its own token; the file holds only hashes, and two agents sharing
-a token is a startup error rather than a puzzle later. Every audit record names
-the agent that caused it, so one interleaved log still answers per-agent
-questions:
+one is a startup error rather than a puzzle later. Every audit record names the
+agent that caused it, so one interleaved log still answers per-agent questions:
 
 ```bash
 agent-iap audit tail --agent ci-runner
@@ -1573,33 +1495,29 @@ agent-iap audit tail -f --agent ci-runner
 
 Approvals are per agent too. A standing answer — "until quit" in the dialogue —
 always names the agent that prompted it, however wide the rest of the scope is
-set, so releasing a call for one agent never releases the same call for another.
+set, so releasing a call for one agent never releases it for another.
 
 Agents off this host need `[server.tls]`; without it their tokens are on the
 wire in cleartext, and this is the process holding every upstream credential.
 
-What this does **not** do yet:
+None of it needs a restart. Enrolling an agent, revoking one, rotating a leaked
+token, adding an upstream, renewing a certificate — all of it reloads into the
+running proxy, immediately from the console and within a second from a shell
+(§ Reloading). Without a console attached nothing is reading the file and a
+restart is what applies the change, which is what every `rm` and `rotate` says
+on the way out.
 
-- **Nothing here needs a restart.** Enrolling an agent, revoking one, rotating
-  a leaked token, adding an upstream, renewing a certificate — all of it reloads
-  into the running proxy: immediately from the console, and within a second from
-  a shell, because the console watches the policy file (§ Reloading). Without a
-  console attached there is nothing reading it, and a restart is still what
-  applies the change: which is what every `rm` and `rotate` says on the way out,
-  because a revocation that has not taken effect is worse than one you know is
-  pending.
-- **No per-agent limits.** No rate limit, no concurrency cap, no spend budget.
-  The agents share one upstream credential and therefore one quota and one bill,
-  and one runaway agent is felt by all of them — the audit log will tell you
-  which one, afterwards.
+What this does **not** do yet is **per-agent limits**: no rate limit, no
+concurrency cap, no spend budget. The agents share one upstream credential and
+therefore one quota and one bill, and one runaway agent is felt by all of them —
+the audit log will tell you which one, afterwards.
 
 ## Workload identity
 
-An agent token answers *who is calling*. It is long-lived, it is the same
-credential for every call that agent will ever make, and it says nothing about
-what any particular piece of work needs — so a copy of it, lifted out of a
-context window or a crash dump, is the agent's whole standing grant until
-somebody notices and rotates it.
+An agent token answers *who is calling*. It is long-lived, the same credential
+for every call that agent will ever make, and says nothing about what any
+particular piece of work needs — so a copy lifted out of a context window or a
+crash dump is the agent's whole standing grant until somebody rotates it.
 
 A **workload token** answers the other half: *what is this run allowed to do,
 and until when*. The agent presents its agent token once, says which requests it
@@ -1646,10 +1564,9 @@ single remaining power is asking for one.
 
 - **A scope can only narrow.** The ACL still runs on every request. The token
   says what the workload asked for; policy says what it may have; a call needs
-  both. A minted token can never reach something the policy does not allow, and
-  a rule you delete stops working immediately rather than at expiry. That is
-  also why minting is not an approval step: asking for a wide scope gets you a
-  wide token and exactly the same set of allowed calls.
+  both. A rule you delete stops working immediately rather than at expiry. Which
+  is why minting is not an approval step: asking for a wide scope gets a wide
+  token and exactly the same set of allowed calls.
 - **Renewal rotates.** `POST /_iap/token/renew` issues the next token in the
   lineage and retires the one that asked, in the same step. There is never a
   moment when two tokens in a lineage are live. A renewal may re-scope — that is
@@ -1686,11 +1603,9 @@ agent token for nothing but asking again.
 ## Zero state
 
 An agent handed a token and an address has everything it needs and no way to
-find out what to do with it. Both of the other surfaces assume the explaining
-already happened: an SDK reaches `/<upstream>` because a human set a base URL,
-and the gateway ([§ MCP](#mcp)) is discovered because a human wrote it into a
-client config. Give an agent `IAP_TOKEN=iap_…` and `127.0.0.1:8080` and nothing
-else, and there was nowhere for it to start.
+find out what to do with it. The other two surfaces assume the explaining
+already happened — an SDK reaches `/<upstream>` because a human set a base URL,
+the gateway ([§ MCP](#mcp)) because a human wrote it into a client config.
 
 So the root of the proxy answers that. `GET /` with the token returns a skill
 document generated from the running policy, for the agent that asked:
@@ -1723,11 +1638,11 @@ you should not go looking for one or ask a person for one …
 - **ask a human** `confirm-sends` — POST `/v1/messages`
 ```
 
-It offers MCP first and says so plainly, because for an agent that can add an
-MCP server that is the shorter road — the catalog, the skills and the call
-itself arrive over one connection, already structured, and the snippet in the
-document is the address the agent actually reached, ready to paste. The HTTP
-form is spelled out underneath for everything else.
+It offers MCP first, because for an agent that can add an MCP server that is the
+shorter road: the catalog, the skills and the call itself arrive over one
+connection, already structured, and the snippet is the address the agent
+actually reached, ready to paste. The HTTP form is underneath for everything
+else.
 
 A client that turns out to *be* an MCP client is not handed prose at all. The
 common misconfiguration — an MCP server entry pointing at the base URL rather
@@ -1745,20 +1660,16 @@ same way.
 | `POST /` | 307 to `/_iap/mcp` |
 
 Nothing here discloses more than the agent could learn by making one refused
-call. The document is built per agent, so two agents on one daemon are told two
-different things, each describing only what that one can actually reach — an
-agent granted a target no rule names is told it can reach nothing, because that
-is the truth about every call it could make. Credential *schemes* are named;
-credentials are not. Without a token the root says what this is and how to
-authenticate, and nothing about the policy at all.
+call. The document is built per agent, so an agent granted a target no rule
+names is told it can reach nothing. Credential *schemes* are named; credentials
+are not. Without a token the root says what this is and how to authenticate, and
+nothing about the policy.
 
-Reading it is an audit event, like anything else that consults the policy on an
-agent's behalf. An anonymous read is not: it names no agent, no upstream and no
-rule, which makes it `/_iap/health` with better prose.
+Reading it is an audit event. An anonymous read is not: it names no agent, no
+upstream and no rule, which makes it `/_iap/health` with better prose.
 
-The refusals learned the same lesson. A request that names no upstream, or
-guesses one wrong, now comes back naming the upstreams that agent could have
-used:
+The refusals follow the same rule. A request that names no upstream, or guesses
+one wrong, comes back naming the upstreams that agent could have used:
 
 ```console
 $ curl -sH "Authorization: Bearer $IAP_TOKEN" http://127.0.0.1:8080/gihtub/user
@@ -1832,8 +1743,7 @@ An agent that finds a tool called `iap_request` learns nothing from the name
 about which upstreams exist or which paths are allowed, and a static README
 would go stale the first time a rule changed. So the gateway serves documents
 built from the running policy, for the agent that asked — two agents on one
-daemon are told two different things, each describing only what that one can
-actually reach:
+daemon are told two different things:
 
 - The `initialize` response's `instructions` field: what this proxy is, that
   credentials are never the agent's to hold, that refusals are final and
@@ -1852,8 +1762,7 @@ itself. The secret behind it stays in the daemon.
 
 Responses are buffered, not streamed: a JSON-RPC result cannot be a stream, so a
 response is read up to `max_body_bytes` and truncation is reported in the
-result. Streaming output is what the HTTP proxy is for, and it is still there —
-the gateway is the default way in, not the only one. JSON-RPC batching is not
+result. Streaming output is what the HTTP proxy is for. JSON-RPC batching is not
 accepted, having been dropped from the protocol revision this implements.
 
 ### The bridge
@@ -1920,10 +1829,9 @@ One JSON object per line, hash-chained: each entry commits to the one before it.
 
 `workload` is the token the call was made under — `lineage/generation`, matching
 the `token_mint` record that lists the scope it was granted. It is absent for a
-call made with a bare agent token, which is how a log shows at a glance how much
-of its traffic still runs on a standing grant. Minting, renewing and revoking
-are `kind: "identity"` records of their own (`token_mint`, `token_renew`,
-`token_revoke`).
+call made with a bare agent token, which is how a log shows how much of its
+traffic still runs on a standing grant. Minting, renewing and revoking are
+`kind: "identity"` records of their own.
 
 The line to alert on is `rule: "<workload-token-replayed>"` — a token presented
 after it had been renewed away from. It names the agent and the lineage that was
@@ -1952,8 +1860,7 @@ agent-iap audit tail -f -n 0 --target github
 
 A follower may be started before the proxy is — it waits for the log to appear
 rather than refusing — and it survives rotation: when the file it is reading is
-renamed away or truncated, it says so and picks up the new one, which is what
-keeps a terminal left open overnight still useful in the morning.
+renamed away or truncated, it says so and picks up the new one.
 
 Editing or removing a line is detected by `verify`. The chain resumes across
 restarts, so one file covers the life of the deployment.
@@ -2004,13 +1911,12 @@ can read them *is* the security boundary.
 | `/var/lib/agent-iap/iap-audit.jsonl` | The hash-chained audit log. | `0600 agent-iap:agent-iap` |
 | `/var/lib/agent-iap/admin-token` | Control-plane bearer token, written at every start. | `0600 agent-iap:agent-iap` |
 
-The policy file holds no credential — agent tokens are stored as sha256, and an
+The policy file holds no credential — agent tokens are stored as sha256, an
 upstream's key is a reference to somewhere else. It still wants `0600`: readable
-it is a map of every credential worth going after and every agent entitled to
-one, and writable it *is* the ACL. The audit log's own claim is weaker than the
-mode suggests — chaining detects tampering, it does not prevent it (§ Security
-model), and a log an attacker can delete outright proves nothing. Ship the lines
-somewhere append-only if that matters.
+it is a map of every credential worth going after, and writable it *is* the ACL.
+The audit log's claim is weaker than its mode suggests — chaining detects
+tampering, it does not prevent it (§ Security model). Ship the lines somewhere
+append-only if that matters.
 
 ### systemd
 
@@ -2036,13 +1942,12 @@ sudo systemctl enable --now agent-iap
 ```
 
 `/var/lib/agent-iap` is created `0700` by `StateDirectory=` on first start — the
-audit log and the `admin-token` beside it land there, and it is the only path
-the service can write to. The unit says so with `IAP_STATE_DIR`, rather than
-leaning on a working directory: the service user has no home for the default
-`~/.local/state/agent-iap` to resolve against, and `ProtectHome=yes` would put it
-out of reach anyway. `IAP_CONFIG` does the same for the policy file, so
-`agent-iap list`, `agent-iap audit verify` and the rest read the daemon's
-policy and log with no `--config`.
+audit log and the `admin-token` land there, and it is the only path the service
+can write to. The unit says so with `IAP_STATE_DIR` rather than leaning on a
+working directory: the service user has no home, and `ProtectHome=yes` would put
+one out of reach anyway. `IAP_CONFIG` does the same for the policy file, so
+`agent-iap list`, `agent-iap audit verify` and the rest read the daemon's policy
+and log with no `--config`.
 
 Two things worth knowing before the first restart:
 
@@ -2056,12 +1961,12 @@ Two things worth knowing before the first restart:
   a restart. The audit log is not regenerated: the hash chain continues across
   restarts, and `agent-iap audit verify` spans them.
 
-There is no console: `--no-tui` logs to the journal and an `ask` is answered
-over the control plane (§ Control plane) or denied. Reloading is not affected —
-the daemon watches its own policy file and answers `SIGHUP` either way
-(§ Reloading), so `systemctl reload` is a reload and not a restart. A rule set that is entirely
-`allow`/`deny` needs no answerer; one that uses `ask` needs something watching,
-or those calls fail closed.
+There is no console: `--no-tui` logs to the journal and an `ask` is answered over
+the control plane (§ Control plane) or denied. The daemon watches its own policy
+file and answers `SIGHUP` either way, so `systemctl reload` is a reload and not
+a restart (§ Reloading). A rule set that is entirely `allow`/`deny` needs no
+answerer; one that uses `ask` needs something watching, or those calls fail
+closed.
 
 ### Container
 
@@ -2098,8 +2003,8 @@ What the image deliberately cannot do, both following from the distroless base:
   layer on a base that carries `op`.
 - **stdio MCP servers.** A `command = [...]` server is a child process, and
   there is no `npx` or `uvx` to be one. Front those over HTTP instead — which
-  § Security model already recommends, since the stdio bridge is not a process
-  boundary anyway.
+  § Security model recommends anyway, the stdio bridge not being a process
+  boundary.
 
 ## Security model
 
@@ -2129,11 +2034,9 @@ What it does not give you, and you should know before relying on it:
   binds a token to a channel, so anyone holding a copy is that agent for as long
   as it lives. That is what mTLS would buy, and it is not built yet.
 - **Workload scopes are the agent's own declaration.** They narrow; they never
-  widen. An agent that asks for everything it is entitled to has a token as
-  broad as its ACL entry — short-lived and revocable, but not narrow. The
-  narrowing is worth something because the agent, not the operator, is the one
-  who knows what this run is about; treat it as defence in depth under the ACL,
-  not as a replacement for writing one.
+  widen. An agent that asks for everything it is entitled to has a token as broad
+  as its ACL entry — short-lived and revocable, but not narrow. Treat it as
+  defence in depth under the ACL, not as a replacement for writing one.
 - **The ACL sees method, path and tool name, not intent.** It cannot tell a
   reasonable `POST /v1/messages` from an expensive one. Use `ask` where the
   distinction matters.
@@ -2142,12 +2045,12 @@ What it does not give you, and you should know before relying on it:
 - Audit hash-chaining detects tampering by anyone who cannot rewrite the whole
   file; it is not an append-only store. Ship the lines somewhere else for that.
 
-Found something that breaks one of the properties in the first list, rather than
+Found something that breaks one of the properties in the first list rather than
 one of the limitations in the second? [`SECURITY.md`](SECURITY.md) has the
-private reporting channel, what counts as in scope, and what to expect after a
-report. Please don't open a public issue for it — the tracker is world-readable,
-and a working description of how to get past the ACL is a usable exploit against
-every deployment that has not upgraded yet.
+private reporting channel and what counts as in scope. Please don't open a
+public issue — the tracker is world-readable, and a working description of how
+to get past the ACL is a usable exploit against every deployment that has not
+upgraded yet.
 
 ## Not built yet
 
@@ -2175,12 +2078,11 @@ cargo fmt --all --check
 The end-to-end suite starts a proxy in front of a mock upstream and asserts the
 properties that matter: the upstream receives the real key, the agent's token
 stops at the proxy, denied calls never reach the network, an `ask` releases only
-when a human answers, and the resulting log verifies.
+when a human answers, and the log verifies.
 
 `tests/gateway_e2e.rs` holds the MCP gateway to the same properties over its own
 surface, and asserts the one that spans both: the same call, refused through the
-proxy, is refused through the gateway with the same sentence. A second way in is
-a second way out if it does not enforce the same things.
+proxy, is refused through the gateway with the same sentence.
 
 `tests/revoke_e2e.rs` covers the other direction: it revokes and rotates through
 the enrolment API, restarts the proxy from the edited file, and asserts that the
@@ -2195,9 +2097,10 @@ every access level is materialised and run through the daemon's own
 
 CI runs exactly the three commands above on Linux and macOS, plus `cargo audit`
 over the dependency tree — a dependency with a known advisory fails the build —
-and `scripts/check-version.sh`, described below. Dependabot opens weekly grouped
-PRs for Cargo and for the actions themselves. Windows is not covered: the
-credential file permissions and the MCP stdio bridge are Unix-shaped today.
+`scripts/check-version.sh`, and `brew style` over the Homebrew formula, which is
+the only thing here that is Ruby. Dependabot opens weekly grouped PRs for Cargo
+and for the actions. Windows is not covered: the credential file permissions and
+the MCP stdio bridge are Unix-shaped today.
 
 `.github/workflows/release.yml` is the other half, and it runs the suite again
 per target rather than trusting CI's: the Linux artifacts link musl, which is
@@ -2207,20 +2110,18 @@ claim as passing in what ships.
 ## Versioning
 
 CalVer, `YYYY.MM.PATCH`: `2026.9.0`, then `2026.9.1` for the next release that
-month, then `2026.10.0`. A version tells you when a build was cut, which is the
+month, then `2026.10.0`. A version says when a build was cut, which is the
 question you actually have about something you deployed six weeks ago.
 
-The month is not zero-padded. Cargo requires a semver-shaped version and semver
-forbids leading zeros, so `2026.09.0` is not a version at all and `2026.9.0` is.
-A consequence worth knowing: Cargo reads the year as the major, so every new
-month looks like a breaking change to a `^` constraint. That is the honest
-default here — this is a daemon you deploy, not a library you link, and the
-compatibility surface that matters is the policy file, not a Rust API. Changes
-that make an existing `iap.toml` stop loading are called out in the
-[release notes](https://github.com/vpetersson/agent-iap/releases) for that
-version. Those are generated from the titles of the pull requests in the tag, so
-a change that stops a policy file loading has to say so in its title — or be
-written into the release body before the release is announced.
+The month is not zero-padded: Cargo requires a semver-shaped version and semver
+forbids leading zeros, so `2026.09.0` is not a version and `2026.9.0` is. Cargo
+therefore reads the year as the major, and every new month looks like a breaking
+change to a `^` constraint — which is honest enough for a daemon you deploy
+rather than a library you link. The compatibility surface that matters is the
+policy file, and changes that stop an existing `iap.toml` loading are called out
+in the [release notes](https://github.com/vpetersson/agent-iap/releases). Those
+are generated from pull request titles, so such a change has to say so in its
+title.
 
 Cutting a release:
 
@@ -2232,18 +2133,18 @@ git tag v2026.9.1 && git push && git push --tags
 
 `scripts/bump-version.sh` works out the next version itself — the patch
 continues within a month and resets when the month rolls over — and refuses to
-leave the tree edited if what it produced is not valid. Pass a version to
-override it.
+leave the tree edited if what it produced is not valid.
 
 The tag is the whole trigger: pushing it runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds
 the four platforms in [§ Install](#install), runs the test suite on each target
 the runner can execute, attaches the tarballs and a `SHA256SUMS` to a GitHub
-Release, and pushes the container image built from those same binaries. Nothing
-in it starts until `scripts/check-version.sh` has passed: it runs in CI on every
-push and pull request, and on a `v…` tag it additionally requires the tag and
+Release, pushes the container image built from those same binaries, and rewrites
+`Formula/agent-iap.rb` from the checksums it just published. Nothing in it
+starts until `scripts/check-version.sh` has passed: it runs in CI on every push
+and pull request, and on a `v…` tag it additionally requires the tag and
 `Cargo.toml` to agree — so a release cannot report a version that is nowhere in
-the history, and a mismatched tag fails before anything is published.
+the history.
 
 ## License
 
