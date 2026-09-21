@@ -11,10 +11,17 @@ fix. Check the relevant ones before claiming a change is done.
   allow-all on the documented setup path (#55).
 - **An empty `targets` list means every target, not none.** A removal that would
   empty it is an escalation performed during a removal — refuse it (#31).
-- **`acl_default` is `deny` from `init`, `ask` after `acl reset`, never `allow`
-  unless a human wrote it.** Anything that describes the effect of an empty rule
-  list must read `acl_default` rather than asserting "everything is denied"
-  (#60).
+- **`acl_default` is `ask` from `init` and after `acl reset`, `deny` after
+  `acl reset --deny`, never `allow` unless a human wrote it** (#60, #62).
+  Anything that describes the effect of an empty rule list must read
+  `acl_default` rather than asserting what it is — that assertion has been wrong
+  twice, in `agent add`, `acl rm` and the MCP handshake warning.
+- **A policy where no rule says `ask` and `acl_default` does not either can
+  never stop a request on a human.** That is a fine deployment when it was
+  chosen and the reported bug when it was not, so `check`, the headless banner
+  and the console's request pane all say it — from one diagnosis
+  (`verify::cannot_ask_warning`), with a per-surface way out, because the
+  console's is a key and the terminal's is a command (#62).
 - **`ask` with nobody attached denies.** Headless startup warns; the audit line
   is `ask:no-approver-denied`, not a silent `policy_denied`. Any new surface
   that can park a request has to account for the headless case.

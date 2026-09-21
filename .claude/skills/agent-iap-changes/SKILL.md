@@ -25,6 +25,13 @@ narrower.
 - Ask what else is broken for the same reason. "Stop blaming 1Password for a
   failed `env:` reference" (#15) was one string; reporting *every* broken
   reference instead of the first was the same defect seen properly.
+- **Fix the state, not the command that happens to produce it.** #60 changed
+  what `acl reset` writes and closed the issue; the reported state — no rules,
+  `acl_default = "deny"`, every call refused by `<default>` with nobody asked —
+  was still reachable, and still the default, because `init` wrote it and most
+  files come from `init`. It was reported again within the hour. When a fix
+  lands on one path into a bad state, enumerate the others before calling it
+  done, and ask what tells an operator they are in that state at all (#62).
 - Say what you deliberately did not do, and why it is its own issue (#30, #34).
   A PR that quietly widens is as hard to review as one that quietly narrows.
 - If the work turns up a design wart next to the bug, either fix it in the same
@@ -97,7 +104,14 @@ broken reference — every one (#15). Not a tool the config never mentions. Not
 (#52). And a success message must not overwrite the error printed a line
 earlier (#53).
 
-**8. State the limits in the same change that ships the capability.** README
+**8. An empty surface has to distinguish "nothing yet" from "never".** The
+console answered an unaskable policy with "Requests matching an `ask` rule
+appear here" — true of a policy that can ask, and a promise this one could not
+keep, on the one screen its operator was watching (#62). Same shape as the
+amber `VERIFIED` column (#49): a state that renders as the healthy one teaches
+its reader to stop looking.
+
+**9. State the limits in the same change that ships the capability.** README
 § Security model has a "what it does not give you" list, § Multiple agents names
 what does not scale with what it costs, § Not built yet is honest, and a profile
 note says which endpoints are unreachable through the proxy rather than letting
