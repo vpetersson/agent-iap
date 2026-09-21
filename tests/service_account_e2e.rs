@@ -8,10 +8,12 @@
 use agent_iap::config::Config;
 use agent_iap::state::AppState;
 use axum::extract::{Request, State};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use http::StatusCode;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -134,29 +136,42 @@ async fn spawn_token_endpoint(key: &TestKey) -> (SocketAddr, TokenEndpoint) {
     (addr, state)
 }
 
-/// Reports the Authorization header it was handed.
-async fn spawn_upstream() -> SocketAddr {
-    async fn echo(request: Request) -> Json<Value> {
-        Json(serde_json::json!({
-            "authorization": request
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok()),
-        }))
+/// Reports the Authorization header it was handed, under whatever status the
+/// test has currently set — a real API answers a perfectly good token with a
+/// `403` whenever the caller is asking about something it has no rights to.
+#[derive(Clone)]
+struct Upstream {
+    status: Arc<AtomicUsize>,
+}
+
+async fn spawn_upstream() -> (SocketAddr, Upstream) {
+    async fn echo(State(state): State<Upstream>, request: Request) -> Response {
+        let status = StatusCode::from_u16(state.status.load(Ordering::SeqCst) as u16).unwrap();
+        (
+            status,
+            Json(serde_json::json!({
+                "authorization": request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+            })),
+        )
+            .into_response()
     }
+    let state = Upstream {
+        status: Arc::new(AtomicUsize::new(200)),
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, Router::new().fallback(any(echo)))
-            .await
-            .unwrap()
-    });
-    addr
+    let app = Router::new().fallback(any(echo)).with_state(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, state)
 }
 
 struct Harness {
     proxy: SocketAddr,
     token_endpoint: TokenEndpoint,
+    upstream: Upstream,
     audit_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
@@ -165,7 +180,7 @@ struct Harness {
 async fn spawn(subject: Option<&str>) -> Harness {
     let key = generate_key();
     let (token_addr, token_endpoint) = spawn_token_endpoint(&key).await;
-    let upstream = spawn_upstream().await;
+    let (upstream_addr, upstream) = spawn_upstream().await;
 
     let dir = tempfile::tempdir().unwrap();
     let audit_path = dir.path().join("audit.jsonl");
@@ -218,7 +233,7 @@ action = "allow"
 "#,
         audit = audit_path.display(),
         token_hash = agent_iap::identity::token_hash(AGENT_TOKEN),
-        upstream = upstream,
+        upstream = upstream_addr,
         key_path = key_path.display(),
     ))
     .unwrap();
@@ -239,6 +254,7 @@ action = "allow"
     Harness {
         proxy,
         token_endpoint,
+        upstream,
         audit_path,
         key_path,
         _dir: dir,
@@ -403,5 +419,57 @@ key_file = "file:{key_path}"
     assert!(
         !rendered.contains("bm90LWEta2V5"),
         "startup error leaked key bytes"
+    );
+}
+
+/// The bug this replaces: a `403` from the API was read as "the token is bad".
+///
+/// It is not. `401` is the upstream saying the credential did not hold up;
+/// `403` is the upstream answering, with that credential accepted, that the
+/// caller has no rights to the thing it asked about — a GA4 property the
+/// service account was never added to, an API not enabled on the project, a
+/// quota. Minting another token from the same key with the same scopes returns
+/// the same grant, so throwing the cached one away buys nothing and costs a
+/// round trip to the provider on every subsequent call. An agent walking a list
+/// of property ids turned one live hour into a token mint per request.
+#[tokio::test]
+async fn a_403_from_the_api_does_not_throw_away_a_working_token() {
+    let harness = spawn(None).await;
+
+    // One call that works, so there is a cached token to lose.
+    call(&harness, "/storage/v1/b/bucket/o").await;
+    assert_eq!(harness.token_endpoint.hits.load(Ordering::SeqCst), 1);
+
+    // Then the API starts refusing the caller rather than the credential.
+    harness.upstream.status.store(403, Ordering::SeqCst);
+    for _ in 0..5 {
+        call(&harness, "/storage/v1/b/bucket/o").await;
+    }
+
+    assert_eq!(
+        harness.token_endpoint.hits.load(Ordering::SeqCst),
+        1,
+        "a refused *caller* must not cost a fresh token per call"
+    );
+}
+
+/// And the case it was written for still works: a `401` is the credential
+/// itself being rejected, and that one is worth replacing.
+#[tokio::test]
+async fn a_401_still_drops_the_token_it_was_minted_for() {
+    let harness = spawn(None).await;
+
+    call(&harness, "/storage/v1/b/bucket/o").await;
+    assert_eq!(harness.token_endpoint.hits.load(Ordering::SeqCst), 1);
+
+    harness.upstream.status.store(401, Ordering::SeqCst);
+    call(&harness, "/storage/v1/b/bucket/o").await;
+
+    harness.upstream.status.store(200, Ordering::SeqCst);
+    call(&harness, "/storage/v1/b/bucket/o").await;
+    assert_eq!(
+        harness.token_endpoint.hits.load(Ordering::SeqCst),
+        2,
+        "a rejected credential must be replaced rather than replayed until expiry"
     );
 }

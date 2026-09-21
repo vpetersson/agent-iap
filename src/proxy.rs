@@ -309,13 +309,10 @@ async fn proxy(
 
     // A minted token the upstream just rejected is worth nothing; drop it so the
     // next request mints a fresh one rather than repeating the 401 until expiry.
-    if matches!(
-        response.status(),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-    ) && upstream.auth.mints_tokens()
-    {
-        state.injector.invalidate(&upstream.name);
-    }
+    // Which answers mean that is the injector's to decide, not this surface's.
+    state
+        .injector
+        .note_upstream_status(&upstream.name, response.status(), &upstream.auth);
 
     // Recorded at response headers, so streamed (SSE) responses are logged when
     // they start rather than being buffered until they finish.

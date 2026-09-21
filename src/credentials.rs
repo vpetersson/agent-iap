@@ -206,6 +206,26 @@ impl CredentialInjector {
         Ok(token)
     }
 
+    /// What an upstream's answer says about the credential it was sent.
+    ///
+    /// Both data planes ask this, so the proxy and the MCP gateway cannot come
+    /// to different conclusions about the same status code.
+    ///
+    /// Only `401` is the upstream rejecting the *credential*. `403` is the
+    /// upstream accepting it and refusing the *caller* — a service account with
+    /// no binding to the GA4 property being asked about, an API not enabled on
+    /// the project, a quota. Minting again from the same key with the same
+    /// scopes returns the same grant, so discarding the cached token cannot
+    /// change that answer; it only buys a round trip to the provider before
+    /// every subsequent call. `verify` has always drawn this line — a `403`
+    /// there reads "the credential is accepted but not entitled here" — and
+    /// this is the same line, in the path that carries live traffic.
+    pub fn note_upstream_status(&self, target: &str, status: http::StatusCode, auth: &AuthConfig) {
+        if status == http::StatusCode::UNAUTHORIZED && auth.mints_tokens() {
+            self.invalidate(target);
+        }
+    }
+
     /// Drop a target's cached token — used when an upstream rejects it, so the
     /// next request mints a fresh one instead of replaying the failure.
     pub fn invalidate(&self, target: &str) {
@@ -595,6 +615,58 @@ mod tests {
         );
         // Invalidating something that was never cached is harmless.
         injector.invalidate("nothing-here");
+    }
+
+    /// Which statuses mean "this token is no good", spelled out once so both
+    /// data planes inherit the same answer.
+    #[tokio::test]
+    async fn only_a_rejected_credential_costs_the_cached_token() {
+        let minting: AuthConfig = serde_json::from_value(serde_json::json!({
+            "type": "service_account_jwt",
+            "key_file": "file:/dev/null",
+        }))
+        .unwrap();
+
+        let hold = |injector: &CredentialInjector| {
+            injector.token_cache.lock().insert(
+                "gcs".into(),
+                (
+                    Secret::new("good".into()),
+                    Instant::now() + Duration::from_secs(3600),
+                ),
+            );
+        };
+
+        // Refusals that are about the caller, not the credential. A GA4 `403`
+        // for a property the account was never added to is the reported one.
+        for status in [200, 400, 403, 404, 429, 500] {
+            let injector = injector();
+            hold(&injector);
+            injector.note_upstream_status(
+                "gcs",
+                http::StatusCode::from_u16(status).unwrap(),
+                &minting,
+            );
+            assert!(
+                injector.cached_token("gcs").is_some(),
+                "a {status} must leave a working token alone"
+            );
+        }
+
+        // And the one that is about the credential.
+        let rejected = injector();
+        hold(&rejected);
+        rejected.note_upstream_status("gcs", http::StatusCode::UNAUTHORIZED, &minting);
+        assert!(
+            rejected.cached_token("gcs").is_none(),
+            "a 401 is the upstream rejecting the token itself"
+        );
+
+        // A scheme that mints nothing has nothing here to lose either way.
+        let static_key = injector();
+        hold(&static_key);
+        static_key.note_upstream_status("gcs", http::StatusCode::UNAUTHORIZED, &AuthConfig::None);
+        assert!(static_key.cached_token("gcs").is_some());
     }
 
     #[test]
