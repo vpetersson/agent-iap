@@ -386,6 +386,7 @@ action = "allow"
             Overrides {
                 listen: Some("127.0.0.1:19999".into()),
                 admin_listen: Some("127.0.0.1:19998".into()),
+                ..Default::default()
             },
         );
         let state = AppState::build(watcher.read().unwrap(), false).unwrap();

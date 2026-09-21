@@ -320,11 +320,29 @@ agent-iap acl add --target github --methods DELETE --paths '/**' --action ask
 agent-iap agent add ci-runner --name "CI" --target github
 ```
 
-`--action` defaults to `ask`, not `allow`. Every other flag on `acl add`
-defaults to the widest thing it can mean — every agent, kind, target, method and
-path — so a default `allow` would let the bare command grant everything to
-everyone, ahead of the `acl_default = deny` this is all built on. The widest
-rule it can write stops on a human instead; to grant, say `--action allow`.
+**No command here grants anything by default.** `acl add --action` defaults to
+`ask`, not `allow`: every other flag on it defaults to the widest thing it can
+mean — every agent, kind, target, method and path — so a default `allow` would
+let the bare command grant everything to everyone, ahead of the `acl_default =
+deny` this is all built on. The widest rule it can write stops on a human
+instead; to grant, say `--action allow`.
+
+`agent add` asks the same question about the gate in *front* of the ACL. An
+agent's `targets` is what it may address at all, and an absent one means every
+upstream and every MCP server this proxy fronts, including ones added later —
+so a bare `agent add` is not allowed to write one:
+
+```bash
+agent-iap agent add ci-runner --target github        # this, and nothing else
+agent-iap agent add ci-runner --any-target           # all of them, said out loud
+agent-iap agent add ci-runner                        # refused: say which
+```
+
+The blanket grant is still there; it is a decision rather than the thing you
+get for not mentioning it. The *file* is unchanged — an absent `targets` still
+reads as "any", so every policy already written goes on meaning what it meant,
+and `agent-iap check` names the agents that hold one so an existing blanket
+grant is something you are told about rather than something to go looking for.
 
 Rules are **appended**, never inserted, because first match wins — a new rule can
 never silently shadow one already in the file, and `acl add` prints the position
@@ -722,6 +740,70 @@ revoked one until the proxy restarts: every one of these commands says which you
 are getting, because a revocation that has not taken effect is worse than one
 you know is pending.
 
+### Stopping everything
+
+The inverses above each take one thing away. Sometimes the thing you want is
+not one of them — an agent is behaving in a way you do not understand, a
+credential may be out, or you simply want it all to stop while you go and look.
+There are two ways to say that, and the difference between them is what they
+outlive.
+
+```bash
+# Right now, for as long as this process runs. Writes nothing.
+agent-iap run --lockdown
+
+# For keeps. Deletes every rule and puts `acl_default` back to `deny`.
+agent-iap acl reset
+```
+
+**Lockdown** is the switch on the console: `L` engages it, `L` lifts it, and
+the header says `LOCKDOWN` in red for as long as it is on. Every request is
+denied — including the ones an `ask` rule would have parked, because a prompt
+nobody can answer with anything but "no" is a prompt worth not raising. It
+decides *before* the rule list, so no rule can get in front of it, and it is
+deliberately outside everything a reload swaps: a kill switch that the agent's
+own `acl add`, or a config-management tool rewriting the file a minute later,
+could lift without anybody deciding to is not a kill switch. The audit log
+records the refusals against `<lockdown>` rather than a rule, so an hour later
+it is clear what stopped them, and `/status` on the control plane reports it —
+read-only, because the switch belongs on your terminal rather than behind an
+admin token.
+
+It writes nothing, which is the point: the file is still the record of what the
+policy is, and lifting the switch serves that policy again with no window in
+between and no restart.
+
+**`acl reset`** is the other half — the same state, written down. It deletes
+every `[[acl]]` rule and sets `acl_default` to `deny`, which is the pair the
+floor needs: rules under an `allow` default grant everything, and one surviving
+`allow` rule over a `deny` default grants everything too. It is the state
+`agent-iap init` writes, put back, and the next `agent-iap run` starts from it.
+
+```console
+$ agent-iap acl reset
+Delete all 6 rules from /home/you/.config/agent-iap/iap.toml and set
+`acl_default` to `deny`? [y/N] y
+Removed 6 rules from /home/you/.config/agent-iap/iap.toml:
+  acl[0] `anthropic-inference`
+  acl[1] `gh-read`
+  …
+`acl_default` was `allow`, and is now `deny`.
+Nothing matches now, so every request is denied.
+Build it back up with `agent-iap acl add` — the audit log has what was being used.
+```
+
+It asks first, and with stdin redirected it refuses rather than assuming:
+`--yes` is how a script says it means it. The agents, upstreams, MCP servers
+and credentials all stay — a panic button that also revoked everything would be
+one nobody presses, and the state it left behind would take an afternoon to
+rebuild rather than a command. What it does not do is reach into a proxy that
+is already running: an answer given earlier in that session lives in the
+process, not the file, so `--lockdown` is the one for right now.
+
+The names of what was removed are printed because that is the last place those
+rules exist. Getting back up is `agent-iap acl add`, and the audit log is the
+record of which of them were being used.
+
 ## What happens to a request
 
 ```mermaid
@@ -787,6 +869,28 @@ is the log stream it has always been, so nothing deployed has to learn a flag.
 What it gives up is the keyboard: unless something is polling the control plane,
 an `ask` denies immediately rather than parking, and the startup banner says
 which of the two you are getting.
+
+**A parked request rings the terminal bell.** An `ask` that nobody answers
+denies, so a console in a background window is a queue whose usefulness depends
+on somebody happening to look at it — and a terminal you cannot see you can
+still hear. What your terminal does with `BEL` is your setting rather than this
+program's: a sound, a flashing window, a dock badge, a tmux window flagged with
+`#{?window_bell_flag}`, a desktop notification from a terminal wired up that
+way. A burst of parked requests is one ring rather than a dozen, since a dozen
+beeps is a sound people turn off. Three ways to say no:
+
+```bash
+agent-iap run --no-bell         # this run
+export IAP_NO_BELL=1            # every run
+```
+
+```toml
+[server]
+approval_bell = false           # in the policy file, and reloadable
+```
+
+Nothing is rung at a terminal nobody is watching — a proxy under a unit file has
+no business beeping at whoever started it.
 
 The console owns the terminal, so diagnostics go to `agent-iap.log` beside the
 audit log instead of to stdout, and the bottom pane is a live tail of the audit
@@ -861,7 +965,7 @@ from a shell is a form here, over the same functions with the same validation:
 | agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
 | upstreams | base URL, scheme, credential reference, last verification | `n` add, from a profile or spelled out · `e` edit · `v` verify · `x` remove |
 | mcp | transport, command or URL, credential references, last verification | `n` add · `v` verify · `x` remove |
-| acl | every rule in match order, with its number and what is left of any deadline | `n` `x` |
+| acl | every rule in match order, with its number and what is left of any deadline | `n` add · `x` remove · `R` reset to strict |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
 
@@ -900,6 +1004,13 @@ uses, so a click can never grant what a keystroke could not.
 Reporting the pointer stops the terminal's own text selection working, and the
 thing most worth selecting off this screen is a token — so `m` turns it off and
 back on, and most terminals let you hold ⇧ to select through it.
+
+`L` is the panic button: it denies everything for as long as the proxy runs,
+writes nothing, and the header says so in red until `L` again lifts it
+(§ Stopping everything). `R` on the rules pane is the written-down version —
+every rule out, `acl_default` back to `deny` — and asks first, being the one
+key here that can delete a policy. Both are shifted, because neither is
+something to reach by slipping off the key beside it.
 
 `?` lists the keys, and `q` quits the console and stops the proxy with it. `r`
 re-reads the policy file, though it rarely has to: the file is watched, so an
@@ -1031,7 +1142,9 @@ embeds under `--template full`. The shape:
 id = "claude-code"
 name = "Claude Code"
 token_sha256 = "…"                  # from `agent-iap gen-token`
-targets = ["anthropic", "github"]   # optional hard scope, checked before the ACL
+targets = ["anthropic", "github"]   # hard scope, checked before the ACL. Absent
+                                    # means *any* target — `agent add` will not
+                                    # write that without `--any-target`
 
 [[upstreams]]
 name = "anthropic"
@@ -2021,6 +2134,13 @@ What this gives you:
 - Every call is attributable to an agent, to the workload token it was made
   under, and to the rule that permitted it.
 - The blast radius of a compromised agent is the ACL, not the API key's scope.
+- When the answer is "stop everything", there is one: `--lockdown`, or `L` on
+  the console, refuses every request without an edit, a reload or a restart,
+  and cannot be lifted by anything that rewrites the policy file
+  (§ Stopping everything).
+- No command grants anything by default. `acl add` writes `ask`, `agent add`
+  refuses to enrol an agent until it is told what that agent may reach, and an
+  unmatched request falls through to `acl_default`, which is `deny`.
 
 What it does not give you, and you should know before relying on it:
 
@@ -2070,7 +2190,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 442 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 525 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

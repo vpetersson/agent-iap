@@ -8,6 +8,12 @@
 //! for right after `upstream add`, run bare, appended one rule granting
 //! everything to everyone, in front of the deny it was supposed to sit behind.
 //!
+//! The same shape turned up once more on `agent-iap agent add`. An agent's
+//! `targets` is the coarse gate *in front of* the ACL, an omitted one means
+//! every upstream and every MCP server the proxy fronts — and it was what a
+//! bare `agent add` wrote. Same bug, one command over: the widest thing the
+//! flag can mean, handed out for saying nothing.
+//!
 //! These tests drive the real binary, because the defaults under test are
 //! clap's rather than anything the library would see.
 
@@ -167,4 +173,103 @@ fn the_printed_next_step_spells_out_the_action_it_promises() {
         stdout.contains("--action allow"),
         "and running it verbatim allows:\n{stdout}"
     );
+}
+
+/// The reported bug, one command over.
+#[test]
+fn enrolling_an_agent_with_nothing_but_defaults_does_not_hand_it_every_target() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(&path, &["agent", "add", "ci-runner"]);
+
+    assert!(
+        !output.status.success(),
+        "a bare `agent add` must not write the widest grant in the file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--target"), "{stderr}");
+    assert!(stderr.contains("--any-target"), "{stderr}");
+    assert!(
+        policy(&path).agents.iter().all(|a| a.id != "ci-runner"),
+        "and nothing was enrolled"
+    );
+}
+
+/// Spelling it out still works, exactly as `--action allow` still does.
+#[test]
+fn an_explicit_any_target_is_still_the_blanket_grant() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(&path, &["agent", "add", "ci-runner", "--any-target"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let agent = policy(&path)
+        .agents
+        .into_iter()
+        .find(|a| a.id == "ci-runner")
+        .expect("enrolled");
+    assert!(
+        agent.targets.is_empty(),
+        "an absent `targets` is how the file has always spelled `any`"
+    );
+    // And the operator is told, rather than finding out from `list agents`.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("every upstream and MCP server"), "{stdout}");
+}
+
+/// The narrow spelling is the one that needs no extra flag.
+#[test]
+fn naming_a_target_needs_nothing_else() {
+    let (_dir, path) = minimal_policy();
+    assert!(agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "anthropic",
+            "--base-url",
+            "https://api.anthropic.com",
+            "--auth",
+            "none",
+        ],
+    )
+    .status
+    .success());
+
+    let output = agent_iap(
+        &path,
+        &["agent", "add", "ci-runner", "--target", "anthropic"],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let agent = policy(&path)
+        .agents
+        .into_iter()
+        .find(|a| a.id == "ci-runner")
+        .expect("enrolled");
+    assert_eq!(agent.targets, vec!["anthropic".to_string()]);
+}
+
+/// Reading is unchanged, so every policy file already written goes on meaning
+/// what it meant. `check` is where an existing blanket grant becomes visible
+/// rather than a thing you have to know to go and look for.
+#[test]
+fn check_names_the_agents_that_already_hold_a_blanket_grant() {
+    let (_dir, path) = minimal_policy();
+    assert!(agent_iap(&path, &["agent", "add", "wide", "--any-target"])
+        .status
+        .success());
+
+    let stdout = String::from_utf8_lossy(&agent_iap(&path, &["check"]).stdout).into_owned();
+
+    assert!(stdout.contains("may address every target"), "{stdout}");
+    assert!(stdout.contains("wide"), "{stdout}");
 }

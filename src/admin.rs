@@ -128,6 +128,14 @@ struct StatusBody {
     mcp_servers: usize,
     acl_rules: usize,
     acl_default: String,
+    /// Everything is being denied, whatever `acl_rules` and `acl_default`
+    /// say. Reported and not settable: the switch lives on the operator's own
+    /// terminal — `--lockdown` at startup, `L` in the console — because a
+    /// control plane that could lift it turns a kill switch into one more
+    /// thing an admin token grants. What this answers is the question a
+    /// monitor asks, which is why a proxy with rules in it is refusing
+    /// everything.
+    lockdown: bool,
     pending: usize,
     remembered: usize,
     has_approver: bool,
@@ -145,6 +153,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         mcp_servers: config.mcp_servers.len(),
         acl_rules: state.acl.rule_count(),
         acl_default: state.acl.default_action().to_string(),
+        lockdown: state.acl.locked_down(),
         pending: state.broker.pending_count(),
         remembered: state.broker.remembered_count(),
         has_approver: state.broker.has_approver(),

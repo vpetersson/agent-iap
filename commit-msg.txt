@@ -1,0 +1,25 @@
+The default grant is deny too
+
+`acl_default` denies and `acl add` writes `ask`, so the rule list could not
+grant anything by accident. The gate in *front* of it still could. An agent's
+`targets` is what it may address at all, an absent one means every upstream
+and every MCP server this proxy fronts — including ones added later — and
+that was exactly what a bare `agent-iap agent add <id>` wrote. Same bug as
+the `acl add --action` default, one command over: the widest thing the flag
+can mean, handed out for saying nothing.
+
+`add_agent` now takes a `Reach` rather than a list where empty means
+everything, because "I did not say" and "I meant everything" being one
+missing flag apart is the shape the bug had. `--target` narrows,
+`--any-target` is the blanket grant asked for by name, and a bare `agent add`
+is refused with both spelled out. The console's enrol form gets the same
+switch and the same refusal.
+
+Reading is untouched: an absent `targets` still means any, so every policy
+file already written goes on meaning what it meant and nothing needs
+migrating. What changed is that a command can no longer write one by being
+left alone — and `agent-iap check` now names the agents that already hold a
+blanket grant, so an existing one is something you are told about rather than
+something you have to know to go looking for.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

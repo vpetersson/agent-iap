@@ -174,11 +174,15 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
     match &form.intent {
         Intent::Agent => {
             let id = required(form, "id")?;
+            let targets = form.list("targets");
             let agent = enroll::add_agent(
                 path,
                 &id,
                 form.opt("name").as_deref(),
-                &form.list("targets"),
+                match form.flag("any-target") {
+                    true => enroll::Reach::Any,
+                    false => enroll::Reach::Only(&targets),
+                },
             )?;
             Ok(Effect {
                 message: format!("enrolled `{id}` — its token is live now, no restart needed"),

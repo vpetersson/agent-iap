@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
 use crate::acl::{AccessRequest, Kind};
+use crate::bell::Bell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,10 +161,15 @@ pub struct ApprovalBroker {
     /// operator who discovers it is too short is the one currently watching a
     /// request time out.
     timeout: Mutex<Duration>,
+    /// Rung when a request parks. Here rather than in the console because
+    /// this is the one place that knows a request stopped on a human, and it
+    /// is the same place whether the console or the control plane is the
+    /// thing that will answer it.
+    bell: Bell,
 }
 
 impl ApprovalBroker {
-    pub fn new(timeout: Duration) -> Self {
+    pub fn new(timeout: Duration, bell: bool) -> Self {
         let (changes, _) = broadcast::channel(64);
         ApprovalBroker {
             pending: Mutex::new(IndexMap::new()),
@@ -172,6 +178,7 @@ impl ApprovalBroker {
             last_poll: Mutex::new(None),
             changes,
             timeout: Mutex::new(timeout),
+            bell: Bell::new(bell),
         }
     }
 
@@ -180,6 +187,17 @@ impl ApprovalBroker {
     /// request in flight is a request nobody can reason about.
     pub fn set_timeout(&self, timeout: Duration) {
         *self.timeout.lock() = timeout;
+    }
+
+    /// Adopt an edited `approval_bell`, so an operator who finds out they
+    /// wanted it — which is, reliably, just after a request timed out
+    /// unnoticed — gets it without restarting the proxy.
+    pub fn set_bell(&self, on: bool) {
+        self.bell.set_enabled(on);
+    }
+
+    pub fn bell_enabled(&self) -> bool {
+        self.bell.enabled()
     }
 
     /// Declare that the interactive console is running.
@@ -233,6 +251,12 @@ impl ApprovalBroker {
             },
         );
         let _ = self.changes.send(());
+        // Only now: everything above is a reason the request never reached a
+        // human, and a bell for a question nobody was going to be asked is
+        // the noise that gets the bell turned off. The outcome is dropped on
+        // purpose — a request must never be held up, let alone refused,
+        // because a terminal would not take a byte.
+        self.bell.ring();
 
         let timeout = *self.timeout.lock();
         let outcome = match tokio::time::timeout(timeout, receiver).await {
@@ -355,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn denies_when_nothing_is_watching_the_queue() {
-        let broker = ApprovalBroker::new(Duration::from_secs(5));
+        let broker = ApprovalBroker::new(Duration::from_secs(5), false);
         let outcome = broker.ask(&request(), "Claude", None).await;
         assert_eq!(outcome, Outcome::NoApprover);
         assert_eq!(outcome.verdict(), Verdict::Deny);
@@ -363,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn polling_the_queue_counts_as_watching_it_for_a_while() {
-        let broker = ApprovalBroker::new(Duration::from_secs(5));
+        let broker = ApprovalBroker::new(Duration::from_secs(5), false);
         assert!(!broker.has_approver());
         broker.note_poll();
         assert!(
@@ -374,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_human_allow_releases_the_request() {
-        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5), false));
         broker.set_has_approver(true);
 
         let asker = {
@@ -397,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn remembering_short_circuits_the_next_identical_request() {
-        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5)));
+        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(5), false));
         broker.set_has_approver(true);
 
         let asker = {
@@ -432,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unanswered_request_times_out_denied() {
-        let broker = ApprovalBroker::new(Duration::from_millis(40));
+        let broker = ApprovalBroker::new(Duration::from_millis(40), false);
         broker.set_has_approver(true);
         let outcome = broker.ask(&request(), "Claude", None).await;
         assert_eq!(outcome, Outcome::TimedOut);

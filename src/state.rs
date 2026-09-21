@@ -145,9 +145,10 @@ impl AppState {
         for server in &config.mcp_servers {
             injector.warm(&server.name, &server.auth)?;
         }
-        let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(
-            config.server.approval_timeout_secs,
-        )));
+        let broker = Arc::new(ApprovalBroker::new(
+            Duration::from_secs(config.server.approval_timeout_secs),
+            config.server.approval_bell,
+        ));
 
         let admin_token = match &config.server.admin_token {
             Some(reference) => resolver
@@ -257,6 +258,7 @@ impl AppState {
         }
         self.broker
             .set_timeout(Duration::from_secs(config.server.approval_timeout_secs));
+        self.broker.set_bell(config.server.approval_bell);
         self.workload.reconfigure(&config.server.workload_identity);
 
         // A log that cannot be reopened is worth saying out loud, but it is not

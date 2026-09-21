@@ -50,6 +50,16 @@ pub struct ServerConfig {
     /// How long an `ask` request waits for a human before failing closed.
     #[serde(default = "default_approval_timeout")]
     pub approval_timeout_secs: u64,
+    /// Ring the terminal bell when a request stops on a human.
+    ///
+    /// On, because the alternative is a queue whose usefulness depends on
+    /// somebody happening to be looking at it: an `ask` that nobody answers
+    /// denies, and a console in a background window cannot be seen. What the
+    /// terminal does with `BEL` — a sound, a flashing window, a tmux flag, a
+    /// desktop notification — is the operator's setting, not this program's.
+    /// `--no-bell` and `IAP_NO_BELL` are the other two ways to say no.
+    #[serde(default = "yes")]
+    pub approval_bell: bool,
     /// How long an upstream may go silent mid-response before the proxy gives up.
     ///
     /// This is an idle timeout, not a total one: a token-by-token LLM response
@@ -109,6 +119,7 @@ impl Default for ServerConfig {
             admin_listen: default_admin_listen(),
             admin_token: None,
             approval_timeout_secs: default_approval_timeout(),
+            approval_bell: true,
             upstream_timeout_secs: default_upstream_timeout(),
             upstream_connect_timeout_secs: default_connect_timeout(),
             max_body_bytes: default_max_body(),
@@ -676,9 +687,17 @@ impl Default for AclDefault {
 pub struct Overrides {
     pub listen: Option<String>,
     pub admin_listen: Option<String>,
+    /// `--no-bell`. `Some(false)` only: the flag can turn the bell off, and
+    /// the file is what turns it on, so an operator who set
+    /// `approval_bell = true` after starting the proxy gets it without a
+    /// restart while a run started with `--no-bell` stays quiet regardless.
+    pub bell: Option<bool>,
 }
 
 impl Overrides {
+    /// Whether the *listen addresses* were overridden. Named for what it is
+    /// used for: re-validating a config whose sockets the file no longer
+    /// describes. The bell moves nothing and binds nothing.
     pub fn any(&self) -> bool {
         self.listen.is_some() || self.admin_listen.is_some()
     }
@@ -693,6 +712,9 @@ impl Overrides {
                 .server
                 .override_admin_listen(spec)
                 .context("--admin-listen")?;
+        }
+        if let Some(bell) = self.bell {
+            config.server.approval_bell = bell;
         }
         if self.any() {
             // The file was validated on load; the addresses it was validated
