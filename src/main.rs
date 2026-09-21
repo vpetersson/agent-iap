@@ -265,9 +265,19 @@ enum AgentCommand {
         #[arg(long)]
         name: Option<String>,
         /// Upstream or MCP server this agent may address at all. Repeatable.
-        /// Omit for "any", which still leaves the ACL in charge.
+        ///
+        /// One of this and `--any-target` is required. It used to default to
+        /// "any", which is what the *file* still means by an absent `targets`
+        /// — but it is the coarse gate in front of the ACL, and an agent that
+        /// got a blanket grant because nobody typed a flag is the one grant
+        /// nobody decided to give.
         #[arg(long = "target", value_name = "NAME")]
         targets: Vec<String>,
+        /// Let this agent address every upstream and MCP server, including
+        /// ones added later — the ACL still decides each call. The blanket
+        /// grant, spelled out; `--target` is how you avoid needing it.
+        #[arg(long, conflicts_with = "targets")]
+        any_target: bool,
         #[command(flatten)]
         clipboard: ClipboardArg,
     },
@@ -907,8 +917,18 @@ fn main() -> Result<()> {
             config,
             name,
             targets,
+            any_target,
             clipboard,
-        }) => add_agent(&config.config, &id, name.as_deref(), &targets, clipboard),
+        }) => add_agent(
+            &config.config,
+            &id,
+            name.as_deref(),
+            match any_target {
+                true => enroll::Reach::Any,
+                false => enroll::Reach::Only(&targets),
+            },
+            clipboard,
+        ),
         Command::Agent(AgentCommand::Rm { id, config, prune }) => {
             remove_agent(&config.config, &id, prune)
         }
@@ -1418,6 +1438,24 @@ fn check(path: &Path) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // The blanket grant, counted. `targets` is the coarse gate in front of the
+    // ACL and an absent one means *every* service this proxy fronts, which is
+    // the widest thing the file can say about an agent — and the one that says
+    // it by being silent. `agent add` will not write one unasked any more;
+    // this is how the ones already written get seen.
+    let blanket: Vec<&str> = config
+        .agents
+        .iter()
+        .filter(|agent| agent.targets.is_empty())
+        .map(|agent| agent.id.as_str())
+        .collect();
+    if !blanket.is_empty() {
+        println!(
+            "            {} may address every target ({}) — `targets = [...]` narrows it",
+            plural(blanket.len(), "agent"),
+            blanket.join(", ")
+        );
+    }
     println!(
         "upstreams   {}",
         config
@@ -1758,20 +1796,25 @@ fn add_agent(
     path: &Path,
     id: &str,
     name: Option<&str>,
-    targets: &[String],
+    reach: enroll::Reach<'_>,
     clipboard: ClipboardArg,
 ) -> Result<()> {
-    let enrolled = enroll::add_agent(path, id, name, targets)?;
+    let enrolled = enroll::add_agent(path, id, name, reach)?;
     println!("Added agent `{}` to {}.\n", enrolled.id, path.display());
     show_token(
         "Its token — shown once, and not any upstream's credential:",
         &enrolled.token,
         clipboard,
     );
-    if targets.is_empty() {
-        println!("It may address any target, subject to the ACL.");
-    } else {
-        println!("It may address: {}.", targets.join(", "));
+    match reach {
+        // Said plainly, and every time: this is the widest thing the file can
+        // say about an agent, and it should not be something an operator finds
+        // out about later by reading `list agents`.
+        enroll::Reach::Any => println!(
+            "It may address every upstream and MCP server, including ones added later — \
+             only the ACL stands between it and all of them."
+        ),
+        enroll::Reach::Only(targets) => println!("It may address: {}.", targets.join(", ")),
     }
     // What to hand over, at the moment the operator is deciding what else to
     // write into the agent's environment: the token and the address are the

@@ -320,11 +320,29 @@ agent-iap acl add --target github --methods DELETE --paths '/**' --action ask
 agent-iap agent add ci-runner --name "CI" --target github
 ```
 
-`--action` defaults to `ask`, not `allow`. Every other flag on `acl add`
-defaults to the widest thing it can mean — every agent, kind, target, method and
-path — so a default `allow` would let the bare command grant everything to
-everyone, ahead of the `acl_default = deny` this is all built on. The widest
-rule it can write stops on a human instead; to grant, say `--action allow`.
+**No command here grants anything by default.** `acl add --action` defaults to
+`ask`, not `allow`: every other flag on it defaults to the widest thing it can
+mean — every agent, kind, target, method and path — so a default `allow` would
+let the bare command grant everything to everyone, ahead of the `acl_default =
+deny` this is all built on. The widest rule it can write stops on a human
+instead; to grant, say `--action allow`.
+
+`agent add` asks the same question about the gate in *front* of the ACL. An
+agent's `targets` is what it may address at all, and an absent one means every
+upstream and every MCP server this proxy fronts, including ones added later —
+so a bare `agent add` is not allowed to write one:
+
+```bash
+agent-iap agent add ci-runner --target github        # this, and nothing else
+agent-iap agent add ci-runner --any-target           # all of them, said out loud
+agent-iap agent add ci-runner                        # refused: say which
+```
+
+The blanket grant is still there; it is a decision rather than the thing you
+get for not mentioning it. The *file* is unchanged — an absent `targets` still
+reads as "any", so every policy already written goes on meaning what it meant,
+and `agent-iap check` names the agents that hold one so an existing blanket
+grant is something you are told about rather than something to go looking for.
 
 Rules are **appended**, never inserted, because first match wins — a new rule can
 never silently shadow one already in the file, and `acl add` prints the position
@@ -1124,7 +1142,9 @@ embeds under `--template full`. The shape:
 id = "claude-code"
 name = "Claude Code"
 token_sha256 = "…"                  # from `agent-iap gen-token`
-targets = ["anthropic", "github"]   # optional hard scope, checked before the ACL
+targets = ["anthropic", "github"]   # hard scope, checked before the ACL. Absent
+                                    # means *any* target — `agent add` will not
+                                    # write that without `--any-target`
 
 [[upstreams]]
 name = "anthropic"
@@ -2118,6 +2138,9 @@ What this gives you:
   the console, refuses every request without an edit, a reload or a restart,
   and cannot be lifted by anything that rewrites the policy file
   (§ Stopping everything).
+- No command grants anything by default. `acl add` writes `ask`, `agent add`
+  refuses to enrol an agent until it is told what that agent may reach, and an
+  unmatched request falls through to `acl_default`, which is `deny`.
 
 What it does not give you, and you should know before relying on it:
 
@@ -2167,7 +2190,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 517 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 525 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

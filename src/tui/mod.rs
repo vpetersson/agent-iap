@@ -2273,7 +2273,12 @@ fn agent_form() -> Form {
             Field::text(
                 "targets",
                 "targets",
-                "upstreams and MCP servers it may address at all. Blank means any, with the ACL still in charge.",
+                "upstreams and MCP servers it may address at all. One of this and the switch below.",
+            ),
+            Field::flag(
+                "any-target",
+                "any target",
+                "every upstream and MCP server, including ones added later — the widest thing this file can say about an agent",
             ),
         ],
     )
@@ -3949,6 +3954,13 @@ action = "allow"
         for ch in "new-agent".chars() {
             app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
         }
+        // id → name → targets, and say what it may reach: the form will not
+        // enrol an agent that has not been told.
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        for ch in "github".chars() {
+            app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
+        }
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
 
         let written = std::fs::read_to_string(&app.policy.path).unwrap();
@@ -3985,11 +3997,45 @@ action = "allow"
         for ch in "new-agent".chars() {
             app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
         }
+        // id → name → targets → the `any target` switch, turned on.
+        for _ in 0..3 {
+            app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        }
+        app.handle(KeyEvent::from(KeyCode::Char(' '))).unwrap();
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
 
         assert_eq!(views::agents(&app.policy.inventory).len(), 2);
         assert!(app.showing_a_secret(), "the token is the modal that is up");
         assert!(!app.flash.as_ref().unwrap().failed);
+    }
+
+    /// And the form will not do it by being left alone. Same rule as the
+    /// command line: the blanket grant is a decision, not a default.
+    #[tokio::test]
+    async fn the_enrol_form_will_not_grant_every_target_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Agents;
+
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        for ch in "new-agent".chars() {
+            app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert_eq!(
+            views::agents(&app.policy.inventory).len(),
+            1,
+            "nothing was enrolled"
+        );
+        assert!(!app.showing_a_secret(), "and no token was minted");
+        // The form stays up with the reason on it, rather than closing on a
+        // flash: what is missing is a field, and the answer goes in this form.
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form should still be open");
+        };
+        let error = form.error.as_deref().expect("with the reason on it");
+        assert!(error.contains("--any-target"), "{error}");
     }
     /// `R` on the rules pane. The confirm first — this is the one key in the
     /// console that can delete a policy — then the file, then the running

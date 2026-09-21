@@ -431,13 +431,65 @@ fn normalise_scheme(scheme: &str) -> &str {
 }
 
 /// Add `[[agents]]`, minting the token and writing only its hash.
+/// What an agent may address at all, as the operator spelled it out.
+///
+/// An enum rather than "the list, and empty means everything", because that
+/// is the shape the bug had: `targets` is the coarse gate in front of the ACL,
+/// an omitted one reads as *any* upstream and *any* MCP server this proxy
+/// fronts, and "I did not say" and "I meant everything" are one missing flag
+/// apart. Here they are two different values, and `add_agent` will not take a
+/// guess at which was meant.
+///
+/// The *file* is unchanged: an absent `targets` key still means any, so every
+/// policy already written goes on meaning what it meant. What changed is that
+/// a command can no longer write one by saying nothing.
+#[derive(Debug, Clone, Copy)]
+pub enum Reach<'a> {
+    /// These upstreams and MCP servers, and nothing else.
+    Only(&'a [String]),
+    /// Everything the proxy fronts, including services added later. The
+    /// blanket grant — available, and asked for by name.
+    Any,
+}
+
+impl<'a> Reach<'a> {
+    /// The targets to write, which is nothing at all for `Any`: an absent
+    /// `targets` key is how the file spells the blanket grant, and there is
+    /// no second spelling to drift from it.
+    pub fn targets(self) -> &'a [String] {
+        match self {
+            Reach::Only(targets) => targets,
+            Reach::Any => &[],
+        }
+    }
+
+    pub fn is_any(self) -> bool {
+        matches!(self, Reach::Any)
+    }
+}
+
 pub fn add_agent(
     path: &Path,
     id: &str,
     name: Option<&str>,
-    targets: &[String],
+    reach: Reach<'_>,
 ) -> Result<EnrolledAgent> {
     check_id(id, "agent id")?;
+
+    // The default grant, refused. Every other flag on `agent add` defaults to
+    // the narrowest thing it can mean; this one defaulted to the widest, and
+    // silently — a bare `agent add` enrolled a token good against every
+    // upstream and every MCP server the proxy fronts, now and in future, with
+    // only the ACL between it and all of them. The blanket grant is still
+    // available; it is no longer what you get for not mentioning it.
+    let targets = reach.targets();
+    if targets.is_empty() && !reach.is_any() {
+        bail!(
+            "`{id}` was given no targets, which in the file means *every* upstream and MCP \
+             server — say which it is:\n  --target <name>   the services it may address, \
+             repeatable\n  --any-target      all of them, including ones added later"
+        );
+    }
 
     let mut document = read(path)?;
     let existing = document_config(&document)?;
@@ -467,7 +519,8 @@ pub fn add_agent(
         if !reachable.iter().any(|name| *name == target) {
             bail!(
                 "no upstream or MCP server named `{target}` in `{}` — add it first with \
-                 `agent-iap upstream add {target} --base-url <url>`, or drop the `--target`",
+                 `agent-iap upstream add {target} --base-url <url>`, or `--any-target` for \
+                 all of them",
                 path.display()
             );
         }
@@ -481,6 +534,9 @@ pub fn add_agent(
         entry["name"] = toml_edit::value(name);
     }
     entry["token_sha256"] = toml_edit::value(identity::token_hash(&token));
+    // `Any` writes no key at all, which is how the file has always spelled the
+    // blanket grant. One spelling, so a reader of the file cannot be told two
+    // different things by the same absence.
     if !targets.is_empty() {
         entry["targets"] = toml_edit::value(string_array(targets));
     }
@@ -1796,7 +1852,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let agent = add_agent(&path, "claude-code", None, &["anthropic".to_string()]).unwrap();
+        let agent = add_agent(
+            &path,
+            "claude-code",
+            None,
+            Reach::Only(&["anthropic".to_string()]),
+        )
+        .unwrap();
 
         let config = load(&path);
         config
@@ -1838,18 +1900,74 @@ mod tests {
     #[test]
     fn the_token_is_never_written_and_never_printed_by_debug() {
         let (_dir, path) = empty_policy();
-        let agent = add_agent(&path, "ci", None, &[]).unwrap();
+        let agent = add_agent(&path, "ci", None, Reach::Any).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains(&agent.token));
         assert!(text.contains(&identity::token_hash(&agent.token)));
         assert!(!format!("{agent:?}").contains(&agent.token));
     }
 
+    /// The default grant, refused. A bare `agent add` used to enrol an agent
+    /// with no `targets` — which the file reads as *every* upstream and every
+    /// MCP server, now and in future. Saying nothing can no longer be how that
+    /// is asked for.
+    #[test]
+    fn enrolling_an_agent_without_saying_what_it_may_reach_is_refused() {
+        let (_dir, path) = empty_policy();
+
+        let error = add_agent(&path, "ci", None, Reach::Only(&[]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--target"), "{error}");
+        assert!(error.contains("--any-target"), "{error}");
+        assert!(
+            load(&path).agents.is_empty(),
+            "and nothing was written — a refused enrolment must not mint a token either"
+        );
+    }
+
+    /// The blanket grant is still available. It is a decision now, not a
+    /// default, and the file spells it the way it always has.
+    #[test]
+    fn the_blanket_grant_is_still_there_when_it_is_asked_for() {
+        let (_dir, path) = empty_policy();
+
+        add_agent(&path, "ci", None, Reach::Any).unwrap();
+
+        let agents = load(&path).agents;
+        assert_eq!(agents.len(), 1);
+        assert!(
+            agents[0].targets.is_empty(),
+            "an absent `targets` is how the file says `any`, and there is only one spelling"
+        );
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("targets"),
+            "in particular, no empty `targets = []`, which would read as a scope that is not one"
+        );
+    }
+
+    /// Reading is unchanged. Every policy file already written goes on meaning
+    /// what it meant — only the command that writes a new one got stricter.
+    #[test]
+    fn an_absent_targets_key_still_reads_as_any() {
+        let (_dir, path) = empty_policy();
+        add_agent(&path, "ci", None, Reach::Any).unwrap();
+
+        let config = load(&path);
+        assert!(crate::identity::agent_may_address(
+            &config.agents[0],
+            "anything-at-all"
+        ));
+    }
+
     #[test]
     fn a_duplicate_agent_id_is_refused() {
         let (_dir, path) = empty_policy();
-        add_agent(&path, "ci", None, &[]).unwrap();
-        let error = add_agent(&path, "ci", None, &[]).unwrap_err().to_string();
+        add_agent(&path, "ci", None, Reach::Any).unwrap();
+        let error = add_agent(&path, "ci", None, Reach::Any)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("already has an agent"), "{error}");
     }
 
@@ -1858,7 +1976,7 @@ mod tests {
     #[test]
     fn a_target_that_names_nothing_is_refused() {
         let (_dir, path) = empty_policy();
-        let error = add_agent(&path, "ci", None, &["githbu".to_string()])
+        let error = add_agent(&path, "ci", None, Reach::Only(&["githbu".to_string()]))
             .unwrap_err()
             .to_string();
         assert!(
@@ -2421,7 +2539,13 @@ mod tests {
             ),
         )
         .unwrap();
-        add_agent(&path, "ci", None, &["github".into(), "anthropic".into()]).unwrap();
+        add_agent(
+            &path,
+            "ci",
+            None,
+            Reach::Only(&["github".into(), "anthropic".into()]),
+        )
+        .unwrap();
         (dir, path)
     }
 
@@ -2584,7 +2708,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        add_agent(&path, "ci", None, &["anthropic".into()]).unwrap();
+        add_agent(&path, "ci", None, Reach::Only(&["anthropic".into()])).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let error = remove_upstream(&path, "anthropic", true)
@@ -3031,7 +3155,7 @@ mod tests {
             ),
         )
         .unwrap();
-        add_agent(&path, "ci", None, &["github".to_string()]).unwrap();
+        add_agent(&path, "ci", None, Reach::Only(&["github".to_string()])).unwrap();
 
         let config = load(&path);
         let tls = config

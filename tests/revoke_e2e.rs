@@ -77,7 +77,8 @@ fn policy(dir: &Path, upstream: SocketAddr) -> (PathBuf, String) {
         },
     )
     .unwrap();
-    let agent = enroll::add_agent(&path, "ci", None, &["echo".into()]).unwrap();
+    let agent =
+        enroll::add_agent(&path, "ci", None, enroll::Reach::Only(&["echo".into()])).unwrap();
     (path, agent.token)
 }
 

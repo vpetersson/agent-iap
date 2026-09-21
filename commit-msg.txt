@@ -1,39 +1,25 @@
-Two ways to say stop
+The default grant is deny too
 
-`ask` rules and a `deny` default make a policy that can be tightened one
-rule at a time. Neither covers the case where an operator wants it all to
-stop: getting back to "nothing is allowed" by hand means being sure about
-every rule rather than about one, and doing it while something is going
-wrong means editing TOML and waiting for a watcher.
+`acl_default` denies and `acl add` writes `ask`, so the rule list could not
+grant anything by accident. The gate in *front* of it still could. An agent's
+`targets` is what it may address at all, an absent one means every upstream
+and every MCP server this proxy fronts — including ones added later — and
+that was exactly what a bare `agent-iap agent add <id>` wrote. Same bug as
+the `acl add --action` default, one command over: the widest thing the flag
+can mean, handed out for saying nothing.
 
-Two commands, and the difference is what they outlive.
+`add_agent` now takes a `Reach` rather than a list where empty means
+everything, because "I did not say" and "I meant everything" being one
+missing flag apart is the shape the bug had. `--target` narrows,
+`--any-target` is the blanket grant asked for by name, and a bare `agent add`
+is refused with both spelled out. The console's enrol form gets the same
+switch and the same refusal.
 
-`agent-iap acl reset` deletes every `[[acl]]` rule and sets `acl_default`
-to `deny`. Both halves, because either alone still grants everything: rules
-under an `allow` default, or one surviving `allow` rule over a `deny` one.
-It asks first, refuses rather than assuming with no terminal to ask at, and
-prints the rules it removed by name — that being the last place they exist.
-`R` on the console's rules pane is the same edit.
+Reading is untouched: an absent `targets` still means any, so every policy
+file already written goes on meaning what it meant and nothing needs
+migrating. What changed is that a command can no longer write one by being
+left alone — and `agent-iap check` now names the agents that already hold a
+blanket grant, so an existing one is something you are told about rather than
+something you have to know to go looking for.
 
-`agent-iap run --lockdown` denies every request without touching the file.
-It decides before the rule list, so no rule can get in front of it, and it
-sits outside everything a reload swaps — a kill switch the agent's own
-`acl add` could lift is not one. `L` toggles it on the console, the header
-says LOCKDOWN in red while it is on, the audit log records the refusals
-against `<lockdown>`, and `/status` reports it read-only: the switch belongs
-on the operator's terminal, not behind an admin token.
-
-And the bell. An `ask` that nobody answers denies, which made the queue's
-usefulness depend on somebody happening to be looking at it — a console in
-a background window cannot be seen, but the terminal it is in can be heard.
-A parked request writes BEL, and what the terminal does with that is the
-operator's setting: a sound, a flashing window, a tmux flag, a notification.
-A burst is one ring rather than a dozen, since a dozen beeps is a sound
-people turn off. Off with `--no-bell`, `IAP_NO_BELL` or `approval_bell`,
-and never rung at a terminal nobody is watching.
-
-`clipboard`'s /dev/tty writer moves to `term`, since the bell wants the
-same handle for the same reason: neither is program output, and under the
-console ratatui owns stdout.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

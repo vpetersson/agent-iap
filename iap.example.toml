@@ -99,6 +99,9 @@ name = "Claude Code"
 # deliberately invalid: an unedited policy file should refuse to start, not come
 # up looking healthy with an agent that can never authenticate.
 token_sha256 = "REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token"
+# The hard scope, checked before the ACL. Leaving it out means *any* target
+# this proxy fronts, now and in future — which is a real thing to want, and
+# `agent-iap agent add --any-target` is how you say it on purpose.
 targets = ["anthropic", "github", "gcs", "github-mcp"]
 
 # --- what they may reach ---------------------------------------------------
