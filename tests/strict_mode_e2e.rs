@@ -1,16 +1,18 @@
-//! Getting back to "deny everything", in both of the ways that can be meant.
+//! Getting back to a policy you can reason about, in the ways that can be meant.
 //!
 //! A policy file grows. Rules get added to unblock something at four in the
 //! afternoon, `acl_default` gets flipped to `allow` "just to test", an agent
-//! ends up with a `*` it was never meant to keep. The floor this proxy
-//! promises — nothing matches, so nothing is allowed — is easy to write once
-//! and hard to get back to by hand, because getting back to it means being
-//! sure about *every* rule rather than about one.
+//! ends up with a `*` it was never meant to keep. Getting back from that by
+//! hand means being sure about *every* rule rather than about one.
 //!
-//! Two commands, and the difference between them is what they outlive:
+//! Three things, and the difference between them is what happens next:
 //!
-//! - `agent-iap acl reset` edits the file. It lasts, and the next `agent-iap
-//!   run` starts from it.
+//! - `agent-iap acl reset` empties the list and leaves the default asking, so
+//!   the traffic those rules were deciding arrives at a human instead and the
+//!   list is rebuilt from what actually shows up. It edits the file, so the
+//!   next `agent-iap run` starts from it.
+//! - `agent-iap acl reset --deny` is the same wipe with nothing asked: every
+//!   request refused, for keeps.
 //! - `agent-iap run --lockdown` edits nothing and refuses everything for as
 //!   long as that process runs, including anything an `ask` rule would
 //!   otherwise have parked on a human.
@@ -84,7 +86,7 @@ fn opened_up() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
-fn a_reset_puts_the_file_back_on_the_floor() {
+fn a_reset_empties_the_list_and_leaves_the_default_asking() {
     let (_dir, path) = opened_up();
 
     let output = agent_iap(&path, &["acl", "reset", "--yes"]);
@@ -98,20 +100,44 @@ fn a_reset_puts_the_file_back_on_the_floor() {
     assert!(config.acl.is_empty(), "every rule is gone");
     assert_eq!(
         config.acl_default.action,
-        Action::Deny,
-        "and the default that decides in their absence denies"
+        Action::Ask,
+        "and the default that decides in their absence asks"
     );
 
     // Weighed by the engine that will weigh it in production, rather than by
-    // reading the file back and believing it.
+    // reading the file back and believing it. A `deny` here would be the bug
+    // this is guarding: every one of these refused, and nobody asked.
     let acl = Acl::compile(&config).unwrap();
     for request in [
         AccessRequest::http("claude-code", "anthropic", "POST", "/v1/messages"),
         AccessRequest::http("claude-code", "github", "GET", "/repos/x"),
         AccessRequest::mcp("claude-code", "github", "tools/call", "create_issue"),
     ] {
-        assert_eq!(acl.evaluate(&request).action, Action::Deny, "{request:?}");
+        assert_eq!(acl.evaluate(&request).action, Action::Ask, "{request:?}");
     }
+    assert!(acl.can_ask(), "so a console has something to draw");
+}
+
+/// The quiet half, for when the answer really is "nothing, and stop asking me".
+#[test]
+fn a_strict_reset_denies_the_same_requests_without_asking() {
+    let (_dir, path) = opened_up();
+
+    let output = agent_iap(&path, &["acl", "reset", "--deny", "--yes"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = policy(&path);
+    assert!(config.acl.is_empty());
+    assert_eq!(config.acl_default.action, Action::Deny);
+
+    let acl = Acl::compile(&config).unwrap();
+    let request = AccessRequest::http("claude-code", "anthropic", "POST", "/v1/messages");
+    assert_eq!(acl.evaluate(&request).action, Action::Deny);
+    assert!(!acl.can_ask(), "and nothing will stop on a human");
 }
 
 /// What it took out, by name. This is the last place those rules exist, and
@@ -130,14 +156,18 @@ fn a_reset_says_what_it_removed() {
         "the default it replaced:\n{stdout}"
     );
     assert!(
+        stdout.contains("`ask`"),
+        "and the one that replaced it:\n{stdout}"
+    );
+    assert!(
         stdout.contains("agent-iap acl add"),
         "and the way back:\n{stdout}"
     );
 }
 
-/// The services stay. A panic button that also revoked every agent and
-/// forgot every upstream would be one nobody presses — and the state it left
-/// behind would take an afternoon to rebuild rather than a command.
+/// The services stay. A reset that also revoked every agent and forgot every
+/// upstream would be one nobody reaches for — and the state it left behind
+/// would take an afternoon to rebuild rather than a command.
 #[test]
 fn a_reset_touches_nothing_but_the_rules() {
     let (_dir, path) = opened_up();

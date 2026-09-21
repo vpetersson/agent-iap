@@ -325,7 +325,8 @@ enum Destructive {
     RemoveUpstream(String),
     RemoveMcpServer(String),
     RemoveRule(usize),
-    /// Strict mode: every rule out, `acl_default` back to `deny`.
+    /// Start over: every rule out, `acl_default` to `ask`, so the requests
+    /// that were being decided by those rules come back here to be answered.
     ResetAcl,
 }
 
@@ -1059,10 +1060,11 @@ impl App {
             (Tab::Acl, KeyCode::Char('R')) => {
                 let rules = self.state.acl.rule_count();
                 self.modal = Some(Modal::Confirm(Confirm {
-                    question: format!("Delete all {rules} rule(s) and set the default to deny?"),
-                    detail: "Strict mode: nothing matches, so every request is denied. This \
-                             is written to the policy file and outlives this process — `L` is \
-                             the one that only lasts as long as the proxy runs."
+                    question: format!("Delete all {rules} rule(s) and set the default to ask?"),
+                    detail: "Starting over: nothing matches, so every request stops here to be \
+                             answered, and a standing answer writes the rule back. This is \
+                             written to the policy file and outlives this process — `L` is the \
+                             one that denies everything, and only while the proxy runs."
                         .into(),
                     prune: None,
                     intent: Destructive::ResetAcl,
@@ -1381,10 +1383,10 @@ impl App {
                 ))
             }
             Destructive::ResetAcl => {
-                let reset = crate::enroll::reset_acl(&path)?;
+                let reset = crate::enroll::reset_acl(&path, crate::enroll::ResetTo::Ask)?;
                 Ok(format!(
-                    "strict mode — {} rule(s) removed, default was `{}` and is now `deny`; \
-                     everything is denied until a rule says otherwise",
+                    "started over — {} rule(s) removed, default was `{}` and is now `ask`; \
+                     every request stops here until a rule says otherwise",
                     reset.removed.len(),
                     reset.was_default,
                 ))
@@ -2217,7 +2219,7 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ("r", "re-read the policy file now — it is watched anyway"),
         (
             "R",
-            "on the rules pane: strict mode — delete every rule, default back to deny",
+            "on the rules pane: start over — delete every rule, default to ask",
         ),
         (
             "L",
@@ -4055,11 +4057,15 @@ action = "allow"
         app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
 
         assert_eq!(app.state.acl.rule_count(), 0, "in force, not just on disk");
-        assert_eq!(app.state.acl.default_action(), crate::config::Action::Deny);
+        // `ask`, not `deny`: the console is where the requests those rules
+        // were deciding now come to be answered, and a default that denied
+        // would make wiping the list the quietest thing in the program.
+        assert_eq!(app.state.acl.default_action(), crate::config::Action::Ask);
+        assert!(app.state.acl.can_ask());
         let config: crate::config::Config =
             toml::from_str(&std::fs::read_to_string(dir.path().join("iap.toml")).unwrap()).unwrap();
         assert!(config.acl.is_empty());
-        assert_eq!(config.acl_default.action, crate::config::Action::Deny);
+        assert_eq!(config.acl_default.action, crate::config::Action::Ask);
         assert!(!app.flash.as_ref().unwrap().failed);
     }
 
