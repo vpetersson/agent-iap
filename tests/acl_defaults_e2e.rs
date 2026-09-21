@@ -76,7 +76,10 @@ fn a_rule_added_with_nothing_but_defaults_prompts_rather_than_grants() {
         Action::Ask,
         "a bare `acl add` must not hand every agent every upstream"
     );
-    assert_eq!(config.acl_default.action, Action::Deny);
+    // The floor behind it. `init` writes `ask`, so an uncovered request is a
+    // question rather than a silence — the rule above is what must not be an
+    // `allow` in front of it.
+    assert_eq!(config.acl_default.action, Action::Ask);
 }
 
 /// And the decision that rule produces, weighed by the engine that will weigh
@@ -272,4 +275,87 @@ fn check_names_the_agents_that_already_hold_a_blanket_grant() {
 
     assert!(stdout.contains("may address every target"), "{stdout}");
     assert!(stdout.contains("wide"), "{stdout}");
+}
+
+/// The state the console's screenshot was taken in, reached the way it was
+/// actually reached: `init`, then services, and no rule written yet.
+///
+/// The fallthrough is the entire policy at that point, so what it says decides
+/// whether an operator sitting in front of the console sees the request or a
+/// silence. `deny` there was the reported bug — agents enrolled, upstreams
+/// enrolled, every call refused by `<default>`, nothing ever reaching the
+/// queue. `acl reset` had already been changed to write `ask`; the file this
+/// starts from never went through a reset.
+#[test]
+fn a_policy_with_services_but_no_rules_asks_rather_than_refusing_in_silence() {
+    let (_dir, path) = minimal_policy();
+
+    assert!(agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "github",
+            "--base-url",
+            "https://api.github.com",
+            "--auth",
+            "bearer",
+            "--secret",
+            "env:GITHUB_TOKEN",
+        ],
+    )
+    .status
+    .success());
+    assert!(
+        agent_iap(&path, &["agent", "add", "claude", "--target", "github"])
+            .status
+            .success()
+    );
+
+    let config = policy(&path);
+    assert!(config.acl.is_empty(), "nobody has written a rule yet");
+
+    // Weighed by the engine that weighs it in production rather than read off
+    // the file: this is the decision the proxy makes for the agent's first call.
+    let acl = Acl::compile(&config).unwrap();
+    let decision = acl.evaluate(&AccessRequest::http(
+        "claude",
+        "github",
+        "GET",
+        "/repos/acme/api",
+    ));
+    assert_eq!(
+        decision.action,
+        Action::Ask,
+        "a request nothing covers must reach a human, not a `<default>` refusal"
+    );
+}
+
+/// And where the file does say `deny` with nothing that can ask — an existing
+/// policy, or one written that way on purpose — the tools say so instead of
+/// leaving it to be worked out from the audit log.
+#[test]
+fn check_says_when_a_policy_can_never_ask() {
+    let (_dir, path) = minimal_policy();
+    assert!(agent_iap(&path, &["acl", "reset", "--deny", "--yes"])
+        .status
+        .success());
+
+    let stdout = String::from_utf8_lossy(&agent_iap(&path, &["check"]).stdout).into_owned();
+
+    assert!(
+        stdout.contains("nothing in this policy can ask"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("acl reset"),
+        "and how to change it: {stdout}"
+    );
+
+    // The inverse, so the warning cannot become something `check` always says.
+    assert!(agent_iap(&path, &["acl", "reset", "--yes"])
+        .status
+        .success());
+    let stdout = String::from_utf8_lossy(&agent_iap(&path, &["check"]).stdout).into_owned();
+    assert!(!stdout.contains("can ask"), "{stdout}");
 }

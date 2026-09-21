@@ -1226,6 +1226,21 @@ async fn run(
                 ),
                 None => eprintln!("no console and no control plane: `ask` denies immediately"),
             }
+        } else {
+            // The other half of the same sentence: this policy would not have
+            // parked a request even with a console attached.
+            let config = state.config();
+            if let Some(warning) =
+                verify::cannot_ask_warning(&config.acl, config.acl_default.action)
+            {
+                for line in verify::wrap(&warning, 78) {
+                    eprintln!("{line}");
+                }
+                for line in verify::wrap(verify::CANNOT_ASK_FIX, 78) {
+                    eprintln!("{line}");
+                }
+                eprintln!("{}", verify::CANNOT_ASK_COMMAND);
+            }
         }
     }
 
@@ -1511,7 +1526,19 @@ fn check(path: &Path) -> Result<()> {
 
     // Before the secrets, because a shape problem in the policy is worth
     // reporting even on a run that bails on an unresolvable credential.
-    for warning in verify::mcp_handshake_warnings(&config) {
+    // `check` indents a warning's continuation lines under its label, so the
+    // wrapping is this side's to decide: the shared sentence arrives as one
+    // paragraph.
+    let policy_warnings = verify::cannot_ask_warning(&config.acl, config.acl_default.action)
+        .map(|warning| {
+            let mut lines = verify::wrap(&warning, 66);
+            lines.extend(verify::wrap(verify::CANNOT_ASK_FIX, 66));
+            lines.push(verify::CANNOT_ASK_COMMAND.to_string());
+            lines.join("\n")
+        })
+        .into_iter()
+        .chain(verify::mcp_handshake_warnings(&config));
+    for warning in policy_warnings {
         println!();
         for (index, line) in warning.lines().enumerate() {
             // First line under the `warning` label, the rest aligned to it, so

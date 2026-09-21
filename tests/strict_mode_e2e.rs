@@ -76,9 +76,14 @@ fn opened_up() -> (tempfile::TempDir, PathBuf) {
         .status
         .success());
     }
-    let text = std::fs::read_to_string(&path)
-        .unwrap()
-        .replace("[acl_default]\naction = \"deny\"", "");
+    // Pinned with an assertion rather than replaced blind: a template that
+    // changes how it spells the fallthrough should fail here by name, not by
+    // leaving the old table in place and appending a second one — which parses
+    // as a duplicate key and reads as a bug in the code under test.
+    const INIT_DEFAULT: &str = "[acl_default]\naction = \"ask\"";
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(INIT_DEFAULT), "the `init` template moved");
+    let text = text.replace(INIT_DEFAULT, "");
     std::fs::write(&path, text + "\n[acl_default]\naction = \"allow\"\n").unwrap();
     assert_eq!(policy(&path).acl.len(), 2);
     assert_eq!(policy(&path).acl_default.action, Action::Allow);

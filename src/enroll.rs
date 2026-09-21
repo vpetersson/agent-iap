@@ -1792,7 +1792,7 @@ mod tests {
     /// How `init` spells the default. Held here so a template that changes
     /// its mind breaks the tests that edit it rather than silently appending
     /// a second `[acl_default]` and producing a file that does not parse.
-    const DEFAULT_TABLE: &str = "[acl_default]\naction = \"deny\"";
+    const DEFAULT_TABLE: &str = "[acl_default]\naction = \"ask\"";
 
     /// Edit `acl_default` in a written policy file, the way an operator
     /// reaching for a reset got there.
