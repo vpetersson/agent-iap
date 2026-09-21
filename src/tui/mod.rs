@@ -30,6 +30,7 @@
 mod actions;
 mod approve;
 mod browse;
+mod choose;
 mod form;
 mod views;
 
@@ -50,12 +51,14 @@ use std::time::{Duration, Instant};
 use crate::approval::{PendingView, Verdict};
 use crate::audit::AuditEvent;
 use crate::config::UpstreamConfig;
+use crate::list::Inventory;
 use crate::profiles::Profile;
 use crate::state::AppState;
 use crate::verify;
 
 use actions::Policy;
 use approve::{Answer, Dialogue};
+use choose::Candidate;
 use form::{Field, Form, Intent, Outcome};
 
 const FEED_CAPACITY: usize = 200;
@@ -1070,7 +1073,9 @@ impl App {
                 }
             }
 
-            (Tab::Acl, KeyCode::Char('n')) => self.modal = Some(Modal::Form(Box::new(rule_form()))),
+            (Tab::Acl, KeyCode::Char('n')) => {
+                self.modal = Some(Modal::Form(Box::new(rule_form(&self.policy.inventory))))
+            }
             // Shifted, and not the `x` beside it: `x` takes out the one rule
             // the cursor is on, and the key that takes out all of them should
             // not be the one a slipped finger reaches.
@@ -2234,7 +2239,8 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ),
         (
             "ctrl-o",
-            "on a credential field: pick the file, rather than typing its path",
+            "fill the field in from a list: the file a credential reference names, or the \
+             agents, upstreams and MCP servers an ACL rule can name",
         ),
         ("x", "remove what the cursor is on"),
         ("t", "mint a new token for the selected agent"),
@@ -2500,7 +2506,17 @@ fn report_text(report: &verify::Report) -> String {
     text
 }
 
-fn rule_form() -> Form {
+/// Add an ACL rule, against the names this policy file already holds.
+///
+/// Two of these fields — `agent` and `target` — are names written down a few
+/// lines further up the same file, and nothing checks them: a rule aimed at
+/// `github-api` when the upstream is called `github` is accepted, written and
+/// reloaded, and then matches nothing at all. With `acl_default = deny` behind
+/// it, that is an agent refused by a policy that visibly contains the rule
+/// which was supposed to let it through — the one mistake here with no
+/// symptom. So both fields offer what the file holds (`ctrl-o`), and stay text
+/// fields, because `*` and `claude-*` are legal values no list can hold.
+fn rule_form(inventory: &Inventory) -> Form {
     Form::new(
         Intent::Rule,
         "add an ACL rule",
@@ -2511,14 +2527,16 @@ fn rule_form() -> Form {
                 "name",
                 "shown in the audit log and here, so a decision traces to a rule",
             ),
-            Field::prefilled("agent", "agent", "agent id or glob", "*"),
+            Field::prefilled("agent", "agent", "agent id or glob", "*")
+                .offering("an agent", enrolled_agents(inventory)),
             Field::choice(
                 "kind",
                 "kind",
                 "which surface this rule covers",
                 &["*", "http", "mcp"],
             ),
-            Field::prefilled("target", "target", "upstream or MCP server name, or *", "*"),
+            Field::prefilled("target", "target", "upstream or MCP server name, or *", "*")
+                .offering("a target", enrolled_targets(inventory)),
             Field::prefilled(
                 "methods",
                 "methods",
@@ -2552,6 +2570,83 @@ fn rule_form() -> Form {
             ),
         ],
     )
+}
+
+/// The agents an ACL rule could be written against: `*`, then every one the
+/// file has enrolled, each beside what it is allowed to reach at all.
+///
+/// Empty when nothing is enrolled yet — `Field::offering` drops the
+/// affordance, because a picker offering only `*` is a picker that teaches
+/// nothing the prefilled field was not already saying.
+fn enrolled_agents(inventory: &Inventory) -> Vec<Candidate> {
+    let enrolled: Vec<Candidate> = inventory
+        .agents
+        .iter()
+        .flatten()
+        .map(|agent| {
+            // An agent's `targets` is the gate in front of the ACL: a rule
+            // naming a target this agent may not address is a rule that can
+            // never fire, and this is where that is visible.
+            let reach = match agent.targets.is_empty() {
+                true => "any target".to_string(),
+                false => agent.targets.join(", "),
+            };
+            let about = match agent.name == agent.id {
+                true => reach,
+                false => format!("{} — {reach}", agent.name),
+            };
+            Candidate::new(agent.id.clone(), about)
+        })
+        .collect();
+
+    with_star(enrolled, "every agent, including ones enrolled later")
+}
+
+/// The targets an ACL rule could be written against: `*`, then the upstreams
+/// and the MCP servers, each offered only for the `kind` it belongs to.
+///
+/// The `kind` filter is the point of listing them together. `kind = http` on a
+/// rule pointed at an MCP server is the same never-matching rule as a typo,
+/// and a form that offered the name anyway would be the console's own
+/// suggestion to write one.
+fn enrolled_targets(inventory: &Inventory) -> Vec<Candidate> {
+    let mut named: Vec<Candidate> = inventory
+        .upstreams
+        .iter()
+        .flatten()
+        .map(|upstream| {
+            Candidate::new(
+                upstream.name.clone(),
+                format!("upstream — {}", upstream.base_url),
+            )
+            .when("kind", &["*", "http"])
+        })
+        .collect();
+    named.extend(inventory.mcp_servers.iter().flatten().map(|server| {
+        Candidate::new(
+            server.name.clone(),
+            format!("mcp {} — {}", server.transport, server.endpoint),
+        )
+        .when("kind", &["*", "mcp"])
+    }));
+
+    with_star(
+        named,
+        "every upstream and MCP server, including ones added later",
+    )
+}
+
+/// `*` at the top of a list that has something in it, and nothing at all for
+/// one that does not. The glob goes first because it is the field's default:
+/// a picker opened on a rule that has not been narrowed yet should land on
+/// what the rule currently says.
+fn with_star(named: Vec<Candidate>, about: &str) -> Vec<Candidate> {
+    if named.is_empty() {
+        return Vec::new();
+    }
+    let mut all = vec![Candidate::new("*", about)];
+    all.extend(named);
+    all
 }
 
 fn profile_form(profile: &Profile) -> Form {
@@ -3622,7 +3717,7 @@ action = "allow"
     /// test that was missing when it did.
     #[test]
     fn the_rule_form_opens_on_ask_because_its_other_defaults_are_wide_open() {
-        let form = rule_form();
+        let form = rule_form(&Inventory::default());
 
         assert_eq!(form.text("agent"), "*");
         assert_eq!(form.text("target"), "*");
@@ -3633,6 +3728,209 @@ action = "allow"
             "ask",
             "a rule this wide stops on a human, it does not wave the request through"
         );
+    }
+
+    /// A policy file with an agent, an upstream and an MCP server in it, for
+    /// the tests about writing a rule against those names.
+    const POLICY_WITH_MCP: &str = r#"
+[audit]
+path = "AUDIT"
+stderr = false
+
+[[agents]]
+id = "claude-code"
+name = "Claude Code"
+token_sha256 = "HASH"
+
+[[upstreams]]
+name = "github"
+base_url = "https://api.github.com"
+
+[[mcp_servers]]
+name = "linear"
+transport = "stdio"
+command = "linear-mcp"
+args = ["--stdio"]
+"#;
+
+    /// The names in an ACL rule are the ones written further up the same file,
+    /// and a rule that misspells one matches nothing — silently, which with
+    /// `acl_default = deny` looks exactly like a policy working as written. So
+    /// the form offers them, end to end over the keyboard.
+    #[tokio::test]
+    async fn a_rule_can_be_written_by_picking_the_names_the_file_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), POLICY_WITH_MCP);
+        app.tab = Tab::Acl;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // name -> agent
+
+        app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .unwrap();
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            rendered.contains("claude-code") && rendered.contains("Claude Code"),
+            "the enrolled agent is offered, beside what it is: {rendered}"
+        );
+
+        type_in(&mut app, "claude");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("picking a name must not submit the form it was opened from");
+        };
+        assert_eq!(form.text("agent"), "claude-code");
+
+        // And the same for the target, which is the other half of the rule.
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // -> kind
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // -> target
+        app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .unwrap();
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            rendered.contains("api.github.com"),
+            "an upstream is offered by name and by the host it fronts: {rendered}"
+        );
+        type_in(&mut app, "github");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        // The rule writes, and the proxy it was written into agrees with it.
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
+        assert!(written.contains("agent = \"claude-code\""), "{written}");
+        assert!(written.contains("target = \"github\""), "{written}");
+    }
+
+    /// `kind` decides which names can match at all: an MCP server under
+    /// `kind = "http"` is the same never-firing rule as a typo, so the picker
+    /// does not offer one. A console that suggested it would be suggesting the
+    /// mistake this picker exists to prevent.
+    #[tokio::test]
+    async fn the_target_picker_offers_only_what_the_rules_kind_can_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), POLICY_WITH_MCP);
+        app.tab = Tab::Acl;
+        app.clamp_cursors();
+
+        for (kind, offered, withheld) in [
+            ("*", "github", None),
+            ("http", "github", Some("linear")),
+            ("mcp", "linear", Some("github")),
+        ] {
+            app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+            if let Some(Modal::Form(form)) = &mut app.modal {
+                set(form, "kind", kind);
+                let at = form
+                    .fields
+                    .iter()
+                    .position(|field| field.key == "target")
+                    .unwrap();
+                form.focus(at);
+            }
+            app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .unwrap();
+            assert!(
+                matches!(&app.modal, Some(Modal::Form(form)) if form.browsing()),
+                "`ctrl-o` on the target field opens the picker"
+            );
+
+            let rendered = render(&mut app, 120, 34);
+            assert!(
+                rendered.contains(offered),
+                "`kind = {kind}` should offer `{offered}`: {rendered}"
+            );
+            if let Some(withheld) = withheld {
+                assert!(
+                    !rendered.contains(withheld),
+                    "`kind = {kind}` cannot match `{withheld}`, so it must not be offered: \
+                     {rendered}"
+                );
+            }
+            app.handle(KeyEvent::from(KeyCode::Esc)).unwrap(); // the picker
+            app.handle(KeyEvent::from(KeyCode::Esc)).unwrap(); // the form
+        }
+    }
+
+    /// Everything drawn with a key on it is a button here, so both places the
+    /// offer appears have to open the picker — and a row of the picker has to
+    /// take a double-click, as every other list in this console does.
+    #[tokio::test]
+    async fn every_drawn_choose_affordance_opens_the_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), POLICY_WITH_MCP);
+        app.tab = Tab::Acl;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // name -> agent
+
+        render(&mut app, 120, 34);
+        let targets = app.hits.form.as_ref().unwrap().browse.clone();
+        assert_eq!(
+            targets.len(),
+            2,
+            "the offer belongs on the field's own line and in the key row"
+        );
+        for rect in targets {
+            app.click((rect.x + 1, rect.y), false).unwrap();
+            assert!(
+                matches!(&app.modal, Some(Modal::Form(form)) if form.browsing()),
+                "a click at {rect:?} left the picker shut"
+            );
+            app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+        }
+
+        // And the list itself: the second row is the enrolled agent, under `*`.
+        app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .unwrap();
+        render(&mut app, 120, 34);
+        let rows = app
+            .hits
+            .form
+            .as_ref()
+            .and_then(|hits| hits.browser.clone())
+            .expect("the picker reports its rows")
+            .rows;
+        let (row, _) = rows[1];
+        app.click((row.x + 2, row.y), true).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("a double-click on a name fills the field, it does not save the form");
+        };
+        assert_eq!(form.text("agent"), "claude-code");
+
+        // Now that the field holds a name somebody chose, the offer comes off
+        // it — as it does for a path — and the key row keeps the way back.
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.contains("claude-code") && line.contains("ctrl-o")),
+            "nothing should sit against a value the operator chose: {rendered}"
+        );
+        assert_eq!(
+            app.hits.form.as_ref().unwrap().browse.len(),
+            1,
+            "the key row still offers the list, so the choice can be changed"
+        );
+    }
+
+    /// A picker with nothing behind it is not announced. The first rule in a
+    /// fresh file is written against a policy that names nothing yet, and a
+    /// `ctrl-o` that opens an empty box teaches less than the prefilled `*`
+    /// already said.
+    #[test]
+    fn a_policy_that_names_nothing_yet_offers_nothing() {
+        let form = rule_form(&Inventory::default());
+        for key in ["agent", "target"] {
+            let field = form
+                .fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("no `{key}` field on this form"));
+            assert!(
+                field.offers.is_empty(),
+                "`{key}` offered a list built from an empty policy file"
+            );
+        }
     }
 
     /// The daemon reloads; the console follows.

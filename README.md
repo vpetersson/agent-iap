@@ -1026,6 +1026,19 @@ anything else, since `~/.ssh`, `~/.config` and `.env` are nearly the whole
 answer to where such a file is kept. Nothing is read: the picker lists names,
 and the file is opened for the first time by the proxy resolving it.
 
+`n` on the acl pane offers the names the file already holds. An ACL rule's
+`agent` and `target` are the id of an enrolled agent and the name of an upstream
+or an MCP server, written down a few lines further up the same file — and
+nothing checks them: a rule aimed at `github-api` when the upstream is called
+`github` is accepted, written and reloaded, and then matches nothing at all.
+Behind `acl_default = deny` that is an agent refused by a policy which visibly
+contains the rule that was supposed to let it through, and it is the one mistake
+here with no symptom. So `ctrl-o` on either field lists what the file holds —
+each name beside what it is, an agent's targets, an upstream's base URL, an MCP
+server's command — and only what the rule's `kind` can actually match, since an
+MCP server under `kind = "http"` is the same never-firing rule as a typo. Both
+stay text fields: `*` and `claude-*` are legal values that no list can hold.
+
 It answers the mouse. Click a tab to change pane, a row to select it, twice to
 open it. The wheel scrolls the pane, and the scope list when the dialogue is up.
 The footer's key hints are buttons. All of it ends in the handler the keyboard
