@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use agent_iap::audit;
 use agent_iap::clipboard;
-use agent_iap::config::Config;
+use agent_iap::config::{Action, Config};
 use agent_iap::enroll;
 use agent_iap::identity;
 use agent_iap::init::{self, InitOptions, Template};
@@ -326,18 +326,23 @@ struct VerifyArg {
 enum UpstreamCommand {
     /// Add a service the proxy fronts, and the credential it attaches.
     ///
-    /// Either start from a profile — `--profile github` brings the base URL,
-    /// the credential scheme and a reviewed set of ACL rules with it — or spell
-    /// the service out with `--base-url` and the credential flags.
-    /// `agent-iap profile list` shows every profile there is.
+    /// Either start from a profile — `--profile github` brings the base URL and
+    /// the credential scheme with it — or spell the service out with
+    /// `--base-url` and the credential flags. `agent-iap profile list` shows
+    /// every profile there is.
+    ///
+    /// Either way this grants nothing: what an agent may do with the service is
+    /// a separate decision, taken at the console when it first calls, or up
+    /// front with `acl add` or `--profile … --grant`.
     Add {
         /// Routing prefix and policy name: agents call `/<name>/<path>`.
         name: String,
         #[command(flatten)]
         config: ConfigArg,
         /// Start from a profile, from `agent-iap profile list`. Supplies the
-        /// base URL, the credential scheme and the ACL rules; the credential
-        /// itself is still yours to name with `--secret`.
+        /// base URL and the credential scheme; the credential itself is still
+        /// yours to name with `--secret`, and the rules are still nobody's
+        /// until `--grant` or an answer at the console writes them.
         #[arg(long, value_name = "ID")]
         profile: Option<String>,
         /// Where the proxy forwards to, e.g. `https://api.anthropic.com`.
@@ -353,16 +358,25 @@ enum UpstreamCommand {
         // variant of this enum, `rm` most of all.
         #[command(flatten)]
         auth: Box<AuthFlags>,
-        /// With `--profile`: which bundle of scopes and rules to write.
-        /// Defaults to the narrowest the profile offers.
+        /// With `--profile`: which bundle of scopes the credential is minted
+        /// with, and which rules `--grant` would write. Defaults to the
+        /// narrowest the profile offers.
         #[arg(long, value_name = "LEVEL", requires = "profile")]
         access: Option<String>,
+        /// With `--profile`: also write the access level's ACL rules — a
+        /// standing `allow` for every call they cover.
+        ///
+        /// Off by default. Without it the service is enrolled and nothing is
+        /// permitted: the first call stops at the `agent-iap run` console and
+        /// the rule is written from the answer.
+        #[arg(long, requires = "profile")]
+        grant: bool,
         /// With `--profile`: a profile variable, `name=value`. Repeatable.
         #[arg(long = "var", value_name = "NAME=VALUE", requires = "profile")]
         vars: Vec<String>,
-        /// With `--profile`: scope the rules to one agent or glob. Defaults to
-        /// every agent.
-        #[arg(long, value_name = "ID", requires = "profile")]
+        /// With `--grant`: scope the granted rules to one agent or glob.
+        /// Defaults to every agent.
+        #[arg(long, value_name = "ID", requires = "grant")]
         agent: Option<String>,
         /// With `--profile`: print the TOML that would be appended, and write
         /// nothing.
@@ -492,7 +506,9 @@ enum ProfileCommand {
         /// Profile id, from `agent-iap profile list`.
         id: String,
     },
-    /// Add a profile's service and rules to the policy file.
+    /// Add a profile's service to the policy file. Grants nothing without
+    /// `--grant`: the first call stops at the console, and the rule is written
+    /// from the answer.
     Add {
         /// Profile id, from `agent-iap profile list`.
         id: String,
@@ -505,15 +521,25 @@ enum ProfileCommand {
         /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
         #[arg(long, value_name = "REF")]
         secret: Option<String>,
-        /// Which bundle of scopes and rules to write. Defaults to the
-        /// narrowest the profile offers.
+        /// Which bundle of scopes the credential is minted with, and which
+        /// rules `--grant` would write. Defaults to the narrowest the profile
+        /// offers.
         #[arg(long, value_name = "LEVEL")]
         access: Option<String>,
+        /// Also write the access level's ACL rules — a standing `allow` for
+        /// every call they cover.
+        ///
+        /// Off by default. Without it the service is enrolled and nothing is
+        /// permitted: the first call stops at the `agent-iap run` console and
+        /// the rule is written from the answer.
+        #[arg(long)]
+        grant: bool,
         /// Profile variable, `name=value`. Repeatable.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         vars: Vec<String>,
-        /// Scope the rules to one agent or glob. Defaults to every agent.
-        #[arg(long, value_name = "ID")]
+        /// With `--grant`: scope the granted rules to one agent or glob.
+        /// Defaults to every agent.
+        #[arg(long, value_name = "ID", requires = "grant")]
         agent: Option<String>,
         /// Print the TOML that would be appended, and write nothing.
         #[arg(long)]
@@ -950,6 +976,7 @@ fn main() -> Result<()> {
             base_url,
             auth,
             access,
+            grant,
             vars,
             agent,
             dry_run,
@@ -962,6 +989,7 @@ fn main() -> Result<()> {
             base_url,
             auth,
             access,
+            grant,
             vars,
             agent,
             dry_run,
@@ -989,6 +1017,7 @@ fn main() -> Result<()> {
             name,
             secret,
             access,
+            grant,
             vars,
             agent,
             dry_run,
@@ -1002,6 +1031,7 @@ fn main() -> Result<()> {
                 access,
                 vars,
                 agent,
+                grant,
                 dry_run,
             },
             verify,
@@ -1776,25 +1806,36 @@ fn init_config(options: &InitOptions, clipboard: ClipboardArg) -> Result<()> {
     let (Some(agent), Some(token)) = (written.agent.as_deref(), written.token.as_deref()) else {
         // The minimal template. Nothing was granted, so the useful thing to
         // print is the shortest path to a proxy that does something.
+        // Not "denies everything": the template it just wrote has
+        // `acl_default = "ask"`, so an uncovered call stops on a human. Reading
+        // the file back is cheaper than keeping this sentence in step with the
+        // template by hand.
         println!(
-            "Wrote {path}. No agents, no upstreams — the proxy starts and denies everything.\n"
+            "Wrote {path}. No agents, no upstreams, and nothing granted:\n\
+             a call {}.\n",
+            verify::fallthrough_clause(enroll::acl_default(&written.path)?)
         );
-        // A profile first, because it writes the ACL rules too — and the rules
-        // are the half of this that is easy to get wrong quietly.
-        println!("Add what it should front. From a profile, service and rules together:");
+        // A profile first, because it brings the endpoint and the credential
+        // scheme with it. It grants nothing on its own: the first call is the
+        // one that asks.
+        println!("Add what it should front. From a profile:");
         println!("  agent-iap profile list");
         println!(
             "  agent-iap upstream add anthropic --profile anthropic --secret env:ANTHROPIC_API_KEY"
         );
         println!("  agent-iap agent add claude-code --target anthropic\n");
-        println!("Or spell the service out, and say what it may do:");
+        println!("Or spell the service out:");
         println!(
             "  agent-iap upstream add anthropic --base-url https://api.anthropic.com \\\n             \x20     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY"
         );
-        println!(
-            "  agent-iap acl add --target anthropic --methods POST --paths /v1/messages \\\n             \x20     --action allow"
-        );
         println!("  agent-iap agent add claude-code --target anthropic\n");
+        println!(
+            "Either way nothing is permitted until you say so — at the console when the\n\
+             agent calls, or up front:"
+        );
+        println!(
+            "  agent-iap acl add --target anthropic --methods POST --paths /v1/messages \\\n             \x20     --action allow\n"
+        );
         println!("Then:");
         println!("  agent-iap check{flag}   # resolves every credential reference");
         println!("  agent-iap run{flag}       # the approval console");
@@ -1974,6 +2015,7 @@ struct AddUpstream {
     base_url: Option<String>,
     auth: Box<AuthFlags>,
     access: Option<String>,
+    grant: bool,
     vars: Vec<String>,
     agent: Option<String>,
     dry_run: bool,
@@ -1989,6 +2031,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
         base_url,
         auth,
         access,
+        grant,
         vars,
         agent,
         dry_run,
@@ -1997,9 +2040,10 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     } = options;
 
     // A profile is the same enrolment with the vendor's half already answered,
-    // so it goes to the same place `profile add` does — including the ACL
-    // rules, which are the part of a service definition nobody enjoys writing
-    // and the part that decides what the agent can actually do.
+    // so it goes to the same place `profile add` does. The vendor's half is the
+    // endpoint, the credential scheme and the scopes; what the agent may do
+    // with them is this deployment's half, and stays unanswered until somebody
+    // here answers it.
     if let Some(id) = profile {
         return add_upstream_from_profile(
             &path,
@@ -2012,6 +2056,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
                 access,
                 vars,
                 agent,
+                grant,
                 dry_run,
             },
             verify,
@@ -2026,17 +2071,52 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     enroll::add_upstream(&path, &name, &base_url, &auth, &headers)?;
     println!("Added upstream `{name}` to {}.", path.display());
     println!("Agents reach it at `/{name}/<path>`.");
-    if enroll::rule_count(&path)? == 0 {
-        println!(
-            "\nNo `[[acl]]` rules yet, so it is not reachable. Allow something with:\n  \
-             agent-iap acl add --target {name} --methods GET --paths '/**' --action allow"
-        );
-    }
+    print!("{}", first_call_notice(&path, &name)?);
     verify_after_write(&path, &name, verify)
 }
 
-/// `upstream add --profile <id>`: the profile's service and rules, under the
-/// name this command was given.
+/// What the first call to a freshly enrolled service will actually meet.
+///
+/// Read out of the policy file, never asserted about it. "No `[[acl]]` rules,
+/// so it is not reachable" was the third time a message here guessed at the
+/// effect of an empty rule list and guessed wrong — with `acl_default = ask`,
+/// which is what `init` writes, an uncovered call is not refused, it stops on a
+/// human. Guessing the other way is worse: the line it replaces went on to
+/// suggest `--action allow`, which is the standing grant this enrolment
+/// deliberately did not write.
+///
+/// Ends with a newline when it says anything at all.
+fn first_call_notice(path: &Path, name: &str) -> Result<String> {
+    let config = enroll::policy(path)?;
+    // One diagnosis: the same one `check`, the headless banner and the console
+    // show for a policy that can never stop a request on a human.
+    if let Some(warning) = verify::cannot_ask_warning(&config.acl, config.acl_default.action) {
+        // The shared sentence arrives as one paragraph; how wide it is drawn is
+        // this surface's to decide, and here it is a terminal.
+        let mut lines = verify::wrap(
+            &format!("Nothing is granted to `{name}` — and {warning}"),
+            78,
+        );
+        lines.extend(verify::wrap(verify::CANNOT_ASK_FIX, 78));
+        lines.push(verify::CANNOT_ASK_COMMAND.to_string());
+        return Ok(format!("\n{}\n", lines.join("\n")));
+    }
+    if config.acl_default.action == Action::Allow {
+        return Ok(format!(
+            "\nWARNING: `acl_default` is allow, so every agent can already call `{name}` and \n\
+             nothing here narrows it. `agent-iap acl reset` makes the fallthrough a question.\n"
+        ));
+    }
+    Ok(format!(
+        "\nNothing is granted to `{name}` yet: a call to it falls through to `acl_default` \
+         and\n{} — and the rule is written from your answer, for the\nagent that asked and \
+         the call it asked for.\n",
+        verify::fallthrough_clause(config.acl_default.action)
+    ))
+}
+
+/// `upstream add --profile <id>`: the profile's service, under the name this
+/// command was given — and its rules only if `--grant` asked for them.
 ///
 /// Refuses an MCP profile rather than quietly writing an `[[mcp_servers]]`
 /// entry from a command called `upstream add` — the two share one name space,
@@ -2134,17 +2214,19 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
     let auth = auth.to_spec()?;
     enroll::add_mcp_server(&path, &name, &transport, &auth)?;
     println!("Added MCP server `{name}` to {}.", path.display());
-    if enroll::rule_count(&path)? == 0 {
-        println!(
-            "\nNo `[[acl]]` rules yet, so it is not reachable — and an MCP server needs two \
-             kinds of rule:\n  \
-             agent-iap acl add --kind mcp --target {name} --methods initialize \\\n    \
-                 --methods 'notifications/*' --methods ping --methods 'tools/list' \\\n    \
-                 --paths '**' --action allow\n  \
-             agent-iap acl add --kind mcp --target {name} --methods 'tools/call' \\\n    \
-                 --paths 'get_*' --action allow"
-        );
-    }
+    print!("{}", first_call_notice(&path, &name)?);
+    // The one thing that is specific to MCP and has no symptom when it is got
+    // wrong: `initialize` names no tool, so a policy holding only tool-scoped
+    // rules is a server whose session never opens.
+    println!(
+        "\nWriting the rules up front instead takes two, in this order — `initialize` names \
+         no\ntool, so a tool-scoped rule alone is a handshake denied by `<default>`:\n  \
+         agent-iap acl add --kind mcp --target {name} --methods initialize \\\n    \
+             --methods 'notifications/*' --methods ping --methods 'tools/list' \\\n    \
+             --paths '**' --action allow\n  \
+         agent-iap acl add --kind mcp --target {name} --methods 'tools/call' \\\n    \
+             --paths 'get_*' --action allow"
+    );
     verify_after_write(&path, &name, verify)
 }
 
@@ -2612,7 +2694,15 @@ fn show_profile(id: &str) -> Result<()> {
         }
     }
 
-    println!("\nACCESS LEVELS  (the first is the default)");
+    // The scopes are written whichever level is picked; the rules under them
+    // are not written at all unless `--grant` asks. Saying so here is the
+    // difference between a catalogue entry and a promise.
+    println!(
+        "\nACCESS LEVELS  (the first is the default)\n  \
+         The scopes are minted with the credential. The rules are what `--grant` would\n  \
+         write — without it the service is enrolled and nothing is permitted, and the\n  \
+         first call is the one that asks."
+    );
     for level in &profile.access {
         println!("  {}  —  {}", level.name, level.about);
         for scope in &level.scopes {
@@ -2630,8 +2720,9 @@ fn show_profile(id: &str) -> Result<()> {
 
     if profile.service.kind() == "mcp" {
         println!(
-            "\n  Every MCP profile also writes a session rule allowing {} —\n  \
-             without it `initialize` falls through to the default and the handshake fails.",
+            "\n  With `--grant`, an MCP profile writes a session rule allowing {} in front\n  \
+             of the tool rules: `initialize` names no tool, so tool-scoped rules alone are a\n  \
+             server whose handshake is denied by `<default>`.",
             profiles::MCP_SESSION_METHODS.join(", ")
         );
     }
@@ -2679,10 +2770,24 @@ fn add_from_profile(
     for scope in &added.scopes {
         println!("  scope     {scope}");
     }
-    println!("  rules     {}", added.rules.join(", "));
+    if added.granted {
+        println!("  rules     {}", added.rules.join(", "));
+    }
 
     if let Some(note) = &added.note {
         println!("\n{note}");
+    }
+
+    // The access level picked the scopes whether or not it wrote a rule, so
+    // saying "access level `read`" and stopping would read as a grant. What
+    // was and was not permitted is the whole of what this command decided.
+    if !added.granted {
+        print!("{}", first_call_notice(path, &added.name)?);
+        println!(
+            "\n  agent-iap profile add {} --as {} --access {} --grant\n  \
+             # the reviewed rules for this level, as a standing grant, if that is what you want",
+            profile.id, added.name, added.access
+        );
     }
 
     println!(

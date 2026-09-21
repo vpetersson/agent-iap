@@ -1231,7 +1231,7 @@ fn render(key: &str, entry: Table) -> String {
 /// "rule 3 of 3" is the difference between a rule that applies and one that an
 /// earlier `deny` already shadowed.
 pub fn rule_count(path: &Path) -> Result<usize> {
-    Ok(document_config(&read(path)?)?.acl.len())
+    Ok(policy(path)?.acl.len())
 }
 
 /// What an unmatched request falls through to, as the file has it.
@@ -1242,7 +1242,17 @@ pub fn rule_count(path: &Path) -> Result<usize> {
 /// would be confidently wrong in exactly the state an operator reached for a
 /// reset to get into.
 pub fn acl_default(path: &Path) -> Result<Action> {
-    Ok(document_config(&read(path)?)?.acl_default.action)
+    Ok(policy(path)?.acl_default.action)
+}
+
+/// The policy as the file has it, parsed.
+///
+/// For the caller that has to describe what the file it just wrote will now do
+/// and needs the rules as well as the default — `verify::cannot_ask_warning`
+/// reads both. The two accessors above are this call, narrowed, so there is
+/// still only one answer to "what does this file say".
+pub fn policy(path: &Path) -> Result<Config> {
+    document_config(&read(path)?)
 }
 
 /// A rule as `agent-iap list acl` identifies it: the number `acl rm` takes, and

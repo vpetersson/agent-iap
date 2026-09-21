@@ -240,10 +240,26 @@ pub struct AddOptions {
     /// Credential reference. Required unless the profile needs none.
     pub secret: Option<String>,
     /// Access level; defaults to the profile's first, which is the narrowest.
+    ///
+    /// It decides the OAuth scopes the credential is minted with whether or not
+    /// anything is granted, and it decides the rules `grant` writes.
     pub access: Option<String>,
     pub vars: Vec<String>,
-    /// Restrict the rules to one agent. Defaults to every agent.
+    /// Restrict the rules to one agent. Defaults to every agent. Read only
+    /// when `grant` is set — without it there are no rules to scope.
     pub agent: Option<String>,
+    /// Write the access level's ACL rules along with the service.
+    ///
+    /// Off, because enrolling a service is not the same act as granting an
+    /// agent standing access to it, and doing both on one command is how a
+    /// proxy whose whole point is `ask` came to answer its first real request
+    /// with `allow` and nobody asked (SIRI-197). Left off, the service is
+    /// enrolled and nothing is permitted: the first call falls through to
+    /// `acl_default`, stops on a human at the console, and the rule is written
+    /// from the answer — for the agent that actually asked and the path it
+    /// actually asked for. On, this writes the reviewed bundle up front, which
+    /// is a standing `allow` and therefore something a human has to type.
+    pub grant: bool,
     /// Print what would be written and write nothing.
     pub dry_run: bool,
 }
@@ -264,7 +280,12 @@ pub struct Added {
     pub kind: &'static str,
     pub endpoint: String,
     pub access: String,
+    /// The rules written, which is nothing at all unless `grant` was asked for.
     pub rules: Vec<String>,
+    /// Whether `grant` was asked for — so a caller can tell "you asked for the
+    /// rules and here they are" from "nothing is permitted yet", rather than
+    /// inferring it from an empty list an access level could also produce.
+    pub granted: bool,
     pub scopes: Vec<String>,
     pub note: Option<String>,
     /// The TOML a `dry_run` would have written. Returned rather than printed
@@ -324,26 +345,13 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
     // profile: two PostHog accounts on one proxy would otherwise produce two
     // sets of rules with identical names in the audit log.
     let agent = options.agent.clone().unwrap_or_else(|| "*".to_string());
-    let mut rules: Vec<PlannedRule> = Vec::new();
-    if service.kind() == "mcp" {
-        // First, so it is matched before any tool-scoped rule can shadow it.
-        rules.push(PlannedRule {
-            name: format!("{name}-session"),
-            kind: "mcp".to_string(),
-            methods: MCP_SESSION_METHODS.iter().map(|m| m.to_string()).collect(),
-            paths: vec!["**".to_string()],
-            action: "allow".to_string(),
-        });
-    }
-    for rule in &access.rules {
-        rules.push(PlannedRule {
-            name: format!("{name}-{}", rule.suffix),
-            kind: service.kind().to_string(),
-            methods: rule.methods.clone(),
-            paths: rule.paths.clone(),
-            action: rule.action.clone(),
-        });
-    }
+    // Empty unless `grant` was asked for. The access level still decided the
+    // scopes above either way — what it no longer decides on its own is
+    // whether an agent may call.
+    let rules = match options.grant {
+        true => planned_rules(&name, &service, access),
+        false => Vec::new(),
+    };
 
     let added = Added {
         name: name.clone(),
@@ -351,6 +359,7 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
         endpoint: service.endpoint(),
         access: access.name.clone(),
         rules: rules.iter().map(|rule| rule.name.clone()).collect(),
+        granted: options.grant,
         scopes: access.scopes.clone(),
         note: profile.note.clone(),
         plan: None,
@@ -419,11 +428,52 @@ fn render_plan(
         auth,
     ));
     plan.push('\n');
+    if rules.is_empty() {
+        // An empty `[[acl]]` section is the whole point of the default, and a
+        // plan that just stops after the service looks like one that forgot to
+        // print the rest.
+        plan.push_str(
+            "# no `[[acl]]` rules: nothing is permitted yet, and the first call\n\
+             # falls through to `acl_default`. `--grant` writes the access\n\
+             # level's rules here instead.\n",
+        );
+        return plan;
+    }
     for rule in rules {
         plan.push_str(&enroll::render_rule(&planned_spec(rule, agent, name)));
         plan.push('\n');
     }
     plan
+}
+
+/// The access level's rules, named after the service as it was actually added.
+///
+/// Only ever called for a `--grant`: these are standing `allow` rules, and
+/// nothing but a human asking writes one.
+fn planned_rules(name: &str, service: &Service, access: &Access) -> Vec<PlannedRule> {
+    let mut rules: Vec<PlannedRule> = Vec::new();
+    if service.kind() == "mcp" {
+        // First, so it is matched before any tool-scoped rule can shadow it.
+        // `initialize` names no tool, so a file holding only the tool-scoped
+        // rules below is one where the session never opens.
+        rules.push(PlannedRule {
+            name: format!("{name}-session"),
+            kind: "mcp".to_string(),
+            methods: MCP_SESSION_METHODS.iter().map(|m| m.to_string()).collect(),
+            paths: vec!["**".to_string()],
+            action: "allow".to_string(),
+        });
+    }
+    for rule in &access.rules {
+        rules.push(PlannedRule {
+            name: format!("{name}-{}", rule.suffix),
+            kind: service.kind().to_string(),
+            methods: rule.methods.clone(),
+            paths: rule.paths.clone(),
+            action: rule.action.clone(),
+        });
+    }
+    rules
 }
 
 /// A profile's rule, in the shape `enroll` writes. Profiles grant standing

@@ -463,6 +463,17 @@ struct Said {
     ok: Option<String>,
     /// Was the policy file written before this reload was asked for?
     wrote: bool,
+    /// A service to call once this reload has landed, and only then.
+    ///
+    /// The form's own `verify` step used to run the moment the write returned.
+    /// That was correct while the reload was inline; once it moved onto a
+    /// thread of its own the console was left verifying against the policy from
+    /// *before* the write, and a service that had just been added was one
+    /// `verify::target` had never heard of — "`linear` is neither an upstream
+    /// nor an MCP server", on the screen where the operator had just added
+    /// `linear`. So the verification rides on the reload and starts when the
+    /// new policy is in force (SIRI-197).
+    then_verify: Option<String>,
 }
 
 impl Said {
@@ -471,14 +482,16 @@ impl Said {
         Said {
             ok: Some(ok.into()),
             wrote: false,
+            then_verify: None,
         }
     }
 
     /// A reload that follows a write, whose own message is already on screen.
-    fn after_a_write() -> Self {
+    fn after_a_write(then_verify: Option<String>) -> Self {
         Said {
             ok: None,
             wrote: true,
+            then_verify,
         }
     }
 }
@@ -805,10 +818,19 @@ impl App {
                 if let Some(ok) = said.ok {
                     self.say(ok);
                 }
+                // The policy just written is the one in force now, so this is
+                // the first moment the service exists to be called.
+                if let Some(name) = said.then_verify {
+                    self.verify(name);
+                }
             }
             // What a refusal means depends on what was done before it. After a
             // write it is the worse story — see `stale`. On `r` it is a refused
             // reload and nothing else.
+            // A refused reload leaves the running proxy on the old policy, so
+            // there is nothing new to call: verifying here would report on a
+            // service this process is not serving. `stale` is the louder
+            // problem and says so.
             Err(error) if said.wrote => self.stale(&error),
             Err(error) => self.blame(&error),
         }
@@ -1502,14 +1524,16 @@ impl App {
                             // hearing: a refused one leaves these panes showing
                             // the policy from before the write.
                             self.say(effect.message);
-                            self.reload(Said::after_a_write());
-                            // Before the modals below, so the report lands on a
-                            // console that is not already showing a token: the
-                            // token is the one thing that is only on screen
-                            // once, and nothing may cover it.
-                            if let Some(name) = effect.verify {
-                                self.verify(name);
-                            }
+                            // The verification rides on the reload rather than
+                            // starting here: this policy is the one from before
+                            // the write, and a service that is not in it yet is
+                            // one `verify` reports as neither an upstream nor
+                            // an MCP server. It still lands before it could
+                            // cover the modals below — `verification_landed`
+                            // refuses to draw over anything already on screen,
+                            // and the token is the one thing that is only shown
+                            // once.
+                            self.reload(Said::after_a_write(effect.verify));
                             if let Some((id, token)) = effect.token {
                                 let body = format!(
                                     "{token}\n\nGive this to the agent as IAP_TOKEN. It is not an \
@@ -1552,7 +1576,7 @@ impl App {
                     Err(error) => self.blame(&error),
                     Ok(message) => {
                         self.say(message);
-                        self.reload(Said::after_a_write());
+                        self.reload(Said::after_a_write(None));
                     }
                 }
             }
@@ -1672,7 +1696,7 @@ impl App {
                         // governing anything, which is the last thing to tell
                         // somebody who just chose "from now on", so `stale`
                         // still says it when the reload comes back.
-                        self.reload(Said::after_a_write());
+                        self.reload(Said::after_a_write(None));
                         let until = match ttl {
                             Some(ttl) => format!(
                                 "until {}",
@@ -2587,7 +2611,7 @@ fn upstream_form(catalogue: &[Profile], picked: &str) -> Form {
     let mut fields = vec![Field::choices(
         "id",
         "profile",
-        "a service worked out in advance: its endpoint, its credential scheme and its ACL rules. ←/→ to browse.",
+        "a service worked out in advance: its endpoint, its credential scheme and a reviewed set of ACL rules. ←/→ to browse.",
         options,
         selected,
     )];
@@ -2898,7 +2922,7 @@ fn profile_fields(profile: &Profile) -> Vec<Field> {
             "credential reference: env:NAME, file:/path, op://vault/item/field",
         )
         .browsable(),
-        Field::choice("access", "access", "which bundle of scopes and rules to write", &levels),
+        Field::choice("access", "access", "which bundle of scopes the credential is minted with, and which rules `grant` would write", &levels),
     ];
 
     // One field per profile variable, keyed `var:<name>` and carrying the var's
@@ -2918,10 +2942,20 @@ fn profile_fields(profile: &Profile) -> Vec<Field> {
         }
     }
 
+    // Off, and a step of the form rather than something to find: enrolling a
+    // service is not the same act as granting standing access to it, and this
+    // console exists to put that second decision in front of a human when the
+    // agent actually makes the call.
+    fields.push(Field::switch(
+        "grant",
+        "grant now",
+        "also write this level's ACL rules — a standing allow. Off, nothing is permitted and the first call stops here, on this console.",
+        false,
+    ));
     fields.push(Field::text(
         "agent",
         "agent",
-        "scope the rules to one agent or glob. Blank means every agent.",
+        "with `grant now`: scope the granted rules to one agent or glob. Blank means every agent.",
     ));
     fields.push(Field::flag(
         "dry-run",
@@ -3508,6 +3542,76 @@ action = "allow"
         assert_eq!(effect.verify.as_deref(), Some("github"));
     }
 
+    /// The reported bug: the form's own verify step ran against the policy
+    /// from *before* the write.
+    ///
+    /// The reload moved onto a thread of its own, and the verification did not
+    /// move with it — so an upstream added in the console was one
+    /// `verify::target` looked for in a config that did not have it yet, and
+    /// said so: "`local` is neither an upstream nor an MCP server", on the
+    /// screen where `local` had just been typed. The operator's only way to a
+    /// real answer was to press `v` again once the reload had quietly landed.
+    #[tokio::test]
+    async fn the_form_verifies_the_service_it_just_wrote_and_not_the_policy_before_it() {
+        // A local service standing in for the upstream, so the test makes a
+        // real call and not a real internet call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(axum::routing::any(|| async { "hello" })),
+            )
+            .await
+            .unwrap()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+
+        let mut form = upstream_form(&app.profiles, NO_PROFILE);
+        assert!(form.flag("verify"), "the step this test is about is on");
+        set(&mut form, "name", "local");
+        set(&mut form, "base-url", &format!("http://{addr}"));
+        app.modal = Some(Modal::Form(Box::new(form)));
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        // Nothing has been called yet: the reload has to land first, and it is
+        // not on this thread.
+        assert!(
+            !app.verified.contains_key("local"),
+            "the verification waits for the policy it is about to ask about"
+        );
+        app.settle().await;
+
+        // Whenever it was started, the answer comes back through the inbox.
+        // Drained on a deadline rather than a bare `recv`, because `settle`
+        // itself drains — a verification that started too early has already
+        // been applied by the time we get here, and waiting for a second one
+        // would hang instead of reporting the first.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            app.verified.get("local"),
+            Some(Verification::Done(_)) | Some(Verification::Failed(_))
+        ) && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.catch_up();
+        }
+
+        match app.verified.get("local") {
+            Some(Verification::Done(report)) => assert!(
+                report.ok(),
+                "the upstream is up; the report should say so: {report:?}"
+            ),
+            Some(Verification::Failed(why)) => {
+                panic!("the console verified the wrong policy: {why}")
+            }
+            _ => panic!("no verification came back for `local`"),
+        }
+    }
+
     /// Types a whole form in, the way an operator does, and looks at the pane.
     ///
     /// The form and the table are two views of the same file, and the moment
@@ -3647,14 +3751,52 @@ action = "allow"
             .upstream("gh")
             .expect("the profile writes an upstream, routable without a restart");
         assert_eq!(upstream.base_url, "https://api.github.com");
+        // And nothing else. The profile brought the endpoint and the credential
+        // scheme; what it may be used for is still nobody's decision but the
+        // operator's, taken when an agent actually calls.
         assert!(
-            config.acl.iter().any(|rule| {
-                rule.name
-                    .as_deref()
-                    .is_some_and(|name| name.starts_with("gh-"))
-            }),
-            "and its ACL rules, which is the whole reason to start from a profile"
+            !config.acl.iter().any(gh_rule),
+            "a profile grants nothing on its own: {:?}",
+            config.acl
         );
+    }
+
+    /// `grant now` is the advanced half of the same form: the reviewed rules,
+    /// written up front, by a human who asked for them.
+    #[tokio::test]
+    async fn the_profile_form_writes_the_access_levels_rules_when_told_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+
+        let mut form = upstream_form(&app.profiles, "github");
+        assert!(
+            !form.flag("grant"),
+            "the switch is off until somebody turns it on"
+        );
+        set(&mut form, "as", "gh");
+        set(&mut form, "secret", "env:AGENT_IAP_TEST_TOKEN");
+        let field = form
+            .fields
+            .iter_mut()
+            .find(|field| field.key == "grant")
+            .expect("the form offers it");
+        field.value = form::Value::Flag(true);
+
+        actions::submit(&app.policy, &form).unwrap();
+        app.reread().await;
+
+        let config = app.state.config();
+        assert!(
+            config.acl.iter().any(gh_rule),
+            "asked for, the rules are written: {:?}",
+            config.acl
+        );
+    }
+
+    fn gh_rule(rule: &crate::config::AclRuleConfig) -> bool {
+        rule.name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("gh-"))
     }
 
     /// An MCP profile is not an upstream. Offering one here would write an

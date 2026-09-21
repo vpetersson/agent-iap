@@ -1115,6 +1115,23 @@ pub fn cannot_ask_warning(rules: &[AclRuleConfig], default: Action) -> Option<St
     ))
 }
 
+/// What a request no rule covers meets, as one clause naming the reason.
+///
+/// Every surface that reports an enrolment has to say this, and until now each
+/// one guessed: `init` said the proxy "denies everything", `upstream add` said
+/// a service with no rule "is not reachable", and the console said "agents can
+/// reach it now" — three different answers to one question `acl_default`
+/// already answers, on a file where the answer is `ask`. The wording around it
+/// is each surface's own (the way out of a bad default is a command in a
+/// terminal and a key in the console); the clause is this.
+pub fn fallthrough_clause(default: Action) -> &'static str {
+    match default {
+        Action::Ask => "stops at the `agent-iap run` console",
+        Action::Allow => "is forwarded — `acl_default` is allow",
+        Action::Deny => "is refused by `<default>`, with nobody asked",
+    }
+}
+
 /// How a terminal fixes the state [`cannot_ask_warning`] describes. The console
 /// has its own, because there the answer is a key rather than a command.
 pub const CANNOT_ASK_FIX: &str = "`agent-iap acl reset` makes the fallthrough a question, and \
