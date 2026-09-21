@@ -1239,6 +1239,17 @@ The last two mint a token rather than forwarding a secret. Minted tokens are
 cached until a minute before they expire, and a burst of requests on a cold
 cache mints one token, not one each.
 
+A cached token is thrown away early only when the upstream answers **401** —
+that is the API saying the credential itself did not hold up, and the next call
+mints a fresh one rather than replaying a dead token until it expires. A **403**
+does not: the API accepted the credential and refused the *caller*, which is a
+GA4 property the service account was never added to, an API not enabled on the
+project, or a quota. Minting again from the same key with the same scopes
+returns the same grant, so the cached token is kept and the 403 is passed
+through as the API's own answer. This is the line `verify` draws too, and it is
+why walking a list of resources you turn out not to have rights to costs no
+token mints at all.
+
 ### Service accounts (Google, and anything else doing RFC 7523)
 
 Google does not want you sending a service-account key to an API. It wants a

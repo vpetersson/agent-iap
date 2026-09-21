@@ -588,13 +588,12 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
     })?;
 
     let status = response.status();
-    // A minted token the upstream just rejected is worth nothing; drop it so the
-    // next request mints a fresh one rather than repeating the 401 until expiry.
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        && upstream.auth.mints_tokens()
-    {
-        state.injector.invalidate(&upstream.name);
-    }
+    // Same question as the proxy asks, answered by the same function: a token
+    // the upstream rejected is worth nothing, and a caller the upstream refused
+    // says nothing about the token.
+    state
+        .injector
+        .note_upstream_status(&upstream.name, status, &upstream.auth);
 
     let headers = readable_headers(response.headers());
     let (bytes, truncated) = read_capped(response, state.config().server.max_body_bytes).await?;
