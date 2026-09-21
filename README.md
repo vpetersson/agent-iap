@@ -1051,6 +1051,14 @@ changed. A file caught mid-rewrite is waited on rather than reported as broken,
 and a file edited into something that will not parse is reported once, with the
 proxy left running the last policy that did (§ Reloading).
 
+A reload re-reads every credential the file names, which for `op://` references
+is a vault lookup each, so it runs off the drawing thread — as does the reload
+behind a form you just submitted or a rule you just granted from the approval
+dialogue. The keystroke comes back at once, the header says `re-reading the
+policy…` while it is happening, and the panes follow when the proxy has the new
+policy in charge. The answer you gave a waiting request never waits on any of
+it: that goes straight to the agent holding the connection open.
+
 `v` on an upstream or an MCP server calls it with the credential the file names,
 and puts the answer in the row's `VERIFIED` column, the whole report in a modal
 behind it. It runs off the drawing thread, because the console cannot stop

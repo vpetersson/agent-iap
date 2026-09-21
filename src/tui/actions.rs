@@ -32,7 +32,7 @@ use crate::config::Config;
 use crate::enroll::{self, McpTransportSpec};
 use crate::list::{Inventory, ListOptions, What};
 use crate::profiles;
-use crate::reload::{Trigger, Watcher};
+use crate::reload::Watcher;
 use crate::state::AppState;
 
 use super::form::{Form, Intent};
@@ -61,18 +61,11 @@ impl Policy {
         Ok(policy)
     }
 
-    /// Re-read the file and put it in charge of the running proxy.
-    ///
-    /// All of it, or none of it. `AppState::reload` refuses a policy that will
-    /// not load and leaves the proxy on the one it already had, so a failure
-    /// here is a message on the footer rather than a proxy in an unknown state.
-    pub fn rebuild(&mut self, state: &Arc<AppState>) -> Result<()> {
-        let config = self.watcher.reload(state, Trigger::Asked)?;
-        self.show(config)
-    }
-
     /// The watcher the daemon is running, shared with this console.
-    #[cfg(test)]
+    ///
+    /// Handed out because the reload itself happens on a thread of its own —
+    /// re-reading the file is a vault lookup per credential, which is not
+    /// something the console can stop drawing for. See `spawn_reloader`.
     pub fn watcher(&self) -> &Arc<Watcher> {
         &self.watcher
     }
