@@ -32,8 +32,6 @@
 //!   operator's trade to refuse, so `IAP_NO_CLIPBOARD` and `--no-clipboard`
 //!   turn it off, and nothing is ever copied without a line saying it was.
 
-use std::io::{IsTerminal, Write};
-
 /// The escape sequence's ceiling, in bytes of base64.
 ///
 /// xterm's is the smallest in common use and everything else is more generous.
@@ -125,18 +123,18 @@ pub fn copy(text: &str, allowed: bool) -> Copied {
     if !allowed || disabled_by_environment() {
         return Copied::Declined;
     }
-    // Neither stream being a terminal means the output is going somewhere
-    // nobody is looking at right now — a file, a pipe, a CI log. `/dev/tty`
+    // Nobody looking at this process means the output is going somewhere
+    // nobody is watching right now — a file, a pipe, a CI log. `/dev/tty`
     // might still open in that case, but writing to it would put a secret on
     // the clipboard of whoever happens to own the session, for a command they
     // are not watching.
-    if !std::io::stdout().is_terminal() && !std::io::stderr().is_terminal() {
+    if !crate::term::attached() {
         return Copied::NoTerminal;
     }
     let Some(sequence) = sequence(text, relay()) else {
         return Copied::TooLarge;
     };
-    match write_to_terminal(&sequence) {
+    match crate::term::write(&sequence) {
         true => Copied::Sent,
         false => Copied::Failed,
     }
@@ -233,34 +231,6 @@ fn chunks(text: &str, size: usize) -> impl Iterator<Item = &str> {
     text.as_bytes()
         .chunks(size)
         .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
-}
-
-/// Write to the terminal itself rather than to stdout.
-///
-/// Stdout is the program's output, and an operator is entitled to redirect it
-/// into a file without finding an escape sequence in the middle of the token
-/// they saved. `/dev/tty` is the session's terminal whatever stdout was pointed
-/// at — and it is also the only handle that works from inside the console,
-/// where ratatui owns stdout.
-fn write_to_terminal(sequence: &str) -> bool {
-    #[cfg(unix)]
-    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        return tty
-            .write_all(sequence.as_bytes())
-            .and_then(|()| tty.flush())
-            .is_ok();
-    }
-    // No controlling terminal to open, or not a platform that has one. Stderr
-    // is the fallback because it is the stream that is still a terminal when
-    // stdout has been redirected, and because it is not anybody's output.
-    let mut stderr = std::io::stderr();
-    if !stderr.is_terminal() {
-        return false;
-    }
-    stderr
-        .write_all(sequence.as_bytes())
-        .and_then(|()| stderr.flush())
-        .is_ok()
 }
 
 #[cfg(test)]

@@ -242,6 +242,10 @@ fn minimal() -> String {
 listen = "127.0.0.1:8080"        # where agents connect
 admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
+# approval_bell = false          # do not ring the terminal bell when an `ask`
+                                 # parks a request. `--no-bell` and IAP_NO_BELL
+                                 # say the same thing; on by default, because a
+                                 # queue nobody hears is one that times out
 
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
 # control plane follows onto HTTPS with the same certificate. Any provider
@@ -285,6 +289,10 @@ fn starter(agent: &str, token_hash: &str, secret: &str) -> String {
 listen = "127.0.0.1:8080"        # where agents connect
 admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
+# approval_bell = false          # do not ring the terminal bell when an `ask`
+                                 # parks a request. `--no-bell` and IAP_NO_BELL
+                                 # say the same thing; on by default, because a
+                                 # queue nobody hears is one that times out
 
 # Loopback needs no TLS. An agent on another host does — uncomment, and the
 # control plane follows onto HTTPS with the same certificate. Any provider

@@ -7,6 +7,10 @@
 listen = "127.0.0.1:8080"        # where agents connect
 admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
+# approval_bell = false          # do not ring the terminal bell when an `ask`
+                                 # parks a request. `--no-bell` and IAP_NO_BELL
+                                 # say the same thing; on by default, because a
+                                 # queue nobody hears is one that times out
 upstream_timeout_secs = 300          # idle timeout: how long an upstream may go
                                      # silent mid-response, not a total cap, so a
                                      # long token stream is never truncated

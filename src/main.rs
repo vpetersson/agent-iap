@@ -115,6 +115,23 @@ enum Command {
         /// so a unit file or a container needs neither this flag nor a TTY.
         #[arg(long, conflicts_with = "tui")]
         no_tui: bool,
+        /// Start blocking everything: every request denied, whatever the
+        /// policy file says, and no `ask` reaches a human.
+        ///
+        /// The switch for the minute in which something is going wrong and
+        /// the answer is "stop". It writes nothing, so the file stays the
+        /// record of what the policy is and lifting it — `L` in the console —
+        /// brings that policy straight back. Deliberately not something a
+        /// reload can undo: a kill switch a config-management tool could turn
+        /// off a minute later is not one. `agent-iap acl reset` is the other
+        /// half of this — the same state, written down, for keeps.
+        #[arg(long)]
+        lockdown: bool,
+        /// Do not ring the terminal bell when a request stops on a human.
+        /// `approval_bell = false` in the policy file and the `IAP_NO_BELL`
+        /// environment variable do the same.
+        #[arg(long)]
+        no_bell: bool,
     },
     /// Bridge one MCP server for an agent. Requires a running `agent-iap run`.
     Mcp {
@@ -666,6 +683,25 @@ enum AclCommand {
         #[command(flatten)]
         config: ConfigArg,
     },
+    /// Strict mode: delete every rule and set `acl_default` to `deny`.
+    ///
+    /// The state `agent-iap init` writes, put back. Nothing matches, so every
+    /// request falls through to a default that now denies — and both halves
+    /// are needed, since rules under an `allow` default grant everything and
+    /// so does one surviving `allow` rule over a `deny` default.
+    ///
+    /// It edits the file, so it lasts. What it does not do is stop a proxy
+    /// that is already running from honouring an answer given earlier in this
+    /// session; `agent-iap run --lockdown` is the switch for right now.
+    #[command(alias = "strict")]
+    Reset {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Do not ask. Required when there is no terminal to ask at, so a
+        /// script has to say it means this.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -773,6 +809,8 @@ fn main() -> Result<()> {
             admin_listen,
             tui,
             no_tui,
+            lockdown,
+            no_bell,
         } => {
             let config_path = config.config.clone();
             // Held rather than applied once: the file is re-read under a
@@ -782,6 +820,8 @@ fn main() -> Result<()> {
             let overrides = agent_iap::config::Overrides {
                 listen: listen.clone(),
                 admin_listen: admin_listen.clone(),
+                // Only ever a `no`: see `Overrides::bell`.
+                bell: no_bell.then_some(false),
             };
             let overridden = overrides.any();
             let watcher = Arc::new(Watcher::new(&config_path, overrides));
@@ -797,7 +837,7 @@ fn main() -> Result<()> {
                     "listen addresses overridden outside the config file"
                 );
             }
-            tokio_runtime()?.block_on(run(config, console, watcher))
+            tokio_runtime()?.block_on(run(config, console, watcher, lockdown))
         }
         Command::Mcp {
             config,
@@ -993,6 +1033,7 @@ fn main() -> Result<()> {
             expires_in,
         }),
         Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
+        Command::Acl(AclCommand::Reset { config, yes }) => reset_rules(&config.config, yes),
         Command::GenToken { id, clipboard } => gen_token(&id, clipboard),
         Command::HashToken { token } => {
             let token = match token {
@@ -1072,13 +1113,21 @@ fn init_tracing(console: Console, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run(config: Config, console: Console, watcher: Arc<Watcher>) -> Result<()> {
+async fn run(
+    config: Config,
+    console: Console,
+    watcher: Arc<Watcher>,
+    lockdown: bool,
+) -> Result<()> {
     let listen = config.server.listen;
     let admin_listen = config.server.admin_listen;
     let audit_path = config.audit.path.clone();
     let audit_to_stderr = config.audit.stderr && !console.draws();
 
     let state = AppState::build(config, audit_to_stderr)?;
+    // Before anything binds, so there is no window in which the proxy is
+    // reachable and not yet locked down.
+    state.acl.set_lockdown(lockdown);
 
     // Before anything binds. The secrets are already warm from `AppState`; this
     // is where a malformed certificate, or a key that belongs to a different
@@ -1129,6 +1178,12 @@ async fn run(config: Config, console: Console, watcher: Arc<Watcher>) -> Result<
             state.acl.default_action()
         );
         eprintln!("audit log: {}", audit_path.display());
+        if state.acl.locked_down() {
+            eprintln!(
+                "LOCKDOWN: every request is denied, whatever the rules say — restart without \
+                 --lockdown, or lift it with `L` in the console, to serve the policy again"
+            );
+        }
         // Running headless is what silences the `ask` rules: with no console,
         // nothing parks a request unless something is polling the queue. Say
         // so here rather than leaving it to be discovered in the audit log.
@@ -2067,6 +2122,81 @@ fn add_rule(options: AddRule) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Wipe the rule list and put `acl_default` back to `deny`.
+fn reset_rules(path: &Path, yes: bool) -> Result<()> {
+    // Read before asking, so the question names what is about to go rather
+    // than asking an operator to confirm a number they have to go and look up.
+    let count = enroll::rule_count(path).unwrap_or(0);
+    if !yes {
+        let question = match count {
+            0 => format!(
+                "Set `acl_default` to `deny` in {}? There are no rules to remove.",
+                path.display()
+            ),
+            _ => format!(
+                "Delete all {} from {} and set `acl_default` to `deny`?",
+                plural(count, "rule"),
+                path.display()
+            ),
+        };
+        if !confirm(&question, "--yes")? {
+            println!("Nothing changed.");
+            return Ok(());
+        }
+    }
+
+    let reset = enroll::reset_acl(path)?;
+
+    // The rules by name, because this is the last place they exist. A count
+    // is no help to the operator reconstructing the list afterwards, and
+    // reconstructing it is the expected next step: strict mode is where you
+    // start from, not where you stay.
+    match reset.removed.len() {
+        0 => println!("No rules to remove in {}.", path.display()),
+        _ => {
+            println!(
+                "Removed {} from {}:",
+                plural(reset.removed.len(), "rule"),
+                path.display()
+            );
+            for rule in &reset.removed {
+                println!("  {rule}");
+            }
+        }
+    }
+    match reset.was_default {
+        agent_iap::config::Action::Deny => {
+            println!("`acl_default` was already `deny`, and still is.")
+        }
+        was => println!("`acl_default` was `{was}`, and is now `deny`."),
+    }
+    println!("Nothing matches now, so every request is denied.");
+    println!("Build it back up with `agent-iap acl add` — the audit log has what was being used.");
+    reload_notice("the running proxy still decides by the old rules");
+    Ok(())
+}
+
+/// Ask before something there is no undoing, or refuse to guess.
+///
+/// A prompt only protects anybody where there is somebody to read it. With
+/// stdin redirected there is not, and a command that took silence for consent
+/// is one a script runs by accident — so that case names the flag instead of
+/// assuming either answer.
+fn confirm(question: &str, flag: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        bail!("{question}\nNothing here to ask at — pass `{flag}` to mean it.");
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn remove_rule(path: &Path, index: usize) -> Result<()> {

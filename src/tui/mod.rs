@@ -211,7 +211,7 @@ impl Tab {
                 ("x", "remove"),
             ],
             Tab::Mcp => &[("n", "add"), ("v", "verify"), ("x", "remove")],
-            Tab::Acl => &[("n", "add rule"), ("x", "remove rule")],
+            Tab::Acl => &[("n", "add rule"), ("x", "remove rule"), ("R", "reset")],
             Tab::Credentials => &[("c", "re-check")],
             Tab::Profiles => &[("enter", "add")],
         }
@@ -325,6 +325,8 @@ enum Destructive {
     RemoveUpstream(String),
     RemoveMcpServer(String),
     RemoveRule(usize),
+    /// Strict mode: every rule out, `acl_default` back to `deny`.
+    ResetAcl,
 }
 
 /// Where the last frame put everything a pointer can hit.
@@ -563,6 +565,17 @@ impl App {
         });
     }
 
+    /// A result the operator should not miss. Uses the failure colours
+    /// without being a failure: the loudest thing on this screen is the right
+    /// register for "nothing is getting through", and there is no third one.
+    fn warn(&mut self, message: impl Into<String>) {
+        self.flash = Some(Flash {
+            message: message.into(),
+            failed: true,
+            at: Instant::now(),
+        });
+    }
+
     fn blame(&mut self, error: &anyhow::Error) {
         self.flash = Some(Flash {
             message: format!("{error:#}"),
@@ -672,6 +685,27 @@ impl App {
                 Ok(()) => self.say("re-read the policy file"),
                 Err(error) => self.blame(&error),
             },
+            // The panic button. Shifted so it is never a slip, and answered
+            // on the footer rather than behind a confirmation: the direction
+            // that needs no deliberation is the one that stops everything,
+            // and a dialogue between an operator and that is a dialogue in
+            // the way. Lifting it takes the same key, and the header says
+            // which way it is the whole time it is on.
+            KeyCode::Char('L') => {
+                let on = !self.state.acl.locked_down();
+                self.state.acl.set_lockdown(on);
+                match on {
+                    true => self.warn(
+                        "LOCKDOWN — every request is denied, whatever the rules say. Nothing \
+                         was written to the policy file; `L` again serves it as it stands.",
+                    ),
+                    false => self.say(format!(
+                        "lockdown lifted — back to the file: {} rules, default {}",
+                        self.state.acl.rule_count(),
+                        self.state.acl.default_action(),
+                    )),
+                }
+            }
             // Reporting the pointer is what stops the terminal's own
             // selection working, and the one thing an operator most wants to
             // select out of this screen is a token — which `c` now copies
@@ -1019,6 +1053,21 @@ impl App {
             }
 
             (Tab::Acl, KeyCode::Char('n')) => self.modal = Some(Modal::Form(Box::new(rule_form()))),
+            // Shifted, and not the `x` beside it: `x` takes out the one rule
+            // the cursor is on, and the key that takes out all of them should
+            // not be the one a slipped finger reaches.
+            (Tab::Acl, KeyCode::Char('R')) => {
+                let rules = self.state.acl.rule_count();
+                self.modal = Some(Modal::Confirm(Confirm {
+                    question: format!("Delete all {rules} rule(s) and set the default to deny?"),
+                    detail: "Strict mode: nothing matches, so every request is denied. This \
+                             is written to the policy file and outlives this process — `L` is \
+                             the one that only lasts as long as the proxy runs."
+                        .into(),
+                    prune: None,
+                    intent: Destructive::ResetAcl,
+                }));
+            }
             (Tab::Acl, KeyCode::Char('x')) => {
                 if let Some(at) = self.selected() {
                     if let Some(rule) = self.policy.inventory.acl.iter().flatten().nth(at) {
@@ -1331,6 +1380,15 @@ impl App {
                     removal.remaining
                 ))
             }
+            Destructive::ResetAcl => {
+                let reset = crate::enroll::reset_acl(&path)?;
+                Ok(format!(
+                    "strict mode — {} rule(s) removed, default was `{}` and is now `deny`; \
+                     everything is denied until a rule says otherwise",
+                    reset.removed.len(),
+                    reset.was_default,
+                ))
+            }
         }
     }
 
@@ -1491,7 +1549,7 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
-        let spans = vec![
+        let mut spans = vec![
             Span::styled(
                 " agent-iap ",
                 Style::default()
@@ -1501,15 +1559,28 @@ impl App {
             ),
             Span::raw(format!("  proxy {}  ", self.state.config().server.listen)),
             Span::styled(format!("  {waiting} waiting  "), pending_style),
-            Span::raw(format!(
-                "  {} agents · {} upstreams · {} mcp · {} rules · default {} ",
-                self.state.agents.len(),
-                self.policy.config.upstreams.len(),
-                self.policy.config.mcp_servers.len(),
-                self.state.acl.rule_count(),
-                self.state.acl.default_action(),
-            )),
         ];
+        // Loud, and for as long as it is on: a flash fades after eight
+        // seconds and lockdown does not, so without this the state in which
+        // every request is being refused looks exactly like the state in
+        // which the policy is being served.
+        if self.state.acl.locked_down() {
+            spans.push(Span::styled(
+                "  LOCKDOWN  ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::raw(format!(
+            "  {} agents · {} upstreams · {} mcp · {} rules · default {} ",
+            self.state.agents.len(),
+            self.policy.config.upstreams.len(),
+            self.policy.config.mcp_servers.len(),
+            self.state.acl.rule_count(),
+            self.state.acl.default_action(),
+        )));
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
@@ -2144,6 +2215,14 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ("a / d", "allow or deny the selected request, once"),
         ("f", "forget every standing answer"),
         ("r", "re-read the policy file now — it is watched anyway"),
+        (
+            "R",
+            "on the rules pane: strict mode — delete every rule, default back to deny",
+        ),
+        (
+            "L",
+            "lockdown: deny everything until `L` again. Writes nothing; ends with this process",
+        ),
         ("m", "pointer off, for the terminal's own text selection"),
         ("q", "quit — which stops the proxy"),
     ] {
@@ -3912,6 +3991,90 @@ action = "allow"
         assert!(app.showing_a_secret(), "the token is the modal that is up");
         assert!(!app.flash.as_ref().unwrap().failed);
     }
+    /// `R` on the rules pane. The confirm first — this is the one key in the
+    /// console that can delete a policy — then the file, then the running
+    /// proxy, which is the part a file-only test would miss.
+    #[tokio::test]
+    async fn resetting_the_rules_empties_the_file_and_the_running_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Acl;
+        assert_eq!(app.state.acl.rule_count(), 1);
+
+        app.handle(KeyEvent::from(KeyCode::Char('R'))).unwrap();
+        assert!(
+            matches!(app.modal, Some(Modal::Confirm(_))),
+            "it asks first"
+        );
+        app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+
+        assert_eq!(app.state.acl.rule_count(), 0, "in force, not just on disk");
+        assert_eq!(app.state.acl.default_action(), crate::config::Action::Deny);
+        let config: crate::config::Config =
+            toml::from_str(&std::fs::read_to_string(dir.path().join("iap.toml")).unwrap()).unwrap();
+        assert!(config.acl.is_empty());
+        assert_eq!(config.acl_default.action, crate::config::Action::Deny);
+        assert!(!app.flash.as_ref().unwrap().failed);
+    }
+
+    /// And `n` — the key beside it — still means "one rule", so the reset is
+    /// not something the rules pane does by accident.
+    #[tokio::test]
+    async fn the_lower_case_keys_on_the_rules_pane_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Acl;
+
+        app.handle(KeyEvent::from(KeyCode::Char('r'))).unwrap();
+
+        assert!(app.modal.is_none(), "`r` is still a re-read, not a reset");
+        assert_eq!(app.state.acl.rule_count(), 1);
+    }
+
+    /// `L`, both ways. It writes nothing and it is not a modal: the moment an
+    /// operator wants everything to stop is not the moment for a dialogue.
+    #[tokio::test]
+    async fn lockdown_stops_everything_and_lifting_it_gives_the_policy_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let before = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
+        let request =
+            AccessRequest::http("claude-code", "github", "POST", "/repos/acme/api/issues");
+        assert_eq!(
+            app.state.acl.evaluate(&request).action,
+            crate::config::Action::Ask
+        );
+
+        app.handle(KeyEvent::from(KeyCode::Char('L'))).unwrap();
+
+        assert!(app.modal.is_none(), "no dialogue in the way");
+        assert!(app.state.acl.locked_down());
+        assert_eq!(
+            app.state.acl.evaluate(&request).action,
+            crate::config::Action::Deny,
+            "the `ask` never reaches a human now"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("iap.toml")).unwrap(),
+            before,
+            "and nothing was written"
+        );
+        // Said loudly, and said for as long as it lasts rather than for the
+        // eight seconds a flash is up.
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("LOCKDOWN"), "{rendered}");
+
+        app.handle(KeyEvent::from(KeyCode::Char('L'))).unwrap();
+
+        assert!(!app.state.acl.locked_down());
+        assert_eq!(
+            app.state.acl.evaluate(&request).action,
+            crate::config::Action::Ask,
+            "the file said `ask` the whole time, and says it again"
+        );
+        assert!(!render(&mut app, 120, 34).contains("LOCKDOWN"));
+    }
+
     /// `t` on the agents pane — "new token" — end to end: the confirm, the
     /// mint, and the one moment the token exists outside the file.
     #[tokio::test]

@@ -43,7 +43,7 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-use crate::config::{AclRuleConfig, AuthConfig, Config};
+use crate::config::{AclRuleConfig, Action, AuthConfig, Config};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::identity;
@@ -997,6 +997,75 @@ pub fn remove_rule(path: &Path, index: usize) -> Result<RuleRemoval> {
     })
 }
 
+/// What `reset_acl` took out, and what the policy said before it did.
+#[derive(Debug)]
+pub struct AclReset {
+    /// Every rule that was in the file, so the command can print what it just
+    /// deleted rather than a number. This is the destructive one of the ACL
+    /// edits — the others take out a rule the operator named — so the record
+    /// of what was there is the whole of what makes it recoverable.
+    pub removed: Vec<RuleRef>,
+    /// What `acl_default` was. `Deny` means the reset only removed rules,
+    /// which is worth being able to say.
+    pub was_default: Action,
+}
+
+/// Strict mode: delete every `[[acl]]` rule and set `acl_default` to `deny`.
+///
+/// The panic button, written down. Every other edit in this module is a
+/// considered change to one entry; this is the one an operator reaches for
+/// when they have stopped wanting to consider anything and want the proxy to
+/// stop saying yes. Afterwards nothing matches, so every request falls through
+/// to a default that now denies — the state a file written by `agent-iap init`
+/// starts in, and the state `SECURITY.md` describes as the floor.
+///
+/// Both halves matter, and neither is enough alone: rules with no `deny`
+/// default is a file whose `acl_default = "allow"` grants everything, and a
+/// `deny` default under an `allow` rule at the top grants everything too. So
+/// this writes both, and is the only edit here that touches `acl_default`.
+///
+/// It does not stop what is already running: an in-flight request has been
+/// cleared, and a "remember for this session" answer lives in the process
+/// rather than the file. `agent-iap run --lockdown` is the switch for those.
+pub fn reset_acl(path: &Path) -> Result<AclReset> {
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let removed = rules_matching(&existing, |_| true);
+
+    // The whole key, rather than the entries one at a time: `[[acl]]` blocks
+    // and one inline `acl = [...]` array are two spellings of the same data,
+    // and a reset that silently skipped the second would report that
+    // everything was blocked while leaving every rule in force. Removing the
+    // key is unambiguous in both spellings, which is what this edit — alone
+    // among the edits here — has to be.
+    document.remove("acl");
+    set_default_action(&mut document, "deny");
+
+    save(path, document)?;
+    Ok(AclReset {
+        removed,
+        was_default: existing.acl_default.action,
+    })
+}
+
+/// Write `acl_default.action`, however the file happens to spell the table.
+fn set_default_action(document: &mut DocumentMut, action: &str) {
+    match document.get_mut("acl_default") {
+        Some(Item::Table(table)) => table["action"] = toml_edit::value(action),
+        Some(Item::Value(Value::InlineTable(table))) => {
+            table.insert("action", action.into());
+        }
+        // Absent, or written as something that is not a table at all. The
+        // second cannot have loaded, since `document_config` has already
+        // parsed this file against the schema — so this is the first.
+        _ => {
+            let mut table = Table::new();
+            table["action"] = toml_edit::value(action);
+            document["acl_default"] = Item::Table(table);
+        }
+    }
+}
+
 /// A service to render without writing it, for `profile add --dry-run`.
 pub enum ServiceSpec<'a> {
     Upstream {
@@ -1613,6 +1682,26 @@ mod tests {
 
     fn load(path: &Path) -> Config {
         toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// How `init` spells the default. Held here so a template that changes
+    /// its mind breaks the tests that edit it rather than silently appending
+    /// a second `[acl_default]` and producing a file that does not parse.
+    const DEFAULT_TABLE: &str = "[acl_default]\naction = \"deny\"";
+
+    /// Edit `acl_default` in a written policy file, the way an operator
+    /// reaching for a reset got there.
+    fn set_default(path: &Path, action: &str) {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains(DEFAULT_TABLE), "the template moved");
+        std::fs::write(
+            path,
+            text.replace(
+                DEFAULT_TABLE,
+                &format!("[acl_default]\naction = \"{action}\""),
+            ),
+        )
+        .unwrap();
     }
 
     /// `is_reference` is a list, and a list beside a `match` is a list that
@@ -2564,6 +2653,99 @@ mod tests {
         assert_eq!(acl.len(), 2);
         assert_eq!(acl[0].target, "anthropic", "rule 1 is now rule 0");
         assert_eq!(acl[1].name.as_deref(), Some("gh-write"));
+    }
+
+    #[test]
+    fn a_reset_takes_out_every_rule_and_puts_the_default_back_to_deny() {
+        let (_dir, path) = populated_policy();
+        // The state a reset is for: a file that has been edited into saying
+        // yes by default, with rules on top that say yes some more.
+        set_default(&path, "allow");
+        assert_eq!(load(&path).acl_default.action, Action::Allow);
+
+        let reset = reset_acl(&path).unwrap();
+
+        assert_eq!(reset.removed.len(), 3);
+        assert_eq!(reset.was_default, Action::Allow);
+        // Both halves: rules with an `allow` default still grants everything,
+        // and a `deny` default under a surviving `allow` rule does too.
+        let config = load(&path);
+        assert!(config.acl.is_empty());
+        assert_eq!(config.acl_default.action, Action::Deny);
+        // And nothing else went with them — a panic button that also revoked
+        // the agents is one nobody presses.
+        assert_eq!(config.upstreams.len(), 2);
+        assert!(!config.agents.is_empty());
+    }
+
+    #[test]
+    fn the_names_of_what_a_reset_removed_come_back_with_it() {
+        // The only record of a rule list that no longer exists, so the
+        // command can print it rather than a count.
+        let (_dir, path) = populated_policy();
+
+        let reset = reset_acl(&path).unwrap();
+
+        let named: Vec<_> = reset
+            .removed
+            .iter()
+            .filter_map(|rule| rule.name.as_deref())
+            .collect();
+        assert_eq!(named, vec!["gh-read", "gh-write"]);
+        assert_eq!(reset.removed[0].index, 0);
+        assert_eq!(reset.removed[2].index, 2);
+    }
+
+    #[test]
+    fn a_reset_of_a_file_with_no_rules_still_writes_the_default() {
+        // `remove_rule` refuses a file with no `[[acl]]` blocks, and is right
+        // to: there is no rule 0 to take out. A reset is not asking for a
+        // rule, it is asking for a state, and the file is not in it until
+        // `acl_default` says `deny`.
+        let (_dir, path) = empty_policy();
+        set_default(&path, "ask");
+
+        let reset = reset_acl(&path).unwrap();
+
+        assert!(reset.removed.is_empty());
+        assert_eq!(reset.was_default, Action::Ask);
+        assert_eq!(load(&path).acl_default.action, Action::Deny);
+    }
+
+    #[test]
+    fn a_reset_finds_an_inline_default_table_too() {
+        // `acl_default = { action = "allow" }` is the same policy written the
+        // other way, and a reset that added a second `[acl_default]` table
+        // beside it would produce a file that does not parse.
+        // Written out rather than edited from the template: an inline table
+        // has to sit above the first `[table]` header, or TOML reads it as a
+        // key of that table instead of a top-level one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        std::fs::write(
+            &path,
+            "acl_default = { action = \"allow\" }\n\n[[acl]]\ntarget = \"*\"\naction = \"allow\"\n",
+        )
+        .unwrap();
+        assert_eq!(load(&path).acl_default.action, Action::Allow);
+
+        let reset = reset_acl(&path).unwrap();
+        assert_eq!(reset.removed.len(), 1);
+
+        assert_eq!(load(&path).acl_default.action, Action::Deny);
+    }
+
+    #[test]
+    fn a_reset_keeps_the_comments_the_template_wrote() {
+        let (_dir, path) = populated_policy();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        reset_acl(&path).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for line in before.lines().filter(|line| line.starts_with('#')) {
+            assert!(after.contains(line), "lost the comment: {line}");
+        }
     }
 
     #[test]

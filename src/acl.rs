@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{AclRuleConfig, Action, Config};
 
@@ -178,6 +179,11 @@ struct Compiled {
 /// A rule list that has compiled, waiting to be put in charge.
 pub struct Prepared(Compiled);
 
+/// What the audit log and a refusal call the lockdown, where they would
+/// otherwise name the rule that decided. Not a rule: it is in no file, it has
+/// no position, and nothing can be written in front of it.
+pub const LOCKDOWN: &str = "<lockdown>";
+
 /// The compiled rule list, behind a lock so the console can replace it.
 ///
 /// Every read is a whole decision taken under one guard: the point of an ACL is
@@ -185,12 +191,23 @@ pub struct Prepared(Compiled);
 /// one and the second half of another.
 pub struct Acl {
     compiled: RwLock<Compiled>,
+    /// Block everything, whatever the file says.
+    ///
+    /// Deliberately outside `Compiled`, which is what a reload swaps: the
+    /// state this is for is "something is wrong and I want it to stop", and a
+    /// kill switch that a reload — or the agent's own `acl add`, or a
+    /// config-management tool rewriting the file a minute later — could lift
+    /// without anybody deciding to is not one. Nothing turns it off but the
+    /// operator, and it does not outlive the process, so the file stays the
+    /// record of what the policy actually is.
+    lockdown: AtomicBool,
 }
 
 impl Acl {
     pub fn compile(config: &Config) -> Result<Self> {
         Ok(Acl {
             compiled: RwLock::new(compile_all(config)?),
+            lockdown: AtomicBool::new(false),
         })
     }
 
@@ -215,7 +232,31 @@ impl Acl {
         Ok(())
     }
 
+    /// Block everything, or stop blocking everything.
+    ///
+    /// Takes effect on the next request and needs no file edit, which is the
+    /// point: the moment an operator wants everything to stop is not the
+    /// moment to be editing TOML and waiting for a watcher to notice.
+    pub fn set_lockdown(&self, on: bool) {
+        self.lockdown.store(on, Ordering::SeqCst);
+    }
+
+    pub fn locked_down(&self) -> bool {
+        self.lockdown.load(Ordering::SeqCst)
+    }
+
     pub fn evaluate(&self, request: &AccessRequest) -> Decision {
+        // Before the rule list, and before the lock: under lockdown there is
+        // no rule that can decide, including an `allow` sitting at the top of
+        // the file and including the default. "Block everything" that a rule
+        // could get in front of would be a promise this could not keep.
+        if self.locked_down() {
+            return Decision {
+                action: Action::Deny,
+                rule: Some(LOCKDOWN.to_string()),
+                index: None,
+            };
+        }
         let compiled = self.compiled.read();
         // One clock reading for the whole rule list, so two rules in the same
         // decision cannot disagree about whether the deadline between them has
@@ -300,6 +341,10 @@ impl Acl {
             .count()
     }
 
+    /// What an unmatched request falls through to. The *file's* answer, even
+    /// under lockdown: this is what `list` and the console's header report,
+    /// and a policy that reads `deny` because a kill switch is on hides the
+    /// `allow` that is still written down and comes back when it is lifted.
     pub fn default_action(&self) -> Action {
         self.compiled.read().default
     }
@@ -307,6 +352,9 @@ impl Acl {
     /// Can this policy ever stop a request on a human? A proxy running without
     /// the console loses nothing if it cannot, and silently denies if it can.
     pub fn can_ask(&self) -> bool {
+        if self.locked_down() {
+            return false;
+        }
         let compiled = self.compiled.read();
         compiled.default == Action::Ask
             || compiled.rules.iter().any(|rule| rule.action == Action::Ask)
@@ -642,6 +690,93 @@ action = "allow"
 "#);
         assert!(!acl.compiled.read().any_expiring);
         assert_eq!(acl.expired_count(), 0);
+    }
+
+    #[test]
+    fn lockdown_denies_what_the_file_allows() {
+        let acl = acl(r#"
+[[acl]]
+name = "wide-open"
+target = "*"
+methods = ["*"]
+paths = ["**"]
+action = "allow"
+
+[acl_default]
+action = "allow"
+"#);
+        let request = AccessRequest::http("a", "gh", "GET", "/x");
+        assert_eq!(acl.evaluate(&request).action, Action::Allow);
+
+        acl.set_lockdown(true);
+        let stopped = acl.evaluate(&request);
+        assert_eq!(
+            stopped.action,
+            Action::Deny,
+            "an `allow` at the top of the file must not survive a lockdown"
+        );
+        assert_eq!(stopped.rule_label(), LOCKDOWN);
+        assert_eq!(
+            stopped.index, None,
+            "it is not a rule, so it has no position to write in front of"
+        );
+
+        // And the file is still the file: lifting it restores the policy that
+        // was written down, rather than whatever the lockdown left behind.
+        acl.set_lockdown(false);
+        assert_eq!(acl.evaluate(&request).action, Action::Allow);
+    }
+
+    #[test]
+    fn lockdown_survives_a_reload() {
+        // The kill switch is for the minute in which somebody is also editing
+        // the file — or in which the watcher picks up an edit made before it.
+        // A reload that lifted it would be the one that mattered.
+        let acl = acl("");
+        acl.set_lockdown(true);
+        acl.reload(&config_from(
+            r#"
+[[acl]]
+target = "*"
+action = "allow"
+"#,
+        ))
+        .unwrap();
+        assert!(acl.locked_down());
+        assert_eq!(
+            acl.evaluate(&AccessRequest::http("a", "gh", "GET", "/x"))
+                .action,
+            Action::Deny
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_under_lockdown() {
+        // The console cannot release a request that lockdown has already
+        // refused, so a startup that promises `ask` would be promising a
+        // prompt that never comes.
+        let acl = acl(r#"
+[[acl]]
+action = "ask"
+"#);
+        assert!(acl.can_ask());
+        acl.set_lockdown(true);
+        assert!(!acl.can_ask());
+    }
+
+    #[test]
+    fn the_file_is_still_reported_under_lockdown() {
+        let mut config = config_from("");
+        config.acl_default = AclDefault {
+            action: Action::Ask,
+        };
+        let acl = Acl::compile(&config).unwrap();
+        acl.set_lockdown(true);
+        assert_eq!(
+            acl.default_action(),
+            Action::Ask,
+            "the header must show the policy that comes back, not the switch that is on"
+        );
     }
 
     #[test]
