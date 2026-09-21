@@ -51,6 +51,7 @@ use crate::approval::{PendingView, Verdict};
 use crate::audit::AuditEvent;
 use crate::config::UpstreamConfig;
 use crate::profiles::Profile;
+use crate::reload::Trigger;
 use crate::state::AppState;
 use crate::verify;
 
@@ -414,23 +415,115 @@ struct App {
     clicked: Option<(Instant, u16, u16)>,
     /// What the last verification of each service found, by name.
     verified: HashMap<String, Verification>,
-    /// Where a finished verification reports back. A verification is a network
-    /// call and sometimes a child process, so it runs on the runtime rather
-    /// than on this thread — the console cannot stop drawing for ten seconds,
-    /// because the thing it exists to draw is a request waiting on an answer.
-    inbox: (SendVerified, RecvVerified),
+    /// Where finished work reports back. Anything that reads a credential is a
+    /// child process and usually a network call, so it runs on the runtime
+    /// rather than on this thread — the console cannot stop drawing for
+    /// seconds at a time, because the thing it exists to draw is a request
+    /// waiting on an answer.
+    inbox: (Post, RecvLanded),
+    /// Where a reload is asked for. One thread does them, in the order they
+    /// were asked for: `AppState::reload` installs a whole policy, and two of
+    /// those overlapping is a proxy serving neither file.
+    reloader: tokio::sync::mpsc::UnboundedSender<Said>,
+    /// Reloads asked for and not yet heard back about. Two jobs: the header
+    /// says so while it is happening, and `adopt` uses it to tell its own
+    /// news from somebody else's edit.
+    asked: usize,
+    /// Every policy the proxy puts in charge, whoever caused it — this console
+    /// pressing `r`, `agent-iap acl add` in the next terminal, an editor.
+    reloads: tokio::sync::broadcast::Receiver<Arc<crate::config::Config>>,
+    /// The audit log as it is written, for the feed at the bottom.
+    records: tokio::sync::broadcast::Receiver<AuditEvent>,
 }
 
-/// One finished verification on its way back to the console: the service it was
-/// about, and what it found.
-type Verified = (String, Result<verify::Report>);
-type SendVerified = tokio::sync::mpsc::UnboundedSender<Verified>;
-type RecvVerified = tokio::sync::mpsc::UnboundedReceiver<Verified>;
+/// A job the console started on the runtime, on its way back to the thread
+/// that draws.
+enum Landed {
+    /// A verification of one service: what it was about, and what it found.
+    Verified(String, Result<verify::Report>),
+    /// A policy reload the console asked for, and the words it is owed.
+    Reloaded(Result<()>, Said),
+}
+
+/// What a reload the console asked for is owed on the footer when it lands.
+///
+/// Two kinds of caller, and they want different things said. `r` asked for the
+/// reload and nothing else, so the reload is the whole news either way. A write
+/// asked for one *after* editing the file, and the write is its own good news —
+/// already on the footer, because it is true the moment the file is written.
+/// What is left to report there is only the bad case: the edit is in the file,
+/// the proxy refused it, and every pane is showing the policy from before it.
+/// See `stale`.
+struct Said {
+    /// The line for a reload that took. `None` where the caller already said
+    /// its piece and only a refusal is still worth hearing about.
+    ok: Option<String>,
+    /// Was the policy file written before this reload was asked for?
+    wrote: bool,
+}
+
+impl Said {
+    /// `r`: the reload is the whole of what was asked for.
+    fn asked(ok: impl Into<String>) -> Self {
+        Said {
+            ok: Some(ok.into()),
+            wrote: false,
+        }
+    }
+
+    /// A reload that follows a write, whose own message is already on screen.
+    fn after_a_write() -> Self {
+        Said {
+            ok: None,
+            wrote: true,
+        }
+    }
+}
+
+type Post = tokio::sync::mpsc::UnboundedSender<Landed>;
+type RecvLanded = tokio::sync::mpsc::UnboundedReceiver<Landed>;
+
+/// The thread that re-reads the policy file, one reload at a time.
+///
+/// `AppState::reload` re-resolves every credential the file names — a
+/// subprocess and a network round trip each — and only then installs the
+/// policy. None of that belongs on the thread that draws: this console exists
+/// to put a waiting request in front of a human, and a console that stops
+/// drawing while a vault is consulted is a console that has stopped doing the
+/// one thing it is for.
+///
+/// One thread with a queue rather than a task per press. Two
+/// `AppState::reload` calls overlapping is a proxy serving neither file; a
+/// queue means a write that lands while a reload is outstanding still takes
+/// effect, in the order it was asked for, and nothing is dropped.
+fn spawn_reloader(
+    state: &Arc<AppState>,
+    watcher: &Arc<crate::reload::Watcher>,
+    post: Post,
+) -> tokio::sync::mpsc::UnboundedSender<Said> {
+    let (ask, mut asked) = tokio::sync::mpsc::unbounded_channel::<Said>();
+    let state = Arc::clone(state);
+    let watcher = Arc::clone(watcher);
+    tokio::task::spawn_blocking(move || {
+        while let Some(said) = asked.blocking_recv() {
+            let result = watcher.reload(&state, Trigger::Asked).map(|_| ());
+            // The receiver is gone only when the console has already quit.
+            if post.send(Landed::Reloaded(result, said)).is_err() {
+                return;
+            }
+        }
+    });
+    ask
+}
 
 impl App {
     fn new(state: Arc<AppState>, watcher: Arc<crate::reload::Watcher>) -> Result<Self> {
         let policy = Policy::load(watcher, &state)?;
+        let inbox = tokio::sync::mpsc::unbounded_channel();
         Ok(App {
+            reloads: state.subscribe_reloads(),
+            records: state.audit.subscribe(),
+            reloader: spawn_reloader(&state, policy.watcher(), inbox.0.clone()),
             state,
             policy,
             profiles: crate::profiles::catalog(),
@@ -445,28 +538,44 @@ impl App {
             hits: Hits::default(),
             clicked: None,
             verified: HashMap::new(),
-            inbox: tokio::sync::mpsc::unbounded_channel(),
+            asked: 0,
+            inbox,
         })
     }
 
+    /// Take in everything that happened somewhere else: a policy the proxy put
+    /// in charge, records the audit log wrote, and jobs coming back off the
+    /// runtime. Cheap, and on every pass — none of it blocks.
+    fn catch_up(&mut self) {
+        // Collected before they are applied: each of these wants `&mut self`,
+        // and the receivers are part of it.
+        let mut configs = Vec::new();
+        while let Ok(config) = self.reloads.try_recv() {
+            configs.push(config);
+        }
+        for config in configs {
+            self.adopt(config);
+        }
+
+        while let Ok(event) = self.records.try_recv() {
+            if self.feed.len() == FEED_CAPACITY {
+                self.feed.pop_front();
+            }
+            self.feed.push_back(event);
+        }
+
+        let mut landed = Vec::new();
+        while let Ok(job) = self.inbox.1.try_recv() {
+            landed.push(job);
+        }
+        for job in landed {
+            self.landed(job);
+        }
+    }
+
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-        let mut feed_rx = self.state.audit.subscribe();
-        let mut reloads = self.state.subscribe_reloads();
-
         loop {
-            while let Ok(config) = reloads.try_recv() {
-                self.adopt(config);
-            }
-            while let Ok(event) = feed_rx.try_recv() {
-                if self.feed.len() == FEED_CAPACITY {
-                    self.feed.pop_front();
-                }
-                self.feed.push_back(event);
-            }
-
-            while let Ok((name, result)) = self.inbox.1.try_recv() {
-                self.landed(name, result);
-            }
+            self.catch_up();
 
             self.pending = self.state.broker.list();
             self.dismissed
@@ -486,14 +595,46 @@ impl App {
             if !event::poll(TICK)? {
                 continue;
             }
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if self.handle(key)? {
-                        return Ok(());
+            // One frame per burst rather than one frame per event. With the
+            // pointer reported, the terminal sends a stream of motion events
+            // for as long as the mouse is moving across the window, and a held
+            // key arrives as a stream too — a full redraw between each one is a
+            // console that falls behind what it is being given and then catches
+            // up in jumps, which is what "sluggish" means here. Nothing is
+            // dropped: everything already queued is handled, and the frame
+            // after it shows the result of all of it.
+            //
+            // A burst is answered against the frame it was aimed at, which is
+            // the safe direction here and not only the cheap one: the queue is
+            // not re-read and no new dialogue is raised part-way through, so a
+            // key held down cannot walk through a queue of waiting requests
+            // answering them at a screen the operator never saw.
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if self.handle(key)? {
+                            return Ok(());
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        // A click is answered against the frame it was aimed
+                        // at — `hits` is what the last `draw` put on screen —
+                        // so the burst stops on one and the next click gets a
+                        // frame of its own. Motion, drags and the wheel read
+                        // the same whenever they are handled.
+                        let aimed = matches!(mouse.kind, MouseEventKind::Down(_));
+                        if self.handle_mouse(mouse)? {
+                            return Ok(());
+                        }
+                        if aimed {
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                Event::Mouse(mouse) if self.handle_mouse(mouse)? => return Ok(()),
-                _ => {}
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
     }
@@ -602,13 +743,72 @@ impl App {
         });
     }
 
-    /// Re-read the policy file into the console and into the running proxy.
+    /// Ask for the policy file to be re-read, and carry on drawing.
     ///
-    /// The error is handed back rather than flashed here, because what it means
-    /// depends on what the caller just did. On `r` it is a refused reload and
-    /// nothing else. After a write it is something worse — see `stale`.
-    fn refresh(&mut self) -> Result<()> {
-        self.policy.rebuild(&self.state)
+    /// Returns immediately — the reload itself happens on the reloader thread,
+    /// because it is a vault lookup per credential and then a whole policy
+    /// installed. The panes follow when the proxy has the new one in charge,
+    /// through `adopt`, which is the same path an edit made in another terminal
+    /// takes. The footer gets whatever `said` is owed when it lands.
+    fn reload(&mut self, said: Said) {
+        self.asked += 1;
+        if self.reloader.send(said).is_err() {
+            // The reloader is gone, which happens only on the way out.
+            self.asked -= 1;
+        }
+    }
+
+    /// `r`, end to end — for a test that is about what the new policy does
+    /// rather than about how it got here. Asserts that the proxy took it: a
+    /// `Said::asked` reload always leaves a line on the footer, and a refused
+    /// one leaves it in the failure colours.
+    #[cfg(test)]
+    async fn reread(&mut self) {
+        self.reload(Said::asked("re-read the policy file"));
+        self.settle().await;
+        assert!(
+            self.flash.as_ref().is_some_and(|flash| !flash.failed),
+            "the reload was refused: {:?}",
+            self.flash.as_ref().map(|flash| flash.message.clone()),
+        );
+    }
+
+    /// Wait for every reload this console asked for, the way the event loop
+    /// would.
+    ///
+    /// Only for tests. The reload is on a thread of its own now, so a test that
+    /// presses a key and then reads the panes has to wait for it — `catch_up`
+    /// is the same call the event loop makes on every pass.
+    #[cfg(test)]
+    async fn settle(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.asked > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            self.catch_up();
+        }
+        assert_eq!(self.asked, 0, "a reload never came back");
+        self.catch_up();
+    }
+
+    /// A reload the console asked for came back.
+    ///
+    /// Nothing to install here: a reload that took was announced by
+    /// `AppState::reload`, and `adopt` took the new policy on the pass that
+    /// delivered it. This is only the words.
+    fn reloaded(&mut self, result: Result<()>, said: Said) {
+        self.asked = self.asked.saturating_sub(1);
+        match result {
+            Ok(()) => {
+                if let Some(ok) = said.ok {
+                    self.say(ok);
+                }
+            }
+            // What a refusal means depends on what was done before it. After a
+            // write it is the worse story — see `stale`. On `r` it is a refused
+            // reload and nothing else.
+            Err(error) if said.wrote => self.stale(&error),
+            Err(error) => self.blame(&error),
+        }
     }
 
     /// Report a write that landed in the file and a reload the proxy refused.
@@ -646,8 +846,10 @@ impl App {
     fn adopt(&mut self, config: Arc<crate::config::Config>) {
         // A reload the console asked for has already been reported by whatever
         // asked; saying "changed on disk" for a form the operator just
-        // submitted would be the console telling them their own news.
-        let ours = Arc::ptr_eq(&self.policy.config, &config);
+        // submitted would be the console telling them their own news. Either
+        // the panes are already on this policy, or the console has a reload of
+        // its own outstanding and this is it arriving.
+        let ours = Arc::ptr_eq(&self.policy.config, &config) || self.asked > 0;
         if let Err(error) = self.policy.show(config) {
             self.blame(&error);
             return;
@@ -699,10 +901,7 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Char('r') => match self.refresh() {
-                Ok(()) => self.say("re-read the policy file"),
-                Err(error) => self.blame(&error),
-            },
+            KeyCode::Char('r') => self.reload(Said::asked("re-read the policy file")),
             // The panic button. Shifted so it is never a slip, and answered
             // on the footer rather than behind a confirmation: the direction
             // that needs no deliberation is the one that stops everything,
@@ -1151,12 +1350,20 @@ impl App {
             };
             let report = verify::target(&config, &resolver, &name, &options).await;
             // The receiver is gone only when the console has already quit.
-            let _ = post.send((name, report));
+            let _ = post.send(Landed::Verified(name, report));
         });
     }
 
+    /// Route one finished job to whatever was waiting for it.
+    fn landed(&mut self, job: Landed) {
+        match job {
+            Landed::Verified(name, result) => self.verification_landed(name, result),
+            Landed::Reloaded(result, said) => self.reloaded(result, said),
+        }
+    }
+
     /// A verification came back.
-    fn landed(&mut self, name: String, result: Result<verify::Report>) {
+    fn verification_landed(&mut self, name: String, result: Result<verify::Report>) {
         let held = match result {
             Ok(report) => {
                 // The footer gets the short form too. It is one line under a
@@ -1282,13 +1489,15 @@ impl App {
                     Outcome::Cancel => {}
                     Outcome::Submit => match actions::submit(&self.policy, &form) {
                         Ok(effect) => {
-                            // The write succeeded; the reload is a separate
-                            // question, and the answer to it must not be
-                            // written over by this form's own good news.
-                            match self.refresh() {
-                                Ok(()) => self.say(effect.message),
-                                Err(error) => self.stale(&error),
-                            }
+                            // The write landed, which is true the moment the
+                            // file has it — so it is said now rather than at
+                            // the far end of a reload the operator should not
+                            // have to wait through. The reload is a separate
+                            // question, and only its bad answer is still worth
+                            // hearing: a refused one leaves these panes showing
+                            // the policy from before the write.
+                            self.say(effect.message);
+                            self.reload(Said::after_a_write());
                             // Before the modals below, so the report lands on a
                             // console that is not already showing a token: the
                             // token is the one thing that is only on screen
@@ -1332,15 +1541,14 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let prune = confirm.prune.unwrap_or(false);
-                let result = self.destroy(&confirm.intent, prune);
-                let reloaded = self.refresh();
                 // A `destroy` that failed wrote nothing, so its own error is
-                // the whole story and a reload that also failed is a second
-                // symptom of the same thing.
-                match (result, reloaded) {
-                    (Err(error), _) => self.blame(&error),
-                    (Ok(message), Ok(())) => self.say(message),
-                    (Ok(_), Err(error)) => self.stale(&error),
+                // the whole story and there is no reload to ask for.
+                match self.destroy(&confirm.intent, prune) {
+                    Err(error) => self.blame(&error),
+                    Ok(message) => {
+                        self.say(message);
+                        self.reload(Said::after_a_write());
+                    }
                 }
             }
             KeyCode::Char('p') if confirm.prune.is_some() => {
@@ -1451,14 +1659,15 @@ impl App {
                     Ok(landed) => {
                         self.state.broker.decide_scoped(&view.id, verdict, None);
                         // The request in hand is answered either way — that
-                        // went to the broker, not to the file. What a refused
-                        // reload costs is the standing rule: it is in the file
-                        // and it is not governing anything, which is the last
-                        // thing to tell somebody who just chose "from now on".
-                        if let Err(error) = self.refresh() {
-                            self.stale(&error);
-                            return;
-                        }
+                        // went to the broker, not to the file — and it is
+                        // answered *now*, without waiting on a reload: the
+                        // agent on the other end is holding a connection open
+                        // until it hears. What a refused reload costs is the
+                        // standing rule: it is in the file and it is not
+                        // governing anything, which is the last thing to tell
+                        // somebody who just chose "from now on", so `stale`
+                        // still says it when the reload comes back.
+                        self.reload(Said::after_a_write());
                         let until = match ttl {
                             Some(ttl) => format!(
                                 "until {}",
@@ -1590,6 +1799,15 @@ impl App {
                     .fg(Color::White)
                     .bg(Color::Red)
                     .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // The reload is off this thread now, so the console keeps answering
+        // while it runs — and something has to say that the numbers below are
+        // the previous policy's until it comes back.
+        if self.asked > 0 {
+            spans.push(Span::styled(
+                "  re-reading the policy…  ",
+                Style::default().fg(Color::Cyan),
             ));
         }
         spans.push(Span::raw(format!(
@@ -2847,6 +3065,7 @@ action = "deny"
 
         let reach = approve::reaches(&view).pop().unwrap();
         app.answer(&view, Verdict::Allow, approve::Duration::Forever, reach);
+        app.settle().await;
 
         // In the file, before the rule that asked…
         let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
@@ -2878,6 +3097,7 @@ action = "deny"
         let hour = approve::Duration::For("1h");
         let reach = approve::reaches(&view).pop().unwrap();
         app.answer(&view, Verdict::Allow, hour, reach);
+        app.settle().await;
 
         // Live now, in this process…
         assert_eq!(
@@ -2907,7 +3127,7 @@ action = "deny"
             })
             .collect();
         std::fs::write(dir.path().join("iap.toml"), expired.join("\n")).unwrap();
-        app.refresh().unwrap();
+        app.reread().await;
 
         assert_eq!(
             app.state.acl.evaluate(&view.request).action,
@@ -2959,6 +3179,7 @@ action = "deny"
             let scope = reach.scope.clone();
 
             app.answer(&view, Verdict::Allow, duration, reach);
+            app.settle().await;
             assert!(
                 app.flash.as_ref().is_some_and(|flash| !flash.failed),
                 "{duration:?}: {:?}",
@@ -3044,7 +3265,7 @@ action = "deny"
         form.fields[2].value = form::Value::Text("github".into());
 
         let effect = actions::submit(&app.policy, &form).unwrap();
-        app.refresh().unwrap();
+        app.reread().await;
         let (_, token) = effect.token.expect("a new agent is a new token");
 
         let authenticated = app.state.agents.authenticate(&token);
@@ -3112,13 +3333,14 @@ action = "allow"
             "`v` starts one, and does not block the loop waiting for it"
         );
 
-        let (name, result) = app
+        let job = app
             .inbox
             .1
             .recv()
             .await
             .expect("the verification reports back");
-        app.landed(name, result);
+        assert!(matches!(job, Landed::Verified(..)), "a verification");
+        app.landed(job);
 
         // The whole report is put in front of the operator, because a one-line
         // summary of a failure is not enough to act on.
@@ -3211,6 +3433,7 @@ action = "allow"
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
 
         assert!(app.modal.is_none(), "a saved form closes");
+        app.settle().await;
         app.clamp_cursors();
         let rendered = render(&mut app, 140, 30);
         assert!(rendered.contains("api.linear.app"), "{rendered}");
@@ -3225,6 +3448,7 @@ action = "allow"
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
         type_in(&mut app, "typed-in-the-console");
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.settle().await;
 
         app.clamp_cursors();
         let rendered = render(&mut app, 140, 30);
@@ -3248,7 +3472,7 @@ action = "allow"
         set(&mut form, "base-url", "https://api.linear.app");
 
         let effect = actions::submit(&app.policy, &form).unwrap();
-        app.refresh().unwrap();
+        app.reread().await;
 
         assert!(
             !effect.message.contains("restart"),
@@ -3321,7 +3545,7 @@ action = "allow"
         type_in(&mut app, "env:AGENT_IAP_TEST_TOKEN");
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
         assert!(app.modal.is_none(), "a saved form closes");
-        app.refresh().unwrap();
+        app.reread().await;
 
         let config = app.state.config();
         let upstream = config
@@ -3387,6 +3611,7 @@ action = "allow"
         type_in(&mut app, "https://github.example.com/api/v3");
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
         assert!(app.modal.is_none(), "a saved form closes");
+        app.settle().await;
 
         let upstream = app
             .state
@@ -3451,6 +3676,7 @@ action = "allow"
             app.modal.is_none(),
             "and then the form saves as it always did"
         );
+        app.settle().await;
 
         let auth = app.state.config().upstream("github").unwrap().auth.clone();
         assert!(
@@ -3708,6 +3934,68 @@ action = "allow"
         assert!(app.state.config().upstream("linear").is_some());
     }
 
+    /// The bug this console was reported for: `r` took seconds.
+    ///
+    /// A reload re-resolves every credential the policy names, and an `op://`
+    /// reference is a subprocess and a network round trip. That used to happen
+    /// on the thread that draws, so pressing `r` under a policy backed by
+    /// 1Password froze the console — the one surface an agent's request is
+    /// parked on waiting for a human — for as long as the vault took. It is on
+    /// a thread of its own now: the keystroke returns, the console keeps
+    /// drawing and keeps answering, and the reload reports back when it lands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pressing_r_answers_at_once_even_when_the_vault_is_slow() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        std::fs::write(&op, "#!/bin/sh\nsleep 1\nprintf 'sk-not-real'\n").unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = app_with(
+            dir.path(),
+            &POLICY
+                .replace(
+                    r#"secret = "env:AGENT_IAP_TEST_TOKEN""#,
+                    r#"secret = "op://Private/github/credential""#,
+                )
+                .replace(
+                    "[audit]",
+                    &format!("[server]\nop_binary = \"{}\"\n\n[audit]", op.display()),
+                ),
+        );
+
+        let started = Instant::now();
+        app.handle(KeyEvent::from(KeyCode::Char('r'))).unwrap();
+        let keystroke = started.elapsed();
+        assert!(
+            keystroke < Duration::from_millis(200),
+            "`r` held the console for {keystroke:?} — the reload is back on the drawing thread"
+        );
+
+        // And it kept drawing, with the request it exists to show still on it.
+        app.pending = vec![waiting()];
+        app.cursor[Tab::Approvals.index()].select(Some(0));
+        let rendered = render(&mut app, 140, 30);
+        assert!(rendered.contains("re-reading the policy"), "{rendered}");
+        assert!(
+            rendered.contains("POST /repos/acme/api/issues"),
+            "{rendered}"
+        );
+
+        // The reload still lands, and still says so.
+        app.settle().await;
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the vault was consulted"
+        );
+        assert_eq!(
+            app.flash.as_ref().map(|flash| flash.message.as_str()),
+            Some("re-read the policy file")
+        );
+    }
+
     /// A reload the console itself caused is not news to the console.
     #[tokio::test]
     async fn the_console_does_not_report_its_own_write_as_somebody_elses_edit() {
@@ -3740,6 +4028,7 @@ action = "allow"
         // `r`, which is the console asking for the reload the watcher would
         // have done a moment later anyway.
         app.handle(KeyEvent::from(KeyCode::Char('r'))).unwrap();
+        app.settle().await;
 
         assert!(app.flash.as_ref().is_some_and(|flash| flash.failed));
         // And the proxy is still running the policy that compiled.
@@ -4051,6 +4340,7 @@ action = "allow"
             app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
         }
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.settle().await;
 
         let written = std::fs::read_to_string(&app.policy.path).unwrap();
         assert!(written.contains("new-agent"), "the write itself landed");
@@ -4092,6 +4382,7 @@ action = "allow"
         }
         app.handle(KeyEvent::from(KeyCode::Char(' '))).unwrap();
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.settle().await;
 
         assert_eq!(views::agents(&app.policy.inventory).len(), 2);
         assert!(app.showing_a_secret(), "the token is the modal that is up");
@@ -4142,6 +4433,7 @@ action = "allow"
             "it asks first"
         );
         app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        app.settle().await;
 
         assert_eq!(app.state.acl.rule_count(), 0, "in force, not just on disk");
         // `ask`, not `deny`: the console is where the requests those rules
@@ -4230,6 +4522,7 @@ action = "allow"
             "it asks first"
         );
         app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        app.settle().await;
 
         assert!(app.showing_a_secret(), "the new token has to be on screen");
         assert!(
@@ -4262,6 +4555,7 @@ action = "allow"
 
         app.handle(KeyEvent::from(KeyCode::Char('t'))).unwrap();
         app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        app.settle().await;
 
         assert!(
             app.showing_a_secret(),

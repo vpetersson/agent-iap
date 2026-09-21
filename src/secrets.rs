@@ -127,6 +127,17 @@ pub struct SecretResolver {
     op_bin: String,
 }
 
+/// How many secret references are re-read at the same time.
+///
+/// High enough that a policy with a realistic number of `op://` references
+/// reloads in about the time one vault lookup takes, low enough that a large
+/// one does not arrive at 1Password as a burst of processes.
+const REFRESH_AT_ONCE: usize = 8;
+
+fn render(error: anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
 impl SecretResolver {
     pub fn new(op_bin: impl Into<String>) -> Self {
         SecretResolver {
@@ -158,6 +169,66 @@ impl SecretResolver {
         let secret = self.read(raw)?;
         self.cache.lock().insert(raw.to_string(), secret.clone());
         Ok(secret)
+    }
+
+    /// Re-read many references at once, one answer per reference, in the order
+    /// they were given.
+    ///
+    /// `refresh` on an `op://` reference is a subprocess and a network round
+    /// trip, and these used to be done one after another: a policy naming eight
+    /// of them cost eight vault lookups back to back. That is paid on startup,
+    /// on every `SIGHUP`, on every edit the daemon notices — and on the
+    /// console's `r`, where it was seconds of a console that had stopped
+    /// drawing the request somebody was waiting to answer.
+    ///
+    /// Nothing here depends on anything else here, so they go at once. The
+    /// bound is only so that a fifty-upstream policy does not fork fifty `op`
+    /// processes in the same instant; a locked vault answers a burst that size
+    /// with rate limits rather than with secrets.
+    ///
+    /// Only *whether* each one resolved comes back. Both callers are asking
+    /// about the references rather than about the credentials behind them, and
+    /// the values themselves are already where they are wanted — in the cache.
+    pub fn refresh_all(&self, references: &[String]) -> Vec<Result<(), String>> {
+        if references.len() < 2 {
+            return references
+                .iter()
+                .map(|reference| self.refresh(reference).map(|_| ()).map_err(render))
+                .collect();
+        }
+
+        let width = references.len().div_ceil(REFRESH_AT_ONCE);
+        std::thread::scope(|scope| {
+            let running: Vec<_> = references
+                .chunks(width)
+                .map(|chunk| {
+                    (
+                        chunk,
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|reference| {
+                                    self.refresh(reference).map(|_| ()).map_err(render)
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                })
+                .collect();
+            running
+                .into_iter()
+                .flat_map(|(chunk, handle)| match handle.join() {
+                    Ok(answers) => answers,
+                    // A panicked read is not a reference that resolved. Fail
+                    // closed: every reference in that chunk is reported
+                    // unresolved, which is what refuses the policy.
+                    Err(_) => chunk
+                        .iter()
+                        .map(|_| Err("panicked while reading this reference".to_string()))
+                        .collect(),
+                })
+                .collect()
+        })
     }
 
     /// Resolve a raw reference string, returning a cached value when there is
@@ -344,6 +415,99 @@ mod tests {
                 .expose(),
             reference
         );
+    }
+
+    /// A `1Password` stand-in that takes as long as the real one does, so the
+    /// shape of the cost is the thing under test rather than the cost itself.
+    #[cfg(unix)]
+    fn slow_op(dir: &std::path::Path, millis: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let op = dir.join("op");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\n\
+                 sleep {}\n\
+                 printf 'value-for-%s' \"$3\"\n",
+                millis as f64 / 1000.0
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        op
+    }
+
+    /// The reload cost that made the console unusable: every `op://` reference
+    /// in the file was read one after another, so a policy with eight of them
+    /// paid eight vault round trips in a row — on startup, on every `SIGHUP`,
+    /// and on `r`, where it was seconds of a console that had stopped drawing.
+    ///
+    /// The bound is deliberately loose. What is being asserted is that the cost
+    /// no longer scales with the number of references, not a particular number
+    /// of milliseconds on a particular machine.
+    #[cfg(unix)]
+    #[test]
+    fn many_references_cost_about_one_lookup_rather_than_one_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = slow_op(dir.path(), 200);
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let references: Vec<String> = (0..8)
+            .map(|n| format!("op://Private/item-{n}/credential"))
+            .collect();
+
+        let started = std::time::Instant::now();
+        let answers = resolver.refresh_all(&references);
+        let took = started.elapsed();
+
+        assert!(answers.iter().all(|answer| answer.is_ok()), "{answers:?}");
+        // The stand-in really did sleep, so the bound below means something.
+        assert!(
+            took >= std::time::Duration::from_millis(150),
+            "the stand-in did not run: {took:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(800),
+            "eight 200ms lookups took {took:?} — they are still happening one at a time"
+        );
+        // And every value actually landed in the cache, under its own reference.
+        for (n, reference) in references.iter().enumerate() {
+            assert_eq!(
+                resolver.resolve(reference).unwrap().expose(),
+                format!("value-for-op://Private/item-{n}/credential")
+            );
+        }
+    }
+
+    /// Reading them at once must not reorder the answers. The list of failures
+    /// is what an operator reads to find the line of the file that is wrong, so
+    /// it is paired with the references by position.
+    #[test]
+    fn an_answer_comes_back_beside_the_reference_it_belongs_to() {
+        std::env::set_var("AGENT_IAP_ORDER_TEST", "sk-not-real");
+        let resolver = SecretResolver::new("op-not-installed");
+        let references: Vec<String> = (0..12)
+            .map(|n| match n % 3 {
+                0 => "env:AGENT_IAP_ORDER_TEST".to_string(),
+                1 => format!("env:AGENT_IAP_UNSET_{n}"),
+                _ => format!("literal:value-{n}"),
+            })
+            .collect();
+
+        let answers = resolver.refresh_all(&references);
+        assert_eq!(answers.len(), references.len());
+        for (index, answer) in answers.iter().enumerate() {
+            match index % 3 {
+                1 => {
+                    let error = answer.as_ref().expect_err("an unset variable");
+                    assert!(
+                        error.contains(&format!("AGENT_IAP_UNSET_{index}")),
+                        "answer {index} names the wrong reference: {error}"
+                    );
+                }
+                _ => assert!(answer.is_ok(), "answer {index}: {answer:?}"),
+            }
+        }
     }
 
     #[test]

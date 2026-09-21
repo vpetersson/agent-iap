@@ -81,12 +81,16 @@ fn timeouts_changed(current: &Config, edited: &Config) -> bool {
 /// on the policy it already had (`AppState::reload` resolves before it swaps).
 fn preload_secrets(config: &Config, resolver: &SecretResolver) -> Result<()> {
     let references = config.secret_refs();
-    let mut failures = Vec::new();
-    for reference in &references {
-        if let Err(error) = resolver.refresh(reference) {
-            failures.push((reference.clone(), format!("{error:#}")));
-        }
-    }
+    // All at once rather than one after another: see `refresh_all`. Every
+    // reference is still read, and the failures still come back in file order,
+    // because this list is what an operator reads to find the line that is
+    // wrong.
+    let failures: Vec<(String, String)> = resolver
+        .refresh_all(&references)
+        .into_iter()
+        .zip(&references)
+        .filter_map(|(answer, reference)| answer.err().map(|error| (reference.clone(), error)))
+        .collect();
     if failures.is_empty() {
         return Ok(());
     }
