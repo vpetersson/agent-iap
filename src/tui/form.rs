@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::borrow::Cow;
 
 use super::browse::{self, Browser, Pick};
+use super::choose::{Candidate, Chooser};
 use crate::config::AuthConfig;
 use crate::enroll::{AuthInput, AUTH_SCHEMES};
 
@@ -49,6 +50,19 @@ pub struct Field {
     /// so it can be filled in from the file picker as well as typed. See
     /// `browse`.
     pub browses: bool,
+    /// Names this field could take that the policy file already holds — the
+    /// enrolled agents, the upstreams, the MCP servers — offered as a list on
+    /// the same key the file picker uses. Empty where there is nothing to
+    /// offer, and a text field either way: an ACL glob is on no list. See
+    /// `choose`.
+    pub offers: Vec<Candidate>,
+    /// What the `offers` list is a list of, for the picker's title.
+    what: &'static str,
+    /// Has the operator put anything in this field? A prefilled default is
+    /// not an answer — the `*` on an ACL rule is the form talking, not the
+    /// operator — so an offer of the names it could hold stays up over one,
+    /// and comes off the moment there is a value somebody chose.
+    touched: bool,
 }
 
 impl Field {
@@ -64,6 +78,9 @@ impl Field {
             value: Value::Text(String::new()),
             shown_for: None,
             browses: false,
+            offers: Vec::new(),
+            what: "",
+            touched: false,
         }
     }
 
@@ -151,6 +168,28 @@ impl Field {
         self
     }
 
+    /// Say what this field could name that the policy file already holds, so
+    /// `ctrl-o` on it offers them. `what` completes "pick …": `an agent`.
+    ///
+    /// A field offered an empty list keeps no affordance at all — a policy
+    /// with no upstreams in it yet has nothing to show, and a picker that
+    /// opens on an empty box is worse than one that was never advertised.
+    pub fn offering(mut self, what: &'static str, candidates: Vec<Candidate>) -> Self {
+        self.what = what;
+        self.offers = candidates;
+        self
+    }
+
+    /// Which picker `ctrl-o` opens here, or nothing for a field with none
+    /// behind it.
+    fn opens(&self) -> Option<Opens> {
+        match (self.browses, self.offers.is_empty()) {
+            (true, _) => Some(Opens::Files),
+            (false, false) => Some(Opens::Names),
+            (false, true) => None,
+        }
+    }
+
     fn rendered(&self) -> String {
         match &self.value {
             Value::Text(text) => text.clone(),
@@ -169,9 +208,9 @@ pub struct Hits {
     /// The whole dialogue, so a click outside it can be told from one inside.
     pub popup: Rect,
     pub fields: Vec<(Rect, usize)>,
-    /// Everywhere `ctrl-o browse` was drawn for the focused field: once on the
-    /// field's own line, once in the key row. Clicking any of them opens the
-    /// picker.
+    /// Everywhere the focused field's `ctrl-o` affordance was drawn: once on
+    /// the field's own line, once in the key row. Clicking any of them opens
+    /// that field's picker.
     pub browse: Vec<Rect>,
     /// The picker, when it is open over the form. Present means it owns the
     /// screen, and the fields underneath are not reachable.
@@ -200,10 +239,59 @@ pub struct Form {
     /// this module knows nothing about the catalogue, only that the first
     /// field decides what the rest of them are.
     pub picker: bool,
-    /// The file picker, open over this form and filling one of its fields.
-    /// While it is up it takes every keystroke — including `enter`, which in
-    /// here opens a directory rather than submitting an unfinished form.
-    browser: Option<Browser>,
+    /// A picker, open over this form and filling one of its fields. While one
+    /// is up it takes every keystroke — including `enter`, which in there
+    /// opens a directory rather than submitting an unfinished form.
+    overlay: Option<Overlay>,
+}
+
+/// A picker open over the form.
+///
+/// Two of them, reached by the same key and both answering with a string the
+/// form writes into the field it was opened from: the filesystem, for a field
+/// that names a file, and the policy file's own names, for a field that names
+/// something already in it.
+enum Overlay {
+    Files(Browser),
+    Names(Chooser),
+}
+
+impl Overlay {
+    /// Which field the pick lands in.
+    fn field(&self) -> usize {
+        match self {
+            Overlay::Files(browser) => browser.field,
+            Overlay::Names(chooser) => chooser.field,
+        }
+    }
+
+    fn handle(&mut self, key: KeyEvent) -> Pick {
+        match self {
+            Overlay::Files(browser) => browser.handle(key),
+            Overlay::Names(chooser) => chooser.handle(key),
+        }
+    }
+
+    fn click(&mut self, at: usize, double: bool) -> Pick {
+        match self {
+            Overlay::Files(browser) => browser.click(at, double),
+            Overlay::Names(chooser) => chooser.click(at, double),
+        }
+    }
+
+    fn scroll(&mut self, up: bool) {
+        match self {
+            Overlay::Files(browser) => browser.scroll(up),
+            Overlay::Names(chooser) => chooser.scroll(up),
+        }
+    }
+
+    fn render(&self, frame: &mut Frame, area: Rect) -> browse::Hits {
+        match self {
+            Overlay::Files(browser) => browser.render(frame, area),
+            Overlay::Names(chooser) => chooser.render(frame, area),
+        }
+    }
 }
 
 /// Which enrolment a filled-in form is.
@@ -230,7 +318,7 @@ impl Form {
             focus: 0,
             error: None,
             picker: false,
-            browser: None,
+            overlay: None,
         };
         form.focus = form.visible().first().copied().unwrap_or(0);
         form
@@ -247,14 +335,21 @@ impl Form {
         self.fields
             .iter()
             .enumerate()
-            .filter(|(_, field)| match &field.shown_for {
-                None => true,
-                Some((other, allowed)) => self
-                    .raw(other)
-                    .is_some_and(|value| allowed.iter().any(|option| option == &value)),
-            })
+            .filter(|(_, field)| self.shows(&field.shown_for))
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// Does what a `shown_for` guards belong on screen as the form now reads?
+    /// Shared by the fields and by a picker's candidates, so a rule narrowed
+    /// to one surface hides the same things in both places.
+    fn shows(&self, shown_for: &Option<(&'static str, Vec<String>)>) -> bool {
+        match shown_for {
+            None => true,
+            Some((other, allowed)) => self
+                .raw(other)
+                .is_some_and(|value| allowed.iter().any(|option| option == &value)),
+        }
     }
 
     fn raw(&self, key: &str) -> Option<String> {
@@ -369,8 +464,8 @@ impl Form {
     }
 
     pub fn handle(&mut self, key: KeyEvent) -> Outcome {
-        if self.browser.is_some() {
-            return self.handle_browse(key);
+        if self.overlay.is_some() {
+            return self.handle_picker(key);
         }
         let visible = self.visible();
         let at = visible.iter().position(|index| *index == self.focus);
@@ -396,7 +491,7 @@ impl Form {
                     text.clear();
                 }
             }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.browse(),
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.pick(),
             code => self.edit(code),
         }
 
@@ -414,49 +509,66 @@ impl Form {
             .map(|field| &mut field.value)
     }
 
-    /// Is the picker up? The console asks because the wheel and a click mean
-    /// different things over it than they do over the form.
+    /// Is a picker up? The console asks because the wheel and a click mean
+    /// different things over one than they do over the form.
     pub fn browsing(&self) -> bool {
-        self.browser.is_some()
+        self.overlay.is_some()
     }
 
-    /// Open the picker on the focused field, when that field names a file.
-    /// A no-op anywhere else: `ctrl-o` on a header name has nothing to pick.
-    pub fn browse(&mut self) {
+    /// Open the focused field's picker: the filesystem for a field that names
+    /// a file, the policy file's own names for one that names something in it.
+    /// A no-op anywhere else — `ctrl-o` on a header name has nothing to pick.
+    pub fn pick(&mut self) {
         let Some(field) = self.fields.get(self.focus) else {
             return;
         };
-        let (true, Value::Text(text)) = (field.browses, &field.value) else {
+        let Value::Text(text) = &field.value else {
             return;
         };
-        self.browser = Some(Browser::open(self.focus, text));
+        self.overlay = match field.opens() {
+            Some(Opens::Files) => Some(Overlay::Files(Browser::open(self.focus, text))),
+            Some(Opens::Names) => {
+                // Only the candidates this form's own choices leave standing:
+                // a rule already narrowed to `kind = mcp` should not be
+                // offered an upstream it can never match.
+                let offered: Vec<Candidate> = field
+                    .offers
+                    .iter()
+                    .filter(|candidate| self.shows(&candidate.shown_for))
+                    .cloned()
+                    .collect();
+                (!offered.is_empty())
+                    .then(|| Overlay::Names(Chooser::open(self.focus, field.what, offered, text)))
+            }
+            None => return,
+        };
     }
 
     /// A click on a row of the open picker.
     pub fn click_browse(&mut self, at: usize, double: bool) {
-        let Some(browser) = &mut self.browser else {
+        let Some(overlay) = &mut self.overlay else {
             return;
         };
-        let picked = browser.click(at, double);
+        let picked = overlay.click(at, double);
         self.settle(picked);
     }
 
     /// The wheel over the open picker.
     pub fn scroll_browse(&mut self, up: bool) {
-        if let Some(browser) = &mut self.browser {
-            browser.scroll(up);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.scroll(up);
         }
     }
 
-    fn handle_browse(&mut self, key: KeyEvent) -> Outcome {
-        let Some(browser) = &mut self.browser else {
+    fn handle_picker(&mut self, key: KeyEvent) -> Outcome {
+        let Some(overlay) = &mut self.overlay else {
             return Outcome::Continue;
         };
-        let picked = browser.handle(key);
+        let picked = overlay.handle(key);
         self.settle(picked);
-        // Never `Submit`: `enter` in the picker opens a directory, and a form
-        // that saved itself halfway through choosing a file would write the
-        // credential that was there before.
+        // Never `Submit`: `enter` in a picker opens a directory or takes a
+        // name, and a form that saved itself halfway through choosing one
+        // would write whatever the field held before.
         Outcome::Continue
     }
 
@@ -465,19 +577,21 @@ impl Form {
         let field = match picked {
             Pick::Continue => return,
             Pick::Close => {
-                self.browser = None;
+                self.overlay = None;
                 return;
             }
-            Pick::Chose(reference) => {
-                let Some(browser) = self.browser.take() else {
+            Pick::Chose(value) => {
+                let Some(overlay) = self.overlay.take() else {
                     return;
                 };
-                if let Some(Value::Text(text)) =
-                    self.fields.get_mut(browser.field).map(|f| &mut f.value)
-                {
-                    *text = reference;
+                let at = overlay.field();
+                if let Some(field) = self.fields.get_mut(at) {
+                    if let Value::Text(text) = &mut field.value {
+                        *text = value;
+                        field.touched = true;
+                    }
                 }
-                browser.field
+                at
             }
         };
         // Back on the field that was just filled in, not wherever the form
@@ -486,13 +600,17 @@ impl Form {
     }
 
     fn edit(&mut self, code: KeyCode) {
-        let Some(value) = self.focused_mut() else {
+        let Some(field) = self.fields.get_mut(self.focus) else {
             return;
         };
-        match (code, value) {
-            (KeyCode::Char(c), Value::Text(text)) => text.push(c),
+        match (code, &mut field.value) {
+            (KeyCode::Char(c), Value::Text(text)) => {
+                text.push(c);
+                field.touched = true;
+            }
             (KeyCode::Backspace, Value::Text(text)) => {
                 text.pop();
+                field.touched = true;
             }
             (KeyCode::Char(' '), Value::Flag(on)) => *on = !*on,
             (KeyCode::Left, Value::Flag(on)) | (KeyCode::Right, Value::Flag(on)) => *on = !*on,
@@ -614,28 +732,39 @@ impl Form {
                         },
                     ),
                 ];
-                // A field that names a file says so on its own line, while
-                // the cursor is on it and there is nothing in it yet — and
-                // says it the way every other affordance in this console
-                // does, as the key and then what the key does. A lone
-                // highlighted word reads as decoration: it tells you a picker
-                // exists without telling you how to reach it, which is worse
-                // than not drawing it at all.
+                // A field with a picker behind it says so on its own line
+                // while the cursor is on it — and says it the way every other
+                // affordance in this console does, as the key and then what
+                // the key does. A lone highlighted word reads as decoration:
+                // it tells you a picker exists without telling you how to
+                // reach it, which is worse than not drawing it at all.
                 //
-                // It goes the moment you type. Sitting immediately past the
-                // caret, it reads as part of the value being entered —
-                // `op://` followed by a highlighted `ctrl-o` is a field that
-                // looks like it already contains something it does not — and
-                // an offer to go and find a file is noise over somebody who
-                // is plainly typing a reference to somewhere else. The key
-                // row below keeps it for as long as the cursor is here, so
-                // the route is announced without standing in the way of the
-                // thing it is announcing itself next to.
-                if focused && field.browses && blank {
+                // A file field's offer goes the moment you type in it.
+                // Sitting immediately past the caret it reads as part of the
+                // value being entered — `op://` followed by a highlighted
+                // `ctrl-o` is a field that looks like it already contains
+                // something it does not — and an offer to go and find a file
+                // is noise over somebody who is plainly typing a reference to
+                // somewhere else. The key row below keeps it for as long as
+                // the cursor is here, so the route is announced without
+                // standing in the way of the thing it is announcing itself
+                // next to.
+                //
+                // A list of names goes when one has been chosen, and not
+                // before: an ACL rule's `agent` opens on `*`, which is the
+                // form's own widest default rather than anything the operator
+                // said, and a field nobody has answered yet is exactly where
+                // the offer belongs. `ctrl-u` empties it and the offer comes
+                // back, as it does for a path.
+                let offer = field.opens().filter(|opens| match opens {
+                    Opens::Files => blank,
+                    Opens::Names => blank || !field.touched,
+                });
+                if let (true, Some(opens)) = (focused, offer) {
                     let before = 4 + label_width + shown.chars().count();
-                    spans.push(Span::styled(BROWSE_KEY, key_style()));
-                    spans.push(Span::raw(BROWSE_WHAT));
-                    hits.browse.extend(fits(line, before, BROWSE_WIDTH));
+                    spans.push(Span::styled(PICK_KEY, key_style()));
+                    spans.push(Span::raw(opens.what()));
+                    hits.browse.extend(fits(line, before, opens.width()));
                 }
                 Line::from(spans)
             })
@@ -644,10 +773,10 @@ impl Form {
         frame.render_widget(Paragraph::new(lines), rows[1]);
 
         let hint: Cow<'_, str> = match self.fields.get(self.focus) {
-            Some(field) if field.browses => {
-                Cow::Owned(format!("{}  —  ctrl-o to pick the file", field.hint))
-            }
-            Some(field) => Cow::Borrowed(field.hint.as_ref()),
+            Some(field) => match field.opens() {
+                Some(opens) => Cow::Owned(format!("{}  —  ctrl-o {}", field.hint, opens.route())),
+                None => Cow::Borrowed(field.hint.as_ref()),
+            },
             None => Cow::Borrowed(""),
         };
         let footer = match &self.error {
@@ -672,37 +801,64 @@ impl Form {
             Span::styled(" esc ", key_style()),
             Span::raw(" cancel"),
         ];
-        if self
-            .fields
-            .get(self.focus)
-            .is_some_and(|field| field.browses)
-        {
+        if let Some(opens) = self.fields.get(self.focus).and_then(Field::opens) {
             let before: usize = keys.iter().map(|span| span.content.chars().count()).sum();
             keys.push(Span::raw("  "));
-            keys.push(Span::styled(BROWSE_KEY, key_style()));
-            keys.push(Span::raw(BROWSE_WHAT));
-            hits.browse.extend(fits(rows[3], before + 2, BROWSE_WIDTH));
+            keys.push(Span::styled(PICK_KEY, key_style()));
+            keys.push(Span::raw(opens.what()));
+            hits.browse.extend(fits(rows[3], before + 2, opens.width()));
         }
         frame.render_widget(
             Paragraph::new(Line::from(keys)).style(Style::default().fg(Color::DarkGray)),
             rows[3],
         );
 
-        // Last, and over everything else: while the picker is up it owns the
+        // Last, and over everything else: while a picker is up it owns the
         // screen, and the fields behind it are not reachable by a click.
-        if let Some(browser) = &self.browser {
-            hits.browser = Some(browser.render(frame, area));
+        if let Some(overlay) = &self.overlay {
+            hits.browser = Some(overlay.render(frame, area));
         }
 
         hits
     }
 }
 
-/// How the picker is offered, wherever it is offered: the key, then what the
-/// key does. ASCII, so `len` is the column count.
-const BROWSE_KEY: &str = " ctrl-o ";
-const BROWSE_WHAT: &str = " browse";
-const BROWSE_WIDTH: usize = BROWSE_KEY.len() + BROWSE_WHAT.len();
+/// The key every picker in this console is reached by. ASCII, so `len` is the
+/// column count.
+const PICK_KEY: &str = " ctrl-o ";
+
+/// Which picker a field opens, and how the offer of it is worded.
+///
+/// One key, two destinations, because from the operator's side they are the
+/// same offer: the console knows something about this field and will go and
+/// get it rather than making you remember it.
+#[derive(Clone, Copy)]
+enum Opens {
+    Files,
+    Names,
+}
+
+impl Opens {
+    /// What the key does, drawn after it. ASCII, as `PICK_KEY` is.
+    fn what(self) -> &'static str {
+        match self {
+            Opens::Files => " browse",
+            Opens::Names => " choose",
+        }
+    }
+
+    /// The same, spelled out for the hint line under the fields.
+    fn route(self) -> &'static str {
+        match self {
+            Opens::Files => "to pick the file",
+            Opens::Names => "to choose from what the policy file holds",
+        }
+    }
+
+    fn width(self) -> usize {
+        PICK_KEY.len() + self.what().len()
+    }
+}
 
 /// The hit box for something `width` columns wide drawn `before` columns into
 /// `line` — or nothing at all, when the line was too narrow to have drawn it
