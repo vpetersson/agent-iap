@@ -1055,16 +1055,74 @@ fn mcp_handshake_warning(config: &Config, server: &McpServerConfig) -> Option<St
     if !reachable || config.acl_default.action == Action::Allow {
         return None;
     }
+    // What actually happens to the handshake is whatever `acl_default` says, so
+    // name it rather than asserting a `deny` the file may not contain: under
+    // `ask` the session does not fail, it stops on a human every time it opens,
+    // which is its own thing to go and fix.
+    let fallthrough = match config.acl_default.action {
+        Action::Ask => {
+            "The handshake will fall through to `<default>`, which is `ask`, so\n\
+                        every session stops on a human — and denies outright wherever there\n\
+                        is no console."
+        }
+        _ => {
+            "The handshake will be denied by `<default>`, and the agent will see a\n\
+              server that never starts."
+        }
+    };
     Some(format!(
         "mcp server `{name}` has rules, but none of them admits `initialize`.\n\
-         The handshake will be denied by `<default>`, and the agent will see a\n\
-         server that never starts. Add a session rule before the tool rules:\n\n\
+         {fallthrough} Add a session rule before the tool rules:\n\n\
          \x20 agent-iap acl add --kind mcp --target {name} --paths '**' \\\n\
          \x20   {fix} --action allow",
         name = server.name,
         fix = session_methods(),
     ))
 }
+
+/// A policy in which nothing can ever stop on a human.
+///
+/// No rule says `ask` and `acl_default` does not either, so every request the
+/// rules do not cover is settled without anybody being asked. That is a
+/// perfectly good deployment when it was chosen; it is the reported bug when it
+/// was not — the console draws an empty queue, the audit log fills with
+/// `<default>` decisions, and nothing on screen connects the two.
+///
+/// The diagnosis is shared by `check`, `run`'s headless banner and the console,
+/// because three wordings of one state is how an operator ends up believing the
+/// most optimistic of them. The way out is not: a console names the key it is
+/// on, a terminal names the command.
+pub fn cannot_ask_warning(rules: &[AclRuleConfig], default: Action) -> Option<String> {
+    if default == Action::Ask || rules.iter().any(|rule| rule.action == Action::Ask) {
+        return None;
+    }
+    let settled = match default {
+        Action::Allow => "forwarded",
+        _ => "refused",
+    };
+    let rule_list = match rules.len() {
+        0 => "There are no rules at all.".to_string(),
+        1 => "There is one rule.".to_string(),
+        count => format!("The {count} rules cover what they cover."),
+    };
+    // One paragraph, unwrapped: every surface that shows this has its own idea
+    // of how wide it is. `wrap` is here for the ones that have to decide.
+    Some(format!(
+        "nothing in this policy can ask. No rule says `ask` and `acl_default` is \
+         `{default}`. {rule_list} A request no rule covers is {settled} by \
+         `<default>`: a line in the audit log, an empty approval queue, and nothing \
+         on screen joining the two."
+    ))
+}
+
+/// How a terminal fixes the state [`cannot_ask_warning`] describes. The console
+/// has its own, because there the answer is a key rather than a command.
+pub const CANNOT_ASK_FIX: &str = "`agent-iap acl reset` makes the fallthrough a question, and \
+                                  clears the rules doing it. To keep them, one rule is enough:";
+
+/// The command under [`CANNOT_ASK_FIX`], kept off the wrapping so it arrives as
+/// one line somebody can paste.
+pub const CANNOT_ASK_COMMAND: &str = "  agent-iap acl add --action ask";
 
 fn session_methods() -> String {
     crate::profiles::MCP_SESSION_METHODS
@@ -1332,6 +1390,54 @@ fn clip(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule(action: Action) -> AclRuleConfig {
+        let action = match action {
+            Action::Allow => "allow",
+            Action::Deny => "deny",
+            Action::Ask => "ask",
+        };
+        toml::from_str(&format!("target = \"github\"\naction = \"{action}\"")).unwrap()
+    }
+
+    /// The reported state: rules gone (or never written) and a fallthrough that
+    /// settles every request without anybody seeing it.
+    #[test]
+    fn no_rules_and_a_deny_default_cannot_ask() {
+        let warning = cannot_ask_warning(&[], Action::Deny).expect("this is the reported bug");
+        assert!(
+            warning.contains("nothing in this policy can ask"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("`deny`"),
+            "it names the default: {warning}"
+        );
+        assert!(warning.contains("refused"), "{warning}");
+    }
+
+    /// An `allow` default asks nobody either — and the sentence has to stop
+    /// saying "refused", because nothing is being refused.
+    #[test]
+    fn an_allow_default_cannot_ask_either_and_says_what_it_does() {
+        let warning = cannot_ask_warning(&[rule(Action::Allow)], Action::Allow).unwrap();
+        assert!(warning.contains("forwarded"), "{warning}");
+        assert!(!warning.contains("refused"), "{warning}");
+    }
+
+    /// The two ways a policy *can* ask. Neither is warned about: a warning an
+    /// operator sees on a healthy policy is one they learn to skip.
+    #[test]
+    fn a_policy_that_can_ask_is_not_warned_about() {
+        assert!(
+            cannot_ask_warning(&[], Action::Ask).is_none(),
+            "the default asks"
+        );
+        assert!(
+            cannot_ask_warning(&[rule(Action::Allow), rule(Action::Ask)], Action::Deny).is_none(),
+            "a rule asks"
+        );
+    }
 
     fn response(status: u16, headers: &[(&str, &str)]) -> reqwest::Response {
         let mut builder = http::Response::builder().status(status);

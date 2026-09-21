@@ -553,6 +553,23 @@ impl App {
         self.cursor[self.tab.index()].selected()
     }
 
+    /// Why the approval queue is going to stay empty, if it is.
+    ///
+    /// The same diagnosis `check` and the headless banner give, from the policy
+    /// as the file has it, with the way out spelled as the key it is on rather
+    /// than as a command — this console is where `R` lives. Lockdown also stops
+    /// the queue and is not this: the header says `LOCKDOWN` in red, and the
+    /// policy underneath it is still whatever it was.
+    fn cannot_ask(&self) -> Option<String> {
+        let config = &self.policy.config;
+        let warning = verify::cannot_ask_warning(&config.acl, config.acl_default.action)?;
+        Some(format!(
+            "{warning}\n\n`R` on the rules pane (5) clears the rules and makes the fallthrough \
+             a question, so requests arrive here to be answered. One rule does it without \
+             clearing anything: `n` on that pane, with action `ask`."
+        ))
+    }
+
     /// Is a modal holding something that will not be on screen again?
     fn showing_a_secret(&self) -> bool {
         matches!(&self.modal, Some(Modal::Show(shown)) if shown.irreplaceable())
@@ -1644,6 +1661,7 @@ impl App {
                     split[1],
                     &self.pending,
                     self.cursor[index].selected(),
+                    self.cannot_ask(),
                 );
                 rows
             }
@@ -1942,17 +1960,35 @@ fn block_inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
-fn draw_request(frame: &mut Frame, area: Rect, pending: &[PendingView], selected: Option<usize>) {
+fn draw_request(
+    frame: &mut Frame,
+    area: Rect,
+    pending: &[PendingView],
+    selected: Option<usize>,
+    cannot_ask: Option<String>,
+) {
     let block = Block::default().borders(Borders::ALL).title(" request ");
 
     let Some(view) = selected.and_then(|index| pending.get(index)) else {
-        frame.render_widget(
-            Paragraph::new(
+        // An empty queue has two meanings and they are not the same news.
+        // "Nothing has come in yet" is the one this pane used to give
+        // unconditionally — under a policy that cannot ask it is a promise the
+        // queue will never keep, on the one screen an operator watches while
+        // the audit log fills with `<default>` refusals.
+        let (text, style) = match cannot_ask {
+            Some(reason) => (reason, Style::default().fg(Color::Yellow)),
+            None => (
                 "Nothing is waiting.\n\nRequests matching an `ask` rule appear here, and the \
-                 dialogue opens by itself.",
-            )
-            .style(Style::default().fg(Color::DarkGray))
-            .block(block),
+                 dialogue opens by itself."
+                    .to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .style(style)
+                .block(block),
             area,
         );
         return;
@@ -2707,6 +2743,57 @@ action = "ask"
         let mut app = app_for_test(dir.path());
         let rendered = render(&mut app, 120, 34);
         assert!(rendered.contains("Nothing is waiting"), "{rendered}");
+    }
+
+    /// The reported screen: agents and upstreams enrolled, no rules, the
+    /// fallthrough a `deny`, an audit log filling with `<default>` refusals —
+    /// and a pane promising that requests will turn up here.
+    #[tokio::test]
+    async fn an_empty_queue_under_a_policy_that_cannot_ask_says_why() {
+        const NO_RULES: &str = r#"
+[audit]
+path = "AUDIT"
+stderr = false
+
+[[agents]]
+id = "claude-code"
+name = "Claude Code"
+token_sha256 = "HASH"
+
+[[upstreams]]
+name = "github"
+base_url = "https://api.github.com"
+auth = { type = "bearer", secret = "env:AGENT_IAP_TEST_TOKEN" }
+
+[acl_default]
+action = "deny"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), NO_RULES);
+        let rendered = render(&mut app, 120, 34);
+
+        assert!(
+            !rendered.contains("Nothing is waiting"),
+            "a queue nothing can ever join must not say it is merely empty:\n{rendered}"
+        );
+        for expected in ["nothing in this policy can ask", "acl_default", "R"] {
+            assert!(
+                rendered.contains(expected),
+                "the pane did not say `{expected}`:\n{rendered}"
+            );
+        }
+    }
+
+    /// And the other way: a policy that can ask keeps the plain message, so the
+    /// warning cannot become the thing every console shows all the time.
+    #[tokio::test]
+    async fn a_policy_that_can_ask_keeps_the_plain_empty_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+        assert!(
+            app.cannot_ask().is_none(),
+            "the fixture policy has an `ask` rule"
+        );
     }
 
     #[tokio::test]

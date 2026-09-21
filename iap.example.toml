@@ -239,8 +239,13 @@ kind = "mcp"
 target = "github-mcp"
 action = "ask"
 
+# What happens to a request no rule above covers. `ask` stops it on a human at
+# the `agent-iap run` console, which is also how the rule that should have
+# covered it gets written. `deny` is the same policy with nobody to ask, and is
+# what a headless deployment gets whatever this says.
+
 [acl_default]
-action = "deny"
+action = "ask"
 
 # A grant with a deadline on it. This one has long since run out, which is what
 # an expired rule looks like when you find it: still numbered, still listed, and

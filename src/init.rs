@@ -34,12 +34,13 @@ pub const DEFAULT_SECRET_REF: &str = "env:ANTHROPIC_API_KEY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Template {
-    /// Server, audit and `deny` — nothing to reach and nobody to reach it.
+    /// Server, audit and a fallthrough that asks — nothing to reach yet, and
+    /// nobody to reach it.
     /// The default, because the alternatives both guess: one guesses that you
     /// want Anthropic, and both mint a token you did not ask for.
     #[default]
     Minimal,
-    /// One agent, one upstream, one rule, default deny.
+    /// One agent, one upstream, one rule, and a fallthrough that asks.
     Starter,
     /// The shipped example: GitHub, an MCP server and a service account too.
     Full,
@@ -225,8 +226,9 @@ fn minimal() -> String {
 # Nothing here is a credential — only *references* to them, resolved inside the
 # proxy at startup. This file is safe to commit.
 #
-# It has no agents and no upstreams yet: the proxy starts, listens, and denies
-# everything, because `acl_default` is deny and there is nothing to reach.
+# It has no agents and no upstreams yet: the proxy starts, listens, and there
+# is nothing to reach. Once there is, a request no rule covers stops on a human
+# at the `agent-iap run` console, because `acl_default` is ask.
 # Fill it in without editing TOML by hand:
 #
 #   agent-iap upstream add anthropic --base-url https://api.anthropic.com \
@@ -266,9 +268,15 @@ log_bodies = false               # bodies carry prompts and customer data
 
 # First matching rule wins, and with no `[[acl]]` rules every request falls
 # through to here. `action` is "allow", "deny" or "ask".
+#
+# "ask" is what makes an uncovered request visible: it stops at the console and
+# a standing answer writes the rule back here. Headless — a unit file, a
+# container — there is nobody to ask, so it denies and `run` says so at
+# startup. `agent-iap acl reset --deny` is the "nothing, and stop asking me"
+# version of this line.
 
 [acl_default]
-action = "deny"
+action = "ask"
 "##,
         audit = crate::paths::audit_file().display()
     )
@@ -339,7 +347,8 @@ headers = {{ "anthropic-version" = "2023-06-01" }}
 
 # --- policy ----------------------------------------------------------------
 # First matching rule wins. Anything unmatched falls through to acl_default,
-# so an upstream with no rule is an upstream the agent cannot reach.
+# so the upstream you add next is one the agent cannot reach until either a
+# rule names it or you answer for it at the console.
 # `action` is "allow", "deny" or "ask" — "ask" prompts a human at the `run` console.
 
 [[acl]]
@@ -351,8 +360,12 @@ methods = ["POST"]
 paths = ["/v1/messages", "/v1/messages/count_tokens"]
 action = "allow"
 
+# Everything except that one call stops on a human. `deny` here instead is the
+# same policy with nobody to ask — which is what a headless deployment gets in
+# any case, and what `agent-iap acl reset --deny` writes.
+
 [acl_default]
-action = "deny"
+action = "ask"
 "##,
         audit = crate::paths::audit_file().display()
     )
@@ -431,7 +444,11 @@ mod tests {
         assert!(config.agents.is_empty());
         assert!(config.upstreams.is_empty());
         assert!(config.acl.is_empty());
-        assert_eq!(config.acl_default.action, crate::config::Action::Deny);
+        // Nothing is granted — and an agent added tomorrow does not meet a
+        // silence. With no rules at all, `ask` is the whole policy: every
+        // request stops at the console, where the rule that should have
+        // covered it gets written.
+        assert_eq!(config.acl_default.action, crate::config::Action::Ask);
     }
 
     /// An empty policy file still has to start a proxy — that is the half of
@@ -494,9 +511,10 @@ mod tests {
             "the plaintext token must never reach the file"
         );
 
-        // Default deny plus a rule for every target the agent is granted —
-        // otherwise the file advertises an upstream it silently refuses.
-        assert_eq!(config.acl_default.action, Action::Deny);
+        // A rule for every target the agent is granted — otherwise the file
+        // advertises an upstream nothing reaches. What is *not* covered falls
+        // through to a human rather than to a silent refusal.
+        assert_eq!(config.acl_default.action, Action::Ask);
         let acl = Acl::compile(&config).unwrap();
         for target in &agent.targets {
             assert!(
