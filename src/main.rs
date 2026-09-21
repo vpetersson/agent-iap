@@ -123,8 +123,8 @@ enum Command {
         /// record of what the policy is and lifting it — `L` in the console —
         /// brings that policy straight back. Deliberately not something a
         /// reload can undo: a kill switch a config-management tool could turn
-        /// off a minute later is not one. `agent-iap acl reset` is the other
-        /// half of this — the same state, written down, for keeps.
+        /// off a minute later is not one. `agent-iap acl reset --deny` is the
+        /// other half of this — the same state, written down, for keeps.
         #[arg(long)]
         lockdown: bool,
         /// Do not ring the terminal bell when a request stops on a human.
@@ -693,20 +693,26 @@ enum AclCommand {
         #[command(flatten)]
         config: ConfigArg,
     },
-    /// Strict mode: delete every rule and set `acl_default` to `deny`.
+    /// Start over: delete every rule and set `acl_default` to `ask`.
     ///
-    /// The state `agent-iap init` writes, put back. Nothing matches, so every
-    /// request falls through to a default that now denies — and both halves
-    /// are needed, since rules under an `allow` default grant everything and
-    /// so does one surviving `allow` rule over a `deny` default.
+    /// The rule list goes, and what replaces it is a proxy that stops every
+    /// request on a human at the console — allow it once, allow it from now
+    /// on, or refuse it — which is how the rules get built back from what
+    /// actually shows up rather than from memory. Both halves are needed,
+    /// since rules under the old default survive the new one and one
+    /// surviving `allow` rule is never asked about.
     ///
-    /// It edits the file, so it lasts. What it does not do is stop a proxy
-    /// that is already running from honouring an answer given earlier in this
-    /// session; `agent-iap run --lockdown` is the switch for right now.
-    #[command(alias = "strict")]
+    /// `--deny` is the quiet version: same wipe, nothing asked, every request
+    /// refused. It edits the file, so either lasts. What neither does is stop
+    /// a proxy that is already running from honouring an answer given earlier
+    /// in this session; `agent-iap run --lockdown` is the switch for right now.
     Reset {
         #[command(flatten)]
         config: ConfigArg,
+        /// Write `acl_default = "deny"` instead of `ask`: strict mode, where
+        /// nothing matches and nothing prompts.
+        #[arg(long)]
+        deny: bool,
         /// Do not ask. Required when there is no terminal to ask at, so a
         /// script has to say it means this.
         #[arg(short = 'y', long)]
@@ -1053,7 +1059,13 @@ fn main() -> Result<()> {
             expires_in,
         }),
         Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
-        Command::Acl(AclCommand::Reset { config, yes }) => reset_rules(&config.config, yes),
+        Command::Acl(AclCommand::Reset { config, deny, yes }) => {
+            let to = match deny {
+                true => enroll::ResetTo::Deny,
+                false => enroll::ResetTo::Ask,
+            };
+            reset_rules(&config.config, to, yes)
+        }
         Command::GenToken { id, clipboard } => gen_token(&id, clipboard),
         Command::HashToken { token } => {
             let token = match token {
@@ -1824,12 +1836,22 @@ fn add_agent(
          `GET /` there answers with what this agent may reach and how to call it."
     );
     // An agent with no rule matching it is the quiet failure: the file is
-    // valid, the token works, and every call it makes is denied.
+    // valid, the token works, and every call it makes stops somewhere. Which
+    // somewhere is `acl_default`, so say what it actually says rather than
+    // assuming the `deny` a fresh file has — after an `acl reset` it asks.
     if enroll::rule_count(path)? == 0 {
-        println!(
-            "\nThere are no `[[acl]]` rules yet, so every request still falls through to \
-             `acl_default` and is denied. Add one with `agent-iap acl add`."
-        );
+        match enroll::acl_default(path)? {
+            agent_iap::config::Action::Ask => println!(
+                "\nThere are no `[[acl]]` rules yet, so every request falls through to \
+                 `acl_default`, which is `ask`: each one stops on a human at the console. \
+                 Answer one from now on, or write the rule ahead of time with \
+                 `agent-iap acl add`."
+            ),
+            action => println!(
+                "\nThere are no `[[acl]]` rules yet, so every request still falls through to \
+                 `acl_default`, which is `{action}`. Add one with `agent-iap acl add`."
+            ),
+        }
     }
     Ok(())
 }
@@ -2167,19 +2189,20 @@ fn add_rule(options: AddRule) -> Result<()> {
     Ok(())
 }
 
-/// Wipe the rule list and put `acl_default` back to `deny`.
-fn reset_rules(path: &Path, yes: bool) -> Result<()> {
+/// Wipe the rule list and write the default that decides in its absence.
+fn reset_rules(path: &Path, to: enroll::ResetTo, yes: bool) -> Result<()> {
+    let action = to.action();
     // Read before asking, so the question names what is about to go rather
     // than asking an operator to confirm a number they have to go and look up.
     let count = enroll::rule_count(path).unwrap_or(0);
     if !yes {
         let question = match count {
             0 => format!(
-                "Set `acl_default` to `deny` in {}? There are no rules to remove.",
+                "Set `acl_default` to `{action}` in {}? There are no rules to remove.",
                 path.display()
             ),
             _ => format!(
-                "Delete all {} from {} and set `acl_default` to `deny`?",
+                "Delete all {} from {} and set `acl_default` to `{action}`?",
                 plural(count, "rule"),
                 path.display()
             ),
@@ -2190,7 +2213,7 @@ fn reset_rules(path: &Path, yes: bool) -> Result<()> {
         }
     }
 
-    let reset = enroll::reset_acl(path)?;
+    let reset = enroll::reset_acl(path, to)?;
 
     // The rules by name, because this is the last place they exist. A count
     // is no help to the operator reconstructing the list afterwards, and
@@ -2209,14 +2232,29 @@ fn reset_rules(path: &Path, yes: bool) -> Result<()> {
             }
         }
     }
-    match reset.was_default {
-        agent_iap::config::Action::Deny => {
-            println!("`acl_default` was already `deny`, and still is.")
-        }
-        was => println!("`acl_default` was `{was}`, and is now `deny`."),
+    match reset.was_default == reset.now_default {
+        true => println!("`acl_default` was already `{action}`, and still is."),
+        false => println!(
+            "`acl_default` was `{}`, and is now `{action}`.",
+            reset.was_default
+        ),
     }
-    println!("Nothing matches now, so every request is denied.");
-    println!("Build it back up with `agent-iap acl add` — the audit log has what was being used.");
+    match to {
+        enroll::ResetTo::Ask => {
+            println!("Nothing matches now, so every request stops on a human at the console.");
+            println!(
+                "Answer them as they arrive — `a` allows one, and a standing answer writes the \
+                 rule back. `agent-iap acl add` still does too."
+            );
+        }
+        enroll::ResetTo::Deny => {
+            println!("Nothing matches now, so every request is denied, and nothing is asked.");
+            println!(
+                "Build it back up with `agent-iap acl add` — the audit log has what was being \
+                 used."
+            );
+        }
+    }
     reload_notice("the running proxy still decides by the old rules");
     Ok(())
 }
@@ -2256,8 +2294,9 @@ fn remove_rule(path: &Path, index: usize) -> Result<()> {
     );
     if removed.remaining == 0 {
         println!(
-            "No rules left, so every request falls through to `acl_default` — which is `deny` \
-             unless the file says otherwise."
+            "No rules left, so every request falls through to `acl_default` — which this file \
+             says is `{}`.",
+            enroll::acl_default(path)?
         );
     } else if index == removed.remaining {
         // It was the last one, so nothing behind it moved.

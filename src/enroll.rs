@@ -1053,6 +1053,34 @@ pub fn remove_rule(path: &Path, index: usize) -> Result<RuleRemoval> {
     })
 }
 
+/// What a reset leaves deciding once the rules are gone.
+///
+/// Two values rather than an `Action`, because `allow` is not one of the
+/// things a reset can mean: emptying the rule list and then letting everything
+/// through is the one outcome nobody reaches for this command to get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetTo {
+    /// Back to asking — what `agent-iap acl reset` means, and the behaviour
+    /// this proxy is modelled on. No rule matches, so every request stops on a
+    /// human at the console, who answers it once or answers it for good. An
+    /// unanswered one still denies; what changes is that somebody is given the
+    /// chance to answer at all.
+    Ask,
+    /// Strict mode — `--deny`. Nothing matches and nothing asks, so every
+    /// request is refused without a prompt, for keeps and across restarts.
+    /// `agent-iap run --lockdown` is the same state for right now.
+    Deny,
+}
+
+impl ResetTo {
+    pub fn action(self) -> Action {
+        match self {
+            ResetTo::Ask => Action::Ask,
+            ResetTo::Deny => Action::Deny,
+        }
+    }
+}
+
 /// What `reset_acl` took out, and what the policy said before it did.
 #[derive(Debug)]
 pub struct AclReset {
@@ -1061,29 +1089,38 @@ pub struct AclReset {
     /// edits — the others take out a rule the operator named — so the record
     /// of what was there is the whole of what makes it recoverable.
     pub removed: Vec<RuleRef>,
-    /// What `acl_default` was. `Deny` means the reset only removed rules,
-    /// which is worth being able to say.
+    /// What `acl_default` was, so the command can say whether the reset moved
+    /// the fall-through or only emptied the list above it.
     pub was_default: Action,
+    /// And what it is now: `ask` for a plain reset, `deny` for a strict one.
+    pub now_default: Action,
 }
 
-/// Strict mode: delete every `[[acl]]` rule and set `acl_default` to `deny`.
+/// Delete every `[[acl]]` rule and write `acl_default` — `ask` by default.
 ///
-/// The panic button, written down. Every other edit in this module is a
+/// Starting over, written down. Every other edit in this module is a
 /// considered change to one entry; this is the one an operator reaches for
-/// when they have stopped wanting to consider anything and want the proxy to
-/// stop saying yes. Afterwards nothing matches, so every request falls through
-/// to a default that now denies — the state a file written by `agent-iap init`
-/// starts in, and the state `SECURITY.md` describes as the floor.
+/// when the rule list has stopped being something they can reason about and
+/// they want to build it back from what actually shows up.
 ///
-/// Both halves matter, and neither is enough alone: rules with no `deny`
-/// default is a file whose `acl_default = "allow"` grants everything, and a
-/// `deny` default under an `allow` rule at the top grants everything too. So
-/// this writes both, and is the only edit here that touches `acl_default`.
+/// It leaves the state this proxy is modelled on: no rule matches, so every
+/// request falls through to an `ask` and stops on a human, who allows it once,
+/// allows it from now on, or says no. A `deny` default there would be quieter
+/// and worse — the requests would still be refused, but nobody would be asked,
+/// and an operator who had just wiped the rule list on purpose would have no
+/// way to put back the ones they actually wanted short of reading the audit
+/// log for 403s. `ResetTo::Deny` is that quieter state, and it is a flag
+/// because it is a different decision.
+///
+/// Both halves matter either way, and neither is enough alone: rules under a
+/// permissive default grant everything, and a tightened default under a
+/// surviving `allow` rule at the top grants everything too. So this writes
+/// both, and is the only edit here that touches `acl_default`.
 ///
 /// It does not stop what is already running: an in-flight request has been
 /// cleared, and a "remember for this session" answer lives in the process
 /// rather than the file. `agent-iap run --lockdown` is the switch for those.
-pub fn reset_acl(path: &Path) -> Result<AclReset> {
+pub fn reset_acl(path: &Path, to: ResetTo) -> Result<AclReset> {
     let mut document = read(path)?;
     let existing = document_config(&document)?;
     let removed = rules_matching(&existing, |_| true);
@@ -1095,12 +1132,13 @@ pub fn reset_acl(path: &Path) -> Result<AclReset> {
     // key is unambiguous in both spellings, which is what this edit — alone
     // among the edits here — has to be.
     document.remove("acl");
-    set_default_action(&mut document, "deny");
+    set_default_action(&mut document, &to.action().to_string());
 
     save(path, document)?;
     Ok(AclReset {
         removed,
         was_default: existing.acl_default.action,
+        now_default: to.action(),
     })
 }
 
@@ -1194,6 +1232,17 @@ fn render(key: &str, entry: Table) -> String {
 /// earlier `deny` already shadowed.
 pub fn rule_count(path: &Path) -> Result<usize> {
     Ok(document_config(&read(path)?)?.acl.len())
+}
+
+/// What an unmatched request falls through to, as the file has it.
+///
+/// The companion to `rule_count`, and needed by everything that says what an
+/// empty rule list means: "no rules" only reads as "denied" while the default
+/// denies, and `reset_acl` can leave it asking. A message that assumed one
+/// would be confidently wrong in exactly the state an operator reached for a
+/// reset to get into.
+pub fn acl_default(path: &Path) -> Result<Action> {
+    Ok(document_config(&read(path)?)?.acl_default.action)
 }
 
 /// A rule as `agent-iap list acl` identifies it: the number `acl rm` takes, and
@@ -2780,26 +2829,41 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_takes_out_every_rule_and_puts_the_default_back_to_deny() {
+    fn a_reset_takes_out_every_rule_and_leaves_the_default_asking() {
         let (_dir, path) = populated_policy();
         // The state a reset is for: a file that has been edited into saying
         // yes by default, with rules on top that say yes some more.
         set_default(&path, "allow");
         assert_eq!(load(&path).acl_default.action, Action::Allow);
 
-        let reset = reset_acl(&path).unwrap();
+        let reset = reset_acl(&path, ResetTo::Ask).unwrap();
 
         assert_eq!(reset.removed.len(), 3);
         assert_eq!(reset.was_default, Action::Allow);
-        // Both halves: rules with an `allow` default still grants everything,
-        // and a `deny` default under a surviving `allow` rule does too.
+        assert_eq!(reset.now_default, Action::Ask);
+        // Both halves: rules under an `allow` default still grant everything,
+        // and an `ask` default under a surviving `allow` rule never asks.
+        let config = load(&path);
+        assert!(config.acl.is_empty());
+        assert_eq!(config.acl_default.action, Action::Ask);
+        // And nothing else went with them — a reset that also revoked the
+        // agents is one nobody reaches for.
+        assert_eq!(config.upstreams.len(), 2);
+        assert!(!config.agents.is_empty());
+    }
+
+    /// The other half of the same command: same wipe, but nothing is asked.
+    #[test]
+    fn a_strict_reset_writes_the_default_that_does_not_ask() {
+        let (_dir, path) = populated_policy();
+        set_default(&path, "allow");
+
+        let reset = reset_acl(&path, ResetTo::Deny).unwrap();
+
+        assert_eq!(reset.now_default, Action::Deny);
         let config = load(&path);
         assert!(config.acl.is_empty());
         assert_eq!(config.acl_default.action, Action::Deny);
-        // And nothing else went with them — a panic button that also revoked
-        // the agents is one nobody presses.
-        assert_eq!(config.upstreams.len(), 2);
-        assert!(!config.agents.is_empty());
     }
 
     #[test]
@@ -2808,7 +2872,7 @@ mod tests {
         // command can print it rather than a count.
         let (_dir, path) = populated_policy();
 
-        let reset = reset_acl(&path).unwrap();
+        let reset = reset_acl(&path, ResetTo::Ask).unwrap();
 
         let named: Vec<_> = reset
             .removed
@@ -2825,15 +2889,15 @@ mod tests {
         // `remove_rule` refuses a file with no `[[acl]]` blocks, and is right
         // to: there is no rule 0 to take out. A reset is not asking for a
         // rule, it is asking for a state, and the file is not in it until
-        // `acl_default` says `deny`.
+        // `acl_default` says so.
         let (_dir, path) = empty_policy();
-        set_default(&path, "ask");
+        set_default(&path, "deny");
 
-        let reset = reset_acl(&path).unwrap();
+        let reset = reset_acl(&path, ResetTo::Ask).unwrap();
 
         assert!(reset.removed.is_empty());
-        assert_eq!(reset.was_default, Action::Ask);
-        assert_eq!(load(&path).acl_default.action, Action::Deny);
+        assert_eq!(reset.was_default, Action::Deny);
+        assert_eq!(load(&path).acl_default.action, Action::Ask);
     }
 
     #[test]
@@ -2853,10 +2917,10 @@ mod tests {
         .unwrap();
         assert_eq!(load(&path).acl_default.action, Action::Allow);
 
-        let reset = reset_acl(&path).unwrap();
+        let reset = reset_acl(&path, ResetTo::Ask).unwrap();
         assert_eq!(reset.removed.len(), 1);
 
-        assert_eq!(load(&path).acl_default.action, Action::Deny);
+        assert_eq!(load(&path).acl_default.action, Action::Ask);
     }
 
     #[test]
@@ -2864,7 +2928,7 @@ mod tests {
         let (_dir, path) = populated_policy();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        reset_acl(&path).unwrap();
+        reset_acl(&path, ResetTo::Ask).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
         for line in before.lines().filter(|line| line.starts_with('#')) {

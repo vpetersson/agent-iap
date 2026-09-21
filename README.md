@@ -752,8 +752,8 @@ outlive.
 # Right now, for as long as this process runs. Writes nothing.
 agent-iap run --lockdown
 
-# For keeps. Deletes every rule and puts `acl_default` back to `deny`.
-agent-iap acl reset
+# For keeps. Deletes every rule and puts `acl_default` to `deny`.
+agent-iap acl reset --deny
 ```
 
 **Lockdown** is the switch on the console: `L` engages it, `L` lifts it, and
@@ -773,14 +773,15 @@ It writes nothing, which is the point: the file is still the record of what the
 policy is, and lifting the switch serves that policy again with no window in
 between and no restart.
 
-**`acl reset`** is the other half — the same state, written down. It deletes
-every `[[acl]]` rule and sets `acl_default` to `deny`, which is the pair the
-floor needs: rules under an `allow` default grant everything, and one surviving
-`allow` rule over a `deny` default grants everything too. It is the state
-`agent-iap init` writes, put back, and the next `agent-iap run` starts from it.
+**`acl reset --deny`** is the other half — the same state, written down. It
+deletes every `[[acl]]` rule and sets `acl_default` to `deny`, which is the
+pair the floor needs: rules under an `allow` default grant everything, and one
+surviving `allow` rule over a `deny` default grants everything too. It is the
+state `agent-iap init` writes, put back, and the next `agent-iap run` starts
+from it.
 
 ```console
-$ agent-iap acl reset
+$ agent-iap acl reset --deny
 Delete all 6 rules from /home/you/.config/agent-iap/iap.toml and set
 `acl_default` to `deny`? [y/N] y
 Removed 6 rules from /home/you/.config/agent-iap/iap.toml:
@@ -788,9 +789,35 @@ Removed 6 rules from /home/you/.config/agent-iap/iap.toml:
   acl[1] `gh-read`
   …
 `acl_default` was `allow`, and is now `deny`.
-Nothing matches now, so every request is denied.
+Nothing matches now, so every request is denied, and nothing is asked.
 Build it back up with `agent-iap acl add` — the audit log has what was being used.
 ```
+
+**Without `--deny`, the same command means "start over" rather than "stop".**
+It empties the rule list exactly the same way, but writes `acl_default = "ask"`:
+nothing matches, so every request stops on a human at the console instead of
+being refused in silence. That is the state to reach for when the rule list has
+grown past what anybody can reason about and the answer is to rebuild it from
+what actually shows up — answer the calls as they arrive, and a standing answer
+writes the rule back in.
+
+```console
+$ agent-iap acl reset
+Delete all 6 rules from /home/you/.config/agent-iap/iap.toml and set
+`acl_default` to `ask`? [y/N] y
+Removed 6 rules from /home/you/.config/agent-iap/iap.toml:
+  acl[0] `anthropic-inference`
+  …
+`acl_default` was `allow`, and is now `ask`.
+Nothing matches now, so every request stops on a human at the console.
+Answer them as they arrive — `a` allows one, and a standing answer writes the rule
+back. `agent-iap acl add` still does too.
+```
+
+An `ask` nobody answers still denies, and a proxy running headless has nobody
+to ask — `agent-iap run` says so on startup when the policy can ask and no
+console is drawn. Reset without `--deny` is for the console; `--deny` is what a
+unit file wants.
 
 It asks first, and with stdin redirected it refuses rather than assuming:
 `--yes` is how a script says it means it. The agents, upstreams, MCP servers
@@ -965,7 +992,7 @@ from a shell is a form here, over the same functions with the same validation:
 | agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
 | upstreams | base URL, scheme, credential reference, last verification | `n` add, from a profile or spelled out · `e` edit · `v` verify · `x` remove |
 | mcp | transport, command or URL, credential references, last verification | `n` add · `v` verify · `x` remove |
-| acl | every rule in match order, with its number and what is left of any deadline | `n` add · `x` remove · `R` reset to strict |
+| acl | every rule in match order, with its number and what is left of any deadline | `n` add · `x` remove · `R` reset to asking |
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
 
@@ -1007,10 +1034,11 @@ back on, and most terminals let you hold ⇧ to select through it.
 
 `L` is the panic button: it denies everything for as long as the proxy runs,
 writes nothing, and the header says so in red until `L` again lifts it
-(§ Stopping everything). `R` on the rules pane is the written-down version —
-every rule out, `acl_default` back to `deny` — and asks first, being the one
-key here that can delete a policy. Both are shifted, because neither is
-something to reach by slipping off the key beside it.
+(§ Stopping everything). `R` on the rules pane is the written-down start-over —
+every rule out, `acl_default` to `ask`, so what those rules were deciding comes
+back to this console to be answered — and it asks first, being the one key here
+that can delete a policy. Both are shifted, because neither is something to
+reach by slipping off the key beside it.
 
 `?` lists the keys, and `q` quits the console and stops the proxy with it. `r`
 re-reads the policy file, though it rarely has to: the file is watched, so an
@@ -2140,7 +2168,9 @@ What this gives you:
   (§ Stopping everything).
 - No command grants anything by default. `acl add` writes `ask`, `agent add`
   refuses to enrol an agent until it is told what that agent may reach, and an
-  unmatched request falls through to `acl_default`, which is `deny`.
+  unmatched request falls through to `acl_default` — `deny` in the file
+  `agent-iap init` writes, `ask` after an `acl reset`, and never `allow` unless
+  somebody wrote it there.
 
 What it does not give you, and you should know before relying on it:
 
@@ -2190,7 +2220,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 525 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 527 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
