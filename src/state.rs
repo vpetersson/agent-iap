@@ -143,7 +143,10 @@ fn preload_secrets(config: &Config, resolver: &SecretResolver, fresh: bool) -> R
 
 impl AppState {
     pub fn build(config: Config, audit_to_stderr: bool) -> Result<Arc<Self>> {
-        let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
+        let resolver = Arc::new(
+            SecretResolver::new(config.server.op_binary.clone())
+                .with_store(config.server.secret_store_path()),
+        );
 
         // Resolve everything now: a missing key or a locked 1Password vault should
         // stop startup, not surface as a mystery 502 on the first real request.

@@ -363,7 +363,10 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
         .cloned()
         .with_context(|| format!("`{}` is not a configured MCP server", options.server))?;
 
-    let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
+    let resolver = Arc::new(
+        SecretResolver::new(config.server.op_binary.clone())
+            .with_store(config.server.secret_store_path()),
+    );
 
     // The control plane may be on TLS with a certificate no public root signs,
     // which is the normal case for a loopback listener. The bridge reads the

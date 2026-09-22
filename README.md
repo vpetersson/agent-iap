@@ -1201,7 +1201,7 @@ the policy file and the audit log live under your own directories instead:
 | | Linux, macOS, BSD | Windows |
 | --- | --- | --- |
 | Policy file | `$XDG_CONFIG_HOME/agent-iap/iap.toml`, else `~/.config/agent-iap/iap.toml` | `%APPDATA%\agent-iap\iap.toml` |
-| Audit log, `admin-token`, `agent-iap.log` | `$XDG_STATE_HOME/agent-iap/`, else `~/.local/state/agent-iap/` | `%LOCALAPPDATA%\agent-iap\` |
+| Audit log, `admin-token`, `secrets.toml`, `agent-iap.log` | `$XDG_STATE_HOME/agent-iap/`, else `~/.local/state/agent-iap/` | `%LOCALAPPDATA%\agent-iap\` |
 
 Two directories rather than one, because the files age differently. The policy
 file is configuration — small, hand-edited, safe to commit, the sort of thing
@@ -1220,9 +1220,14 @@ export IAP_STATE_DIR=/var/lib/agent-iap          # audit log, token, diagnostics
 export IAP_CONFIG_DIR=/etc/agent-iap             # where `iap.toml` is looked for
 ```
 
-`[audit].path` in the policy file moves the log on its own. An absolute path is
-taken as it stands; a relative one is taken from the state directory, never from
-the working directory.
+`[audit].path` in the policy file moves the log on its own, and
+`[server].secret_store` moves the credential store. An absolute path is taken as
+it stands; a relative one is taken from the state directory, never from the
+working directory.
+
+The store lives with the state rather than with the config for the reason the
+two directories exist at all: it holds credentials, and the config directory is
+the one that ends up in a dotfile repository.
 
 A `./iap.toml` in the current directory is still what `--config` falls back to
 when one is there, so a repository, a demo or one of the walkthroughs above can
@@ -1373,11 +1378,45 @@ plane may not share an address; that is rejected at startup.
 
 ### Where secrets come from
 
-`op://vault/item/field` (1Password CLI), `env:NAME`, `file:/path`, and
-`literal:…` for demos — which the loader warns about. Everything is resolved at
-startup, so a locked vault fails the process rather than the tenth request.
-A bare value that is not one of these forms is rejected, and the error never
-echoes what you pasted.
+`op://vault/item/field` (1Password CLI), `env:NAME`, `file:/path`,
+`iap://name` (a credential agent-iap keeps itself — see below), and `literal:…`
+for demos, which the loader warns about and the enrolment commands refuse.
+Everything is resolved at startup, so a locked vault fails the process rather
+than the tenth request. A bare value that is not one of these forms is
+rejected, and the error never echoes what you pasted.
+
+#### A credential with nowhere else to live
+
+`env:`, `file:` and `op://` all point at something that already holds the
+credential. A read-only token on a personal account often has no such place, and
+standing one up costs more than the token is worth. `iap://` is for those:
+agent-iap keeps the value, and the policy file keeps a pointer like every other
+entry.
+
+```bash
+# Reads the credential from stdin, or prompts for it without echoing.
+agent-iap secret set github-readonly
+agent-iap upstream add gh --base-url https://api.github.com \
+    --auth bearer --secret iap://github-readonly
+
+agent-iap secret list          # names, when they were set, and what uses each
+agent-iap secret rm <name>     # refuses while the policy file still points at it
+```
+
+In the console, typing a credential straight into a credential field offers
+`ctrl-k keep` on it: the value goes to the store, the field becomes the
+`iap://` reference, and the form you were filling in stays open.
+
+There is deliberately no flag carrying the value. An argument is visible to
+every process on the machine through `ps` and stays in the shell history, so a
+credential passed as one has leaked before the command starts.
+
+**What this is not.** The store is `secrets.toml` in the state directory, mode
+`0600`, and *not encrypted at rest* — anything that can read it as you can read
+the credentials, exactly as for `~/.aws/credentials` or a `.env`. That is the
+trade against `op://`, and it is the right one for a read-only token and the
+wrong one for a credential that can spend money. `[server].secret_store` moves
+the file; a relative path is taken from the state directory.
 
 1Password vaults, items and fields are named by humans, so they have spaces in
 them — `op://Private/Anthropic API/credential` is one reference, handed to `op`
@@ -2292,6 +2331,13 @@ What it does not give you, and you should know before relying on it:
   distinction matters.
 - **Response bodies are not inspected.** Nothing here stops an upstream from
   returning data the agent should not have.
+- **`iap://` is a place to keep a credential, not a way to protect one.** The
+  store is a `0600` file, not an encrypted vault: anything running as you can
+  read it, and it is only as safe as the machine. It exists so a read-only token
+  with no vault behind it can still go through the ACL and the audit log instead
+  of being pasted into an agent's environment. Put anything that can spend money,
+  or that you would have to rotate in a hurry, in `op://` or a real secret
+  manager.
 - Audit hash-chaining detects tampering by anyone who cannot rewrite the whole
   file; it is not an append-only store. Ship the lines somewhere else for that.
 

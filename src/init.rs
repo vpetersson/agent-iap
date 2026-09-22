@@ -399,7 +399,8 @@ fn check_secret_ref(reference: &str) -> Result<()> {
         // to write one in the first place is cheaper than noticing later.
         bail!(
             "`literal:` puts the credential in the policy file itself — use `op://`, `env:` \
-             or `file:` so the file stays safe to commit"
+             or `file:`, or `iap://NAME` after `agent-iap secret set NAME`, so the file \
+             stays safe to commit"
         );
     }
     if reference

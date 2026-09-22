@@ -788,7 +788,8 @@ pub fn add_mcp_server(
             if parsed.is_inline() {
                 bail!(
                     "`literal:` puts the credential in the policy file itself — use `op://`, \
-                     `env:` or `file:` so the file stays safe to commit"
+                     `env:` or `file:`, or `iap://NAME` after `agent-iap secret set NAME`, \
+                     so the file stays safe to commit"
                 );
             }
         }
@@ -1610,7 +1611,8 @@ fn check_secret_refs(auth: &AuthSpec) -> Result<()> {
         if parsed.is_inline() {
             bail!(
                 "`literal:` in `--username-secret` puts the credential in the policy file \
-                 itself — use `op://`, `env:` or `file:`"
+                 itself — use `op://`, `env:`, `file:`, or `iap://NAME` after \
+                 `agent-iap secret set NAME`"
             );
         }
         // The password is still parsed, so a bare word is still caught.
@@ -1632,7 +1634,8 @@ fn check_secret_refs(auth: &AuthSpec) -> Result<()> {
             // committable, and `literal:` is the one thing that would stop it.
             bail!(
                 "`literal:` puts the credential in the policy file itself — use `op://`, \
-                 `env:` or `file:` so the file stays safe to commit"
+                 `env:` or `file:`, or `iap://NAME` after `agent-iap secret set NAME`, so \
+                 the file stays safe to commit"
             );
         }
     }

@@ -747,6 +747,73 @@ impl App {
         matches!(&self.modal, Some(Modal::Show(shown)) if shown.irreplaceable())
     }
 
+    /// Hand the credential in the focused field to agent-iap's own store, and
+    /// put the reference to it back in the field.
+    ///
+    /// The console's answer to a credential with nowhere else to live. Typing
+    /// one into a form used to be refused twice over — not a reference, and
+    /// then `literal:` not committable — with nothing on screen saying what
+    /// would be accepted. This is what is accepted, and it is one key away from
+    /// where the refusal happened.
+    ///
+    /// Nothing is written to the policy file here. The field now holds an
+    /// ordinary reference and the form is still open, so the operator can still
+    /// cancel — which leaves a named credential in the store and nothing
+    /// pointing at it, the one direction of that pair that breaks nothing.
+    fn keep_credential(&self, form: &mut form::Form) -> Result<String> {
+        let (index, typed) = form
+            .keeping()
+            .context("there is no typed credential in this field to keep")?;
+        let key = form.fields[index].key.to_string();
+        let store = self.state.resolver.store();
+
+        // Trimmed, unlike a `literal:` payload. That payload sits in a TOML
+        // string in a file somebody edited, where a trailing space is visible
+        // and could conceivably be meant; this is a one-line text field that a
+        // credential was pasted into, where it never is — and a token carrying
+        // an invisible trailing space is a 401 with nothing on screen to
+        // explain it.
+        let value = typed.trim();
+        let name = self.store_name(&key, form.subject().as_deref())?;
+        store.set(&name, value).context("storing the credential")?;
+        form.fill(index, format!("iap://{name}"));
+        Ok(name)
+    }
+
+    /// A name for a credential the operator did not name.
+    ///
+    /// Derived from what is being enrolled, so `secret list` reads as an
+    /// inventory rather than as `credential-1`…`credential-4`. Never one that
+    /// is already taken: the operator did not choose this name, so it must not
+    /// be the thing that silently replaces another upstream's credential.
+    fn store_name(&self, field_key: &str, subject: Option<&str>) -> Result<String> {
+        let mut base = match subject.map(sanitise_name).filter(|s| !s.is_empty()) {
+            Some(subject) => subject,
+            None => "credential".to_string(),
+        };
+        // `secret` is the only credential on most schemes, so naming it adds
+        // nothing; `client-secret` and `private-key` are not, and a store with
+        // two `stripe` entries in it would be a store nobody can read.
+        if field_key != "secret" {
+            base.push('-');
+            base.push_str(&sanitise_name(field_key));
+        }
+        let store = self.state.resolver.store();
+        let taken: std::collections::HashSet<String> = store
+            .list()
+            .context("reading the credential store")?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        if !taken.contains(&base) {
+            return Ok(base);
+        }
+        (2..100)
+            .map(|n| format!("{base}-{n}"))
+            .find(|candidate| !taken.contains(candidate))
+            .context("too many stored credentials share that name — `agent-iap secret list`")
+    }
+
     fn say(&mut self, message: impl Into<String>) {
         self.flash = Some(Flash {
             message: message.into(),
@@ -1128,6 +1195,12 @@ impl App {
         // be tested before the line it is drawn on.
         if hits.browse.iter().any(|rect| within(*rect, at)) {
             self.handle_modal(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+            return;
+        }
+        // And `ctrl-k keep this value`, on the same terms — it is drawn on the
+        // focused field's own line too, so it is tested before that line.
+        if hits.keep.iter().any(|rect| within(*rect, at)) {
+            self.handle_modal(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
             return;
         }
         let Some((_, index)) = hits.fields.iter().find(|(rect, _)| within(*rect, at)) else {
@@ -1580,6 +1653,19 @@ impl App {
                         self.modal = Some(Modal::Form(form))
                     }
                     Outcome::Cancel => {}
+                    Outcome::Keep => {
+                        match self.keep_credential(&mut form) {
+                            Ok(name) => {
+                                // The error, if there was one, is what sent
+                                // them here — it is answered now and must not
+                                // stay under a field that has been fixed.
+                                form.error = None;
+                                self.say(format!("agent-iap is keeping it as `iap://{name}`"));
+                            }
+                            Err(error) => form.error = Some(format!("{error:#}")),
+                        }
+                        self.modal = Some(Modal::Form(form));
+                    }
                     Outcome::Submit => match actions::submit(&self.policy, &form) {
                         Ok(effect) => {
                             // The write landed, which is true the moment the
@@ -3037,6 +3123,28 @@ fn profile_fields(profile: &Profile) -> Vec<Field> {
     fields
 }
 
+/// A store name from something a human wrote: an upstream's name, a field key.
+///
+/// The store's own `check_name` is the rule; this is what makes an arbitrary
+/// string obey it, because the name here is derived rather than typed and a
+/// refusal the operator cannot act on is not a refusal worth making.
+fn sanitise_name(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.trim().chars() {
+        match c {
+            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') => out.push(c),
+            // One separator per run of anything else, so `My API (read)` is
+            // `My-API-read` rather than `My-API--read-`.
+            _ if !out.ends_with('-') && !out.is_empty() => out.push('-'),
+            _ => {}
+        }
+    }
+    // 48 leaves room under the store's own 64 for the `-2` a clash appends and
+    // for a field key on a scheme with more than one credential.
+    out.truncate(48);
+    out.trim_matches('-').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3077,6 +3185,10 @@ action = "ask"
         std::env::set_var("AGENT_IAP_TEST_TOKEN", "sk-not-real");
         let text = policy
             .replace("AUDIT", &dir.join("audit.jsonl").display().to_string())
+            // A console test may write a credential to the store, so every one
+            // of them points at its own — never the one belonging to whoever is
+            // running the suite.
+            .replace("STORE", &dir.join("secrets.toml").display().to_string())
             .replace("HASH", &crate::identity::token_hash("iap_test"));
         let path = dir.join("iap.toml");
         std::fs::write(&path, &text).unwrap();
@@ -4258,6 +4370,157 @@ transport = "stdio"
 command = "linear-mcp"
 args = ["--stdio"]
 "#;
+
+    const POLICY_WITH_STORE: &str = r#"
+[server]
+secret_store = "STORE"
+
+[audit]
+path = "AUDIT"
+stderr = false
+
+[[agents]]
+id = "claude-code"
+name = "Claude Code"
+token_sha256 = "HASH"
+
+[[upstreams]]
+name = "github"
+base_url = "https://api.github.com"
+"#;
+
+    /// Open the `add an upstream` form on `bearer`, named, with the cursor on
+    /// `secret` and a credential typed into it — the state the refusal used to
+    /// be a dead end from.
+    async fn upstream_form_with_a_typed_credential(app: &mut App, name: &str, credential: &str) {
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+
+        let Some(Modal::Form(form)) = &mut app.modal else {
+            panic!("the upstream form is not open");
+        };
+        set(form, "name", name);
+        // `secret` is only on screen for a scheme that reads one, so the scheme
+        // is chosen first — as it is on the way in.
+        let auth = form
+            .fields
+            .iter()
+            .position(|field| field.key == "auth")
+            .unwrap();
+        form.focus(auth);
+        while form.text("auth") != "bearer" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        let at = form
+            .fields
+            .iter()
+            .position(|field| field.key == "secret")
+            .unwrap();
+        form.focus(at);
+        assert_eq!(form.fields[at].key, "secret");
+
+        // Typed through the console, so this is the keystroke path an operator
+        // takes rather than a value poked into the struct.
+        for c in credential.chars() {
+            app.handle(KeyEvent::from(KeyCode::Char(c))).unwrap();
+        }
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form closed while it was being filled in");
+        };
+        assert_eq!(form.text("secret"), credential);
+    }
+
+    /// The console's way out of the refusal that had none.
+    ///
+    /// Typing a credential where a reference goes used to be answered by an
+    /// error and nothing else — the value was not a reference, and the spelling
+    /// the error named was refused by the next command. `ctrl-k` is the third
+    /// thing to do, and it happens without leaving the form the refusal came
+    /// from.
+    #[tokio::test]
+    async fn typing_a_credential_into_the_form_can_be_kept_without_leaving_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), POLICY_WITH_STORE);
+        upstream_form_with_a_typed_credential(&mut app, "readonly", "ghp_a_readonly_token").await;
+
+        app.handle(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("keeping a value closed the form");
+        };
+        // The name is derived from what is being enrolled, so the store reads
+        // as an inventory rather than as `credential-1`.
+        assert_eq!(form.text("secret"), "iap://readonly");
+        assert!(form.error.is_none(), "{:?}", form.error);
+
+        // The value is in the store, under that name, and nowhere else.
+        let store = crate::store::Store::at(dir.path().join("secrets.toml"));
+        assert_eq!(
+            store.get("readonly").unwrap().expose(),
+            "ghp_a_readonly_token"
+        );
+
+        // …and the form is still the operator's to cancel. Nothing has been
+        // written to the policy file yet.
+        let policy = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
+        assert!(!policy.contains("readonly"), "{policy}");
+    }
+
+    /// A name the operator did not choose must never be the thing that replaces
+    /// another upstream's credential.
+    #[tokio::test]
+    async fn keeping_a_second_credential_under_a_taken_name_does_not_overwrite_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at(dir.path().join("secrets.toml"));
+        store.set("readonly", "the-first-one").unwrap();
+
+        let mut app = app_with(dir.path(), POLICY_WITH_STORE);
+        upstream_form_with_a_typed_credential(&mut app, "readonly", "the-second-one").await;
+        app.handle(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form closed");
+        };
+        assert_eq!(form.text("secret"), "iap://readonly-2");
+        assert_eq!(store.get("readonly").unwrap().expose(), "the-first-one");
+        assert_eq!(store.get("readonly-2").unwrap().expose(), "the-second-one");
+    }
+
+    /// Everything drawn with a key on it is a button here, so both places the
+    /// `ctrl-k` offer appears have to keep the value — and the offer has to come
+    /// off the field once it holds a reference, as the `ctrl-o` one does.
+    #[tokio::test]
+    async fn every_drawn_keep_affordance_stores_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), POLICY_WITH_STORE);
+        upstream_form_with_a_typed_credential(&mut app, "readonly", "ghp_a_readonly_token").await;
+
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("ctrl-k"), "{rendered}");
+        let offers = app.hits.form.as_ref().unwrap().keep.clone();
+        assert_eq!(
+            offers.len(),
+            2,
+            "the offer belongs on the field's own line and in the key row"
+        );
+
+        // Either of them, clicked, does what the key does.
+        let rect = offers[0];
+        app.click((rect.x + 1, rect.y), false).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form closed");
+        };
+        assert_eq!(form.text("secret"), "iap://readonly");
+
+        // And now that the field holds a reference the offer is gone — from the
+        // line and from the key row, because there is nothing left to keep.
+        let rendered = render(&mut app, 120, 34);
+        assert!(!rendered.contains("ctrl-k"), "{rendered}");
+        assert!(app.hits.form.as_ref().unwrap().keep.is_empty());
+    }
 
     /// The names in an ACL rule are the ones written further up the same file,
     /// and a rule that misspells one matches nothing — silently, which with
