@@ -14,6 +14,10 @@
 //! - `SIGHUP`, which is what every other daemon on the box answers to, and the
 //!   one thing a config-management tool knows how to send after it writes.
 //!
+//! They differ in one thing, and `Trigger::rereads_credentials` is where that
+//! is argued: `SIGHUP` says *read it all again*, and a file that merely changed
+//! does not.
+//!
 //! What this deliberately does *not* do is decide whether the new policy is
 //! acceptable. `AppState::reload` is all-or-nothing and refuses anything it
 //! cannot serve, so the worst a bad edit does here is get logged and ignored.
@@ -70,8 +74,11 @@ pub enum Trigger {
     Edited,
     /// `SIGHUP`.
     Signal,
-    /// Somebody asked: the console's `r`, or a write the console just made.
+    /// The console's `r` — somebody asked for the file to be re-read.
     Asked,
+    /// A write the console just made, which reloads itself so that a rule
+    /// granted from the approval dialogue governs the next call.
+    Wrote,
 }
 
 impl Trigger {
@@ -80,6 +87,30 @@ impl Trigger {
             Trigger::Edited => "edited",
             Trigger::Signal => "sighup",
             Trigger::Asked => "asked",
+            Trigger::Wrote => "wrote",
+        }
+    }
+
+    /// Does this reload go back to the vault, or serve the values this process
+    /// already holds?
+    ///
+    /// A credential rotated behind an unchanged reference is invisible in the
+    /// file — nothing about the bytes says the value moved — so the only honest
+    /// answer is to read it again, and the only honest moment to do that is
+    /// when somebody said so. `SIGHUP` is what a config-management tool sends
+    /// after writing a renewed certificate or a rotated key, and `r` is an
+    /// operator asking for exactly this; both re-read everything.
+    ///
+    /// The other two did not ask. A watched file that changed and a rule the
+    /// console just wrote are both usually `[[acl]]` edits, which say nothing
+    /// about any credential — and making them a vault lookup per reference is
+    /// how answering an `ask` came to raise a 1Password authorization prompt
+    /// every time (SIRI-205). References the edit *added* are still read, being
+    /// ones this process has never resolved.
+    pub fn rereads_credentials(self) -> bool {
+        match self {
+            Trigger::Signal | Trigger::Asked => true,
+            Trigger::Edited | Trigger::Wrote => false,
         }
     }
 }

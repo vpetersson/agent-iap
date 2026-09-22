@@ -159,7 +159,9 @@ impl SecretResolver {
     /// proxy. `refresh` is how a value that *did* move takes effect without a
     /// restart: a renewed certificate, replaced on disk every ninety days, and
     /// a rotated credential, whose reference string is unchanged but whose
-    /// secret behind it is new. A reload re-reads both through here.
+    /// secret behind it is new. Nothing in the file says either of those
+    /// happened, so this is reached from the triggers that mean *re-read*:
+    /// `SIGHUP`, the console's `r`, and its `c` on the credentials pane.
     ///
     /// The old value is replaced only if the re-read succeeds. A refresh that
     /// cannot reach the source — a locked vault, a half-written file — returns
@@ -172,28 +174,58 @@ impl SecretResolver {
     }
 
     /// Re-read many references at once, one answer per reference, in the order
-    /// they were given.
+    /// they were given. Every one of them goes to its source.
     ///
     /// `refresh` on an `op://` reference is a subprocess and a network round
     /// trip, and these used to be done one after another: a policy naming eight
     /// of them cost eight vault lookups back to back. That is paid on startup,
-    /// on every `SIGHUP`, on every edit the daemon notices — and on the
-    /// console's `r`, where it was seconds of a console that had stopped
-    /// drawing the request somebody was waiting to answer.
+    /// on every `SIGHUP`, and on the console's `r`, where it was seconds of a
+    /// console that had stopped drawing the request somebody was waiting to
+    /// answer.
     ///
     /// Nothing here depends on anything else here, so they go at once. The
     /// bound is only so that a fifty-upstream policy does not fork fifty `op`
     /// processes in the same instant; a locked vault answers a burst that size
     /// with rate limits rather than with secrets.
     ///
-    /// Only *whether* each one resolved comes back. Both callers are asking
+    /// Only *whether* each one resolved comes back. Every caller is asking
     /// about the references rather than about the credentials behind them, and
     /// the values themselves are already where they are wanted — in the cache.
     pub fn refresh_all(&self, references: &[String]) -> Vec<Result<(), String>> {
+        self.read_all(references, true)
+    }
+
+    /// The same, cache-first: a reference this process has already read is
+    /// answered from what it read, and only one it has never seen costs a
+    /// lookup.
+    ///
+    /// What a reload nobody asked for uses. An `[[acl]]` rule appended by the
+    /// approval dialogue says nothing about any credential, and re-reading
+    /// twenty references because of it is twenty vault lookups for an edit that
+    /// touched none of them — which on a desktop 1Password is an authorization
+    /// prompt in front of the operator every time they answer an `ask`
+    /// (SIRI-205). A reference the edit *added* or repointed is not in the
+    /// cache under its new spelling, so it is still read here and a policy that
+    /// names a credential this process cannot get is still refused at reload
+    /// rather than on the first live call.
+    pub fn resolve_all(&self, references: &[String]) -> Vec<Result<(), String>> {
+        self.read_all(references, false)
+    }
+
+    fn read_one(&self, reference: &str, fresh: bool) -> Result<(), String> {
+        match fresh {
+            true => self.refresh(reference),
+            false => self.resolve(reference),
+        }
+        .map(|_| ())
+        .map_err(render)
+    }
+
+    fn read_all(&self, references: &[String], fresh: bool) -> Vec<Result<(), String>> {
         if references.len() < 2 {
             return references
                 .iter()
-                .map(|reference| self.refresh(reference).map(|_| ()).map_err(render))
+                .map(|reference| self.read_one(reference, fresh))
                 .collect();
         }
 
@@ -207,9 +239,7 @@ impl SecretResolver {
                         scope.spawn(move || {
                             chunk
                                 .iter()
-                                .map(|reference| {
-                                    self.refresh(reference).map(|_| ()).map_err(render)
-                                })
+                                .map(|reference| self.read_one(reference, fresh))
                                 .collect::<Vec<_>>()
                         }),
                     )

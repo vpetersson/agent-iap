@@ -216,7 +216,7 @@ impl Tab {
             ],
             Tab::Mcp => &[("n", "add"), ("v", "verify"), ("x", "remove")],
             Tab::Acl => &[("n", "add rule"), ("x", "remove rule"), ("R", "reset")],
-            Tab::Credentials => &[("c", "re-check")],
+            Tab::Credentials => &[("c", "re-read")],
             Tab::Profiles => &[("enter", "add")],
         }
     }
@@ -418,6 +418,9 @@ struct App {
     clicked: Option<(Instant, u16, u16)>,
     /// What the last verification of each service found, by name.
     verified: HashMap<String, Verification>,
+    /// Is a credential check out on the runtime? One at a time, so a held `c`
+    /// is one pass over the vault rather than one per repeat.
+    checking: bool,
     /// Where finished work reports back. Anything that reads a credential is a
     /// child process and usually a network call, so it runs on the runtime
     /// rather than on this thread — the console cannot stop drawing for
@@ -434,7 +437,7 @@ struct App {
     asked: usize,
     /// Every policy the proxy puts in charge, whoever caused it — this console
     /// pressing `r`, `agent-iap acl add` in the next terminal, an editor.
-    reloads: tokio::sync::broadcast::Receiver<Arc<crate::config::Config>>,
+    reloads: tokio::sync::broadcast::Receiver<crate::state::Reloaded>,
     /// The audit log as it is written, for the feed at the bottom.
     records: tokio::sync::broadcast::Receiver<AuditEvent>,
 }
@@ -446,6 +449,8 @@ enum Landed {
     Verified(String, Result<verify::Report>),
     /// A policy reload the console asked for, and the words it is owed.
     Reloaded(Result<()>, Said),
+    /// A re-read of every credential reference: what each one answered.
+    Checked(Vec<(String, Result<(), String>)>),
 }
 
 /// What a reload the console asked for is owed on the footer when it lands.
@@ -501,12 +506,12 @@ type RecvLanded = tokio::sync::mpsc::UnboundedReceiver<Landed>;
 
 /// The thread that re-reads the policy file, one reload at a time.
 ///
-/// `AppState::reload` re-resolves every credential the file names — a
-/// subprocess and a network round trip each — and only then installs the
-/// policy. None of that belongs on the thread that draws: this console exists
-/// to put a waiting request in front of a human, and a console that stops
-/// drawing while a vault is consulted is a console that has stopped doing the
-/// one thing it is for.
+/// `AppState::reload` resolves every credential the file names before it
+/// installs anything, and for `r` that means reading each one from source — a
+/// subprocess and a network round trip each. None of that belongs on the thread
+/// that draws: this console exists to put a waiting request in front of a
+/// human, and a console that stops drawing while a vault is consulted is a
+/// console that has stopped doing the one thing it is for.
 ///
 /// One thread with a queue rather than a task per press. Two
 /// `AppState::reload` calls overlapping is a proxy serving neither file; a
@@ -522,7 +527,16 @@ fn spawn_reloader(
     let watcher = Arc::clone(watcher);
     tokio::task::spawn_blocking(move || {
         while let Some(said) = asked.blocking_recv() {
-            let result = watcher.reload(&state, Trigger::Asked).map(|_| ());
+            // `r` is an operator asking for the file to be read again, and a
+            // credential rotated behind an unchanged reference is one of the
+            // things they are asking about. A reload that only follows a write
+            // this console just made is not that question — see
+            // `Trigger::rereads_credentials`.
+            let why = match said.wrote {
+                true => Trigger::Wrote,
+                false => Trigger::Asked,
+            };
+            let result = watcher.reload(&state, why).map(|_| ());
             // The receiver is gone only when the console has already quit.
             if post.send(Landed::Reloaded(result, said)).is_err() {
                 return;
@@ -554,6 +568,7 @@ impl App {
             hits: Hits::default(),
             clicked: None,
             verified: HashMap::new(),
+            checking: false,
             asked: 0,
             inbox,
         })
@@ -566,8 +581,8 @@ impl App {
         // Collected before they are applied: each of these wants `&mut self`,
         // and the receivers are part of it.
         let mut configs = Vec::new();
-        while let Ok(config) = self.reloads.try_recv() {
-            configs.push(config);
+        while let Ok(reloaded) = self.reloads.try_recv() {
+            configs.push(reloaded.config);
         }
         for config in configs {
             self.adopt(config);
@@ -789,20 +804,21 @@ impl App {
         );
     }
 
-    /// Wait for every reload this console asked for, the way the event loop
-    /// would.
+    /// Wait for every job this console started, the way the event loop would.
     ///
-    /// Only for tests. The reload is on a thread of its own now, so a test that
-    /// presses a key and then reads the panes has to wait for it — `catch_up`
-    /// is the same call the event loop makes on every pass.
+    /// Only for tests. A reload and a credential check are each on a thread of
+    /// their own now, so a test that presses a key and then reads the panes has
+    /// to wait for it — `catch_up` is the same call the event loop makes on
+    /// every pass.
     #[cfg(test)]
     async fn settle(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self.asked > 0 && Instant::now() < deadline {
+        while (self.asked > 0 || self.checking) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(2)).await;
             self.catch_up();
         }
         assert_eq!(self.asked, 0, "a reload never came back");
+        assert!(!self.checking, "a credential check never came back");
         self.catch_up();
     }
 
@@ -841,9 +857,10 @@ impl App {
     /// Neither of the two obvious messages is true here. "enrolled `x`" is a lie
     /// about the running policy, which is still the one from before; the bare
     /// reload error is a lie about the file, which has the edit in it. And this
-    /// is not a rare corner: `AppState::reload` re-resolves every credential the
-    /// file names, so an unrelated `op://` reference whose vault relocked since
-    /// startup is enough to refuse a policy that is otherwise fine.
+    /// is not a rare corner: `AppState::reload` resolves every credential the
+    /// file names before it installs anything, so one reference the proxy
+    /// cannot read — a path typed wrong in the form above, an item moved in the
+    /// vault — is enough to refuse a policy that is otherwise fine.
     ///
     /// Saying it matters more than it looks. These panes are built from the
     /// config that is in force, so a refused reload leaves them showing the
@@ -1328,19 +1345,7 @@ impl App {
                 }
             }
 
-            (Tab::Credentials, KeyCode::Char('c')) => {
-                self.policy.check_credentials(&self.state);
-                let broken = self
-                    .policy
-                    .credentials
-                    .iter()
-                    .filter(|row| matches!(row.resolves, Some(Err(_))))
-                    .count();
-                match broken {
-                    0 => self.say("every reference resolves"),
-                    n => self.say(format!("{n} reference(s) no longer resolve")),
-                }
-            }
+            (Tab::Credentials, KeyCode::Char('c')) => self.check_credentials(),
 
             (Tab::Profiles, KeyCode::Enter) => {
                 if let Some(profile) = self.selected().and_then(|at| self.profiles.get(at)) {
@@ -1386,6 +1391,67 @@ impl App {
         match job {
             Landed::Verified(name, result) => self.verification_landed(name, result),
             Landed::Reloaded(result, said) => self.reloaded(result, said),
+            Landed::Checked(answers) => self.check_landed(answers),
+        }
+    }
+
+    /// `c` on the credentials pane: ask every source whether it still answers.
+    ///
+    /// A read from source, not from what this process is holding. The question
+    /// this pane exists to answer is the one the file cannot — whether the
+    /// vault is still unlocked and the variable still set — and a value
+    /// resolved at startup answers a different question while rendering as the
+    /// healthy one. It used to be cache-first, so on a long-running proxy `c`
+    /// said `yes` down the column whatever had happened to the vault since.
+    ///
+    /// Which is why it is off the thread that draws: this is a subprocess and a
+    /// network round trip per `op://` reference, and the console cannot stop
+    /// putting a waiting request in front of a human for that. One at a time —
+    /// a held-down `c` should not be a burst of vault lookups.
+    fn check_credentials(&mut self) {
+        if self.checking {
+            return;
+        }
+        let mut references: Vec<String> = self
+            .policy
+            .credentials
+            .iter()
+            .map(|row| row.reference.clone())
+            .collect();
+        // Twenty upstreams sharing one vault item is one question, not twenty.
+        references.sort();
+        references.dedup();
+        if references.is_empty() {
+            self.say("no credential references in the policy file");
+            return;
+        }
+
+        self.checking = true;
+        self.say(format!(
+            "re-reading {} reference(s) from source…",
+            references.len()
+        ));
+        let resolver = Arc::clone(&self.state.resolver);
+        let post = self.inbox.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let answers = resolver.refresh_all(&references);
+            let checked = references.into_iter().zip(answers).collect();
+            // The receiver is gone only when the console has already quit.
+            let _ = post.send(Landed::Checked(checked));
+        });
+    }
+
+    /// A credential check came back.
+    fn check_landed(&mut self, answers: Vec<(String, Result<(), String>)>) {
+        self.checking = false;
+        self.policy.checked(&answers);
+        let broken = answers.iter().filter(|(_, answer)| answer.is_err()).count();
+        match broken {
+            0 => self.say(format!(
+                "every reference still resolves ({} read)",
+                answers.len()
+            )),
+            n => self.warn(format!("{n} reference(s) no longer resolve")),
         }
     }
 
@@ -2488,7 +2554,8 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ("t", "mint a new token for the selected agent"),
         (
             "c",
-            "copy the token a modal is showing — or, on credentials, re-resolve them",
+            "copy the token a modal is showing — or, on credentials, read every reference \
+             from its source again",
         ),
         (
             "esc / q",
@@ -2500,7 +2567,11 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
         ),
         ("a / d", "allow or deny the selected request, once"),
         ("f", "forget every standing answer"),
-        ("r", "re-read the policy file now — it is watched anyway"),
+        (
+            "r",
+            "re-read the policy file now, credentials and all — it is watched anyway, but a \
+             value rotated behind an unchanged reference is not",
+        ),
         (
             "R",
             "on the rules pane: start over — delete every rule, default to ask",
@@ -3023,6 +3094,73 @@ action = "ask"
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         format!("{}", terminal.backend())
+    }
+
+    /// A stand-in `op` that answers, and writes down that it was asked.
+    ///
+    /// Counting the calls is the only way to see this particular bug: nothing
+    /// about a vault lookup shows up in the policy, the panes or the log. What
+    /// the operator saw was 1Password asking for authorization; what the proxy
+    /// did was run `op read`.
+    #[cfg(unix)]
+    fn counting_op(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let op = dir.join("op");
+        let calls = dir.join("op-calls");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\necho call >> {}\nprintf 'sk-not-real'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (op, calls)
+    }
+
+    #[cfg(unix)]
+    fn vault_lookups(calls: &std::path::Path) -> usize {
+        std::fs::read_to_string(calls)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The policy above with its credential in a vault instead of the
+    /// environment, and `op` pointed at a stand-in.
+    #[cfg(unix)]
+    fn app_backed_by_a_vault(dir: &std::path::Path) -> (App, std::path::PathBuf) {
+        let (op, calls) = counting_op(dir);
+        let app = app_with(
+            dir,
+            &POLICY
+                .replace(
+                    r#"secret = "env:AGENT_IAP_TEST_TOKEN""#,
+                    r#"secret = "op://Private/github/credential""#,
+                )
+                .replace(
+                    "[audit]",
+                    &format!("[server]\nop_binary = \"{}\"\n\n[audit]", op.display()),
+                ),
+        );
+        (app, calls)
+    }
+
+    /// Leave the policy file naming a credential this proxy cannot read.
+    ///
+    /// Repointed rather than deleted, because those are two different things
+    /// now: a reference this process has already resolved keeps its value
+    /// through a reload nobody asked for, and only one it has never seen is
+    /// read — which is what a repointed reference is. See
+    /// `Trigger::rereads_credentials`.
+    fn repoint_at_nothing(policy: &std::path::Path, was: &std::path::Path) -> std::path::PathBuf {
+        let gone = was.with_file_name("gone.key");
+        let text = std::fs::read_to_string(policy)
+            .unwrap()
+            .replace(&was.display().to_string(), &gone.display().to_string());
+        std::fs::write(policy, text).unwrap();
+        gone
     }
 
     /// The request the policy above stops on a human.
@@ -4436,6 +4574,125 @@ args = ["--stdio"]
         );
     }
 
+    /// The bug this is the fix for: answering an `ask` raised a 1Password
+    /// prompt.
+    ///
+    /// A standing answer writes a rule and reloads so the rule governs the next
+    /// call, and a reload re-read every credential reference the file named —
+    /// one `op read` each, whether or not the edit had anything to do with a
+    /// credential. On a desktop 1Password every one of those is an
+    /// authorization dialogue, drawn over the console, in front of the operator
+    /// who was answering the request. The grant they just wrote names no
+    /// credential at all (SIRI-205).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn granting_from_the_dialogue_does_not_go_back_to_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, calls) = app_backed_by_a_vault(dir.path());
+        assert_eq!(
+            vault_lookups(&calls),
+            1,
+            "startup reads it once, which is where the value being served came from"
+        );
+
+        let view = waiting();
+        let reach = approve::reaches(&view).pop().unwrap();
+        app.answer(&view, Verdict::Allow, approve::Duration::Forever, reach);
+        app.settle().await;
+
+        // The grant took — this is not a reload that quietly did not happen.
+        assert_eq!(
+            app.state.acl.evaluate(&view.request).action,
+            crate::config::Action::Allow,
+            "a rule that needs a restart to work is a rule that did not work"
+        );
+        let written = std::fs::read_to_string(&app.policy.path).unwrap();
+        assert!(written.contains("console-allow"), "{written}");
+
+        assert_eq!(
+            vault_lookups(&calls),
+            1,
+            "an `[[acl]]` rule sent the operator back to 1Password"
+        );
+    }
+
+    /// And the other half: a reload somebody *asked* for still re-reads.
+    ///
+    /// A credential rotated behind an unchanged reference is invisible in the
+    /// file, so the only thing that can pick it up is reading it again — `r`
+    /// here, `SIGHUP` under a unit file. Taking that away to stop the prompts
+    /// would have traded one bug for a proxy serving a retired key until it was
+    /// restarted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pressing_r_still_re_reads_a_credential_that_may_have_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, calls) = app_backed_by_a_vault(dir.path());
+        assert_eq!(vault_lookups(&calls), 1);
+
+        app.reread().await;
+
+        assert_eq!(
+            vault_lookups(&calls),
+            2,
+            "`r` is an operator asking for the file to be read again, vault and all"
+        );
+    }
+
+    /// `c` on the credentials pane asks the source, not this process.
+    ///
+    /// The column answers the one question the file cannot — whether the vault
+    /// is still unlocked and the variable still set — and it used to answer it
+    /// cache-first. Every reference this proxy had ever resolved therefore read
+    /// `yes` for the life of the process, which is the healthy render for a
+    /// question nobody asked: the operator watching that column would have been
+    /// the last to know.
+    #[tokio::test]
+    async fn checking_the_credentials_pane_asks_the_source_rather_than_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("upstream.key");
+        std::fs::write(&secret, "sk-not-real").unwrap();
+        let mut app = app_with(
+            dir.path(),
+            &POLICY.replace(
+                r#"secret = "env:AGENT_IAP_TEST_TOKEN""#,
+                &format!(r#"secret = "file:{}""#, secret.display()),
+            ),
+        );
+        app.tab = Tab::Credentials;
+        app.clamp_cursors();
+
+        // The source goes away under a proxy that already resolved it — the
+        // vault relocking, which is the ordinary way this happens.
+        std::fs::remove_file(&secret).unwrap();
+
+        app.handle(KeyEvent::from(KeyCode::Char('c'))).unwrap();
+        app.settle().await;
+
+        let rendered = render(&mut app, 160, 30);
+        assert!(
+            !rendered.contains(" yes "),
+            "the pane still says the vault is answering:\n{rendered}"
+        );
+        let flash = app.flash.as_ref().expect("the console said something");
+        assert!(
+            flash.failed && flash.message.contains("no longer resolve"),
+            "`{}`",
+            flash.message
+        );
+
+        // And the value it is still serving was not evicted by the failed read:
+        // a relocked vault must not also strip a credential the proxy is using.
+        assert_eq!(
+            app.state
+                .resolver
+                .resolve(&format!("file:{}", secret.display()))
+                .unwrap()
+                .expose(),
+            "sk-not-real"
+        );
+    }
+
     /// A reload the console itself caused is not news to the console.
     #[tokio::test]
     async fn the_console_does_not_report_its_own_write_as_somebody_elses_edit() {
@@ -4749,9 +5006,6 @@ args = ["--stdio"]
     #[tokio::test]
     async fn a_refused_reload_after_a_write_is_not_reported_as_success() {
         let dir = tempfile::tempdir().unwrap();
-        // A credential this proxy can read at startup and not afterwards —
-        // a stand-in for the `op://` vault that relocks while the console is
-        // open, which is the ordinary way this happens.
         let secret = dir.path().join("upstream.key");
         std::fs::write(&secret, "sk-not-real").unwrap();
         let mut app = app_with(
@@ -4764,9 +5018,12 @@ args = ["--stdio"]
         app.tab = Tab::Agents;
         assert_eq!(views::agents(&app.policy.inventory).len(), 1);
 
-        // Every reload re-resolves every reference the file names, so one that
-        // stopped resolving refuses a policy that is otherwise fine.
-        std::fs::remove_file(&secret).unwrap();
+        // Somebody repointed the upstream at a credential this proxy cannot
+        // read — in an editor, in the next terminal — and the reload behind
+        // the enrolment below is where that is found out. A reload resolves
+        // every reference the file names before it installs anything, so one
+        // it cannot read refuses a policy that is otherwise fine.
+        let gone = repoint_at_nothing(&app.policy.path, &secret);
 
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
         for ch in "new-agent".chars() {
@@ -4798,7 +5055,7 @@ args = ["--stdio"]
         );
         assert!(
             flash.message.contains("the edit is in iap.toml")
-                && flash.message.contains("upstream.key"),
+                && flash.message.contains(&gone.display().to_string()),
             "the line has to name both halves — the file has it, the proxy does not: `{}`",
             flash.message
         );
@@ -4991,7 +5248,7 @@ args = ["--stdio"]
         );
         app.tab = Tab::Agents;
         app.cursor[Tab::Agents.index()].select(Some(0));
-        std::fs::remove_file(&secret).unwrap();
+        repoint_at_nothing(&app.policy.path, &secret);
 
         app.handle(KeyEvent::from(KeyCode::Char('t'))).unwrap();
         app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();

@@ -1306,8 +1306,8 @@ async fn run(
             result = serving(&mut admin) => return Ok(result?),
             result = drawn(&mut drawing) => return result,
             _ = tokio::signal::ctrl_c() => return Ok(()),
-            Ok(config) = reloads.recv() => {
-                if let Err(error) = adopt(&state, &config, &mut proxy, &mut admin).await {
+            Ok(reloaded) = reloads.recv() => {
+                if let Err(error) = adopt(&state, &reloaded, &mut proxy, &mut admin).await {
                     // The policy itself is already in force; only the sockets
                     // did not follow. Loud, and not fatal — killing a proxy
                     // that is serving correctly because it could not move to a
@@ -1342,13 +1342,22 @@ async fn drawn(drawing: &mut Option<tokio::task::JoinHandle<Result<()>>>) -> Res
 /// leaving the proxy listening on nothing at all.
 async fn adopt(
     state: &Arc<AppState>,
-    config: &Config,
+    reloaded: &agent_iap::state::Reloaded,
     proxy: &mut Listener,
     admin: &mut Option<Listener>,
 ) -> Result<()> {
-    // Re-read rather than reuse: a certificate is the one credential in the
-    // file expected to be replaced under a running process.
-    let tls = ServerTls::reload(&config.server, &state.resolver)?;
+    let config = &reloaded.config;
+    // A certificate is the one credential in the file *expected* to be replaced
+    // under a running process, so a reload somebody asked for reads it again —
+    // `systemctl reload agent-iap` after a renewal is the documented way to
+    // pick one up. A reload that only followed an edit takes the material this
+    // process already parsed, for the same reason the credentials do: an
+    // `[[acl]]` rule said nothing about the certificate, and reading a `op://`
+    // one costs a vault prompt (SIRI-205).
+    let tls = match reloaded.why.rereads_credentials() {
+        true => ServerTls::reload(&config.server, &state.resolver)?,
+        false => ServerTls::load(&config.server, &state.resolver)?,
+    };
 
     rebind(
         proxy,

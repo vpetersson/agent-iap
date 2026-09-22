@@ -1095,13 +1095,17 @@ changed. A file caught mid-rewrite is waited on rather than reported as broken,
 and a file edited into something that will not parse is reported once, with the
 proxy left running the last policy that did (§ Reloading).
 
-A reload re-reads every credential the file names, which for `op://` references
-is a vault lookup each, so it runs off the drawing thread — as does the reload
-behind a form you just submitted or a rule you just granted from the approval
-dialogue. The keystroke comes back at once, the header says `re-reading the
-policy…` while it is happening, and the panes follow when the proxy has the new
-policy in charge. The answer you gave a waiting request never waits on any of
-it: that goes straight to the agent holding the connection open.
+`r` re-reads the credentials too, and it is the only thing in this console that
+does — a rule you granted from the approval dialogue, or a form you just
+submitted, reloads the policy and serves the credentials this process already
+resolved (§ Reloading). For `op://` references a re-read is a vault lookup each,
+which on a desktop 1Password is an authorization prompt each, and a standing
+answer to an `ask` names no credential at all. So `r` runs off the drawing
+thread, as every reload does: the keystroke comes back at once, the header says
+`re-reading the policy…` while it is happening, and the panes follow when the
+proxy has the new policy in charge. The answer you gave a waiting request never
+waits on any of it: that goes straight to the agent holding the connection
+open.
 
 `v` on an upstream or an MCP server calls it with the credential the file names,
 and puts the answer in the row's `VERIFIED` column, the whole report in a modal
@@ -1111,8 +1115,11 @@ as a switch, on by default (§ Verifying).
 
 A minted token is shown once, in a modal, and then only its sha256 exists. No
 credential *value* is ever displayed: the credentials pane shows references, and
-resolves them on `c` to answer the one question the file cannot — whether the
-vault is still unlocked and the variable still set.
+`c` reads every one of them from its source again — not from what this process
+is already holding — to answer the one question the file cannot: whether the
+vault is still unlocked and the variable still set. That is a real read, so it
+is a vault prompt if your vault prompts, and it runs off the drawing thread like
+everything else here that consults a credential.
 
 Everything written here is in force before you look away — rules, roster,
 upstreams, MCP servers, credentials, timeouts, the audit log, and the address
@@ -1129,8 +1136,8 @@ read once and owned forever. A reload replaces the lot:
 | --- | --- |
 | `[[acl]]`, `[[agents]]` | recompiled and re-enrolled; the next request is judged by the new list |
 | `[[upstreams]]`, `[[mcp_servers]]` | routable immediately, credential and all |
-| a credential reference | re-read from source, so a value rotated behind an unchanged reference takes effect too, not only a repointed reference; a minted token is dropped when its target went away, and when the credential under it was repointed |
-| `[server.tls]`, `[server.admin_tls]` | re-read from source and served from the next handshake; connections already up keep the certificate they negotiated |
+| a credential reference | a reference that is new, or repointed at something else, is read; one this process already resolved keeps its value unless the reload was asked for — see *What triggers one*. A minted token is dropped when its target went away, and when the credential under it was repointed |
+| `[server.tls]`, `[server.admin_tls]` | the same rule, and served from the next handshake; connections already up keep the certificate they negotiated |
 | `server.listen`, `server.admin_listen` | the new address is bound, then the old listener drains for ten seconds |
 | timeouts, `max_body_bytes`, `approval_timeout_secs`, workload settings | in force for the next request; anything already in flight keeps what it started with |
 | `[audit]` | redaction and body limits immediately; a changed `path` closes the old file and picks up the new file's hash chain |
@@ -1160,9 +1167,26 @@ truncate and then a write, and in between the file is half a policy. `SIGHUP`
 skips the wait, which makes it the right trigger for a config-management tool
 that has just finished writing. The console's `r` is the same call.
 
+**`SIGHUP` and `r` also go back to the source for every credential the file
+names; a file that merely changed does not.** A value rotated behind an
+unchanged reference — the vault item replaced, the key file rewritten — is
+invisible in the policy, so the only way to pick it up is to read it again, and
+the only honest moment to do that is when somebody said so. An edit is not
+somebody saying so: an `[[acl]]` rule appended by `agent-iap acl add`, or by
+answering an `ask` with *from now on*, names no credential, and re-reading
+twenty references because of it is twenty vault lookups — which on a desktop
+1Password is an authorization dialogue in front of whoever is answering the next
+request. References the edit *added* or repointed are read either way, so a
+policy naming a credential this proxy cannot get is still refused at the reload
+rather than on the first live call.
+
+So: rotate a credential in place, then `systemctl reload agent-iap` (or press
+`r`). Repoint a reference at something else and the edit alone is enough.
+
 Every reload is written to the audit log as a `reload` record naming which of
-the three caused it and what the policy became — a rule appearing ten seconds
-before a call it allowed is something the log should be able to show you.
+the four caused it — `edited`, `sighup`, `asked`, `wrote` — and what the policy
+became; a rule appearing ten seconds before a call it allowed is something the
+log should be able to show you.
 
 One thing this does not do: the signing key behind § Workload identity is not
 rotated, because that would invalidate every token already handed out — a
@@ -1417,10 +1441,12 @@ see below.
 
 Renewal does not mean a restart. A reload re-reads `cert` and `key` from source
 and serves the new one from the next handshake; connections already up keep what
-they negotiated. What it needs is a *trigger*, and the trigger is the policy file
-changing or a `SIGHUP`, not the certificate file itself — so pair the renewal
-with `systemctl reload agent-iap` (§ Reloading). Client certificates are not an
-identity here either: agents are still the bearer token.
+they negotiated. What it needs is a *trigger*, and the trigger is `SIGHUP` or
+the console's `r` — not the certificate file itself, and not a policy file that
+merely changed, which serves the material this process already parsed
+(§ Reloading). So pair the renewal with `systemctl reload agent-iap`. Client
+certificates are not an identity here either: agents are still the bearer
+token.
 
 #### Where the certificate comes from
 
