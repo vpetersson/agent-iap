@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -127,11 +127,13 @@ pub struct SecretResolver {
     op_bin: String,
 }
 
-/// How many secret references are re-read at the same time.
+/// How many secret references are read at the same time.
 ///
-/// High enough that a policy with a realistic number of `op://` references
-/// reloads in about the time one vault lookup takes, low enough that a large
-/// one does not arrive at 1Password as a burst of processes.
+/// The `op://` ones no longer come through here — they are read together, in
+/// one process, by `read_onepassword_together`. What is left is `env:`,
+/// `file:` and `literal:`, which are a variable lookup and a small read, plus
+/// the one-at-a-time fallback for a batch that did not come off. The bound
+/// stays so that neither of those becomes a fan-out nobody chose.
 const REFRESH_AT_ONCE: usize = 8;
 
 fn render(error: anyhow::Error) -> String {
@@ -183,10 +185,12 @@ impl SecretResolver {
     /// console that had stopped drawing the request somebody was waiting to
     /// answer.
     ///
-    /// Nothing here depends on anything else here, so they go at once. The
-    /// bound is only so that a fifty-upstream policy does not fork fifty `op`
-    /// processes in the same instant; a locked vault answers a burst that size
-    /// with rate limits rather than with secrets.
+    /// The `op://` ones now go in a single `op`, which is both halves of that
+    /// cost at once — one round trip instead of eight, and, because the desktop
+    /// app authorizes a process, one authorization dialogue instead of eight
+    /// (see `prime_onepassword`). Forking them together fixed the waiting and
+    /// made the dialogues simultaneous, which was worse. What is left here runs
+    /// in parallel because nothing in it depends on anything else in it.
     ///
     /// Only *whether* each one resolved comes back. Every caller is asking
     /// about the references rather than about the credentials behind them, and
@@ -222,11 +226,17 @@ impl SecretResolver {
     }
 
     fn read_all(&self, references: &[String], fresh: bool) -> Vec<Result<(), String>> {
+        // Every `op://` reference this call was going to fork a process for,
+        // fetched in one. Whatever came back is in the cache now, so the pass
+        // below answers those from it — including under `fresh`, which is the
+        // whole point: they *were* just read from source.
+        let primed = self.prime_onepassword(references, fresh);
+        let read_one = |reference: &String| {
+            self.read_one(reference, fresh && !primed.contains(reference.as_str()))
+        };
+
         if references.len() < 2 {
-            return references
-                .iter()
-                .map(|reference| self.read_one(reference, fresh))
-                .collect();
+            return references.iter().map(read_one).collect();
         }
 
         let width = references.len().div_ceil(REFRESH_AT_ONCE);
@@ -236,12 +246,7 @@ impl SecretResolver {
                 .map(|chunk| {
                     (
                         chunk,
-                        scope.spawn(move || {
-                            chunk
-                                .iter()
-                                .map(|reference| self.read_one(reference, fresh))
-                                .collect::<Vec<_>>()
-                        }),
+                        scope.spawn(|| chunk.iter().map(&read_one).collect::<Vec<_>>()),
                     )
                 })
                 .collect();
@@ -259,6 +264,148 @@ impl SecretResolver {
                 })
                 .collect()
         })
+    }
+
+    /// Read every `op://` reference this pass needs in a single `op`, and put
+    /// what comes back in the cache. Returns the raw spellings that landed.
+    ///
+    /// One process, because on a desktop 1Password a process is the unit of
+    /// authorization. Each `op` invocation is a separate client asking the app
+    /// for CLI access, and a proxy fronting six vault-backed services asked six
+    /// times — concurrently, so the grant given to the first could not cover
+    /// the five already waiting. What the operator saw was a stack of identical
+    /// dialogues over the console, for a grant they had given (SIRI-205); what
+    /// this process wanted was one question answered six ways.
+    ///
+    /// Nothing is promised here. A batch that will not run — no `op` on the
+    /// path, a version without `inject`, a reference `op` refuses — returns
+    /// nothing at all and every reference goes the way it always did, one
+    /// `op read` each. That fallback is what keeps the per-reference error an
+    /// operator needs to find the line of the file that is wrong: `op inject`
+    /// fails the whole template and names one cause, and "which of your six
+    /// references is the broken one" is not a question a policy file should
+    /// have to be bisected to answer.
+    fn prime_onepassword(&self, references: &[String], fresh: bool) -> HashSet<String> {
+        let mut wanted: Vec<&str> = Vec::new();
+        {
+            let cache = self.cache.lock();
+            let mut seen = HashSet::new();
+            for raw in references {
+                if !matches!(SecretRef::parse(raw), Ok(SecretRef::OnePassword(_))) {
+                    continue;
+                }
+                // Cache-first means this one is not going anywhere near `op`,
+                // so it is not part of the question being asked.
+                if !fresh && cache.contains_key(raw.as_str()) {
+                    continue;
+                }
+                if seen.insert(raw.as_str()) {
+                    wanted.push(raw.as_str());
+                }
+            }
+        }
+        // One reference is already one process; there is nothing to save, and
+        // `op read` gives the better error.
+        if wanted.len() < 2 {
+            return HashSet::new();
+        }
+
+        let values = match self.read_onepassword_together(&wanted) {
+            Ok(values) => values,
+            Err(error) => {
+                // Not a warning: the fallback below reads every one of these
+                // properly, and reports whatever is actually wrong with the
+                // reference that is wrong.
+                tracing::debug!(
+                    error = %format!("{error:#}"),
+                    references = wanted.len(),
+                    "reading the 1Password references together did not come off; \
+                     falling back to one lookup each"
+                );
+                return HashSet::new();
+            }
+        };
+
+        let mut cache = self.cache.lock();
+        let mut primed = HashSet::new();
+        for (raw, value) in wanted.iter().zip(values) {
+            // An empty field is the one answer `op read` calls an error, and it
+            // says which reference. Leave it out and let the fallback say so.
+            if value.expose().is_empty() {
+                continue;
+            }
+            cache.insert((*raw).to_string(), value);
+            primed.insert((*raw).to_string());
+        }
+        primed
+    }
+
+    /// The single `op` invocation: a template naming every reference, answered
+    /// with every value.
+    ///
+    /// `op read` takes one reference; `op inject` takes a template and fills in
+    /// each `{{ op://… }}` it finds. The template here is the references and
+    /// nothing else, separated by a marker drawn fresh each time — a credential
+    /// can be any bytes at all, including a line that looks like a separator,
+    /// and 122 random bits is what makes "the value contained the delimiter"
+    /// not a thing that happens. Anything unexpected in the shape of the answer
+    /// is an error rather than a guess: a mis-split here would hand one
+    /// service's credential to another.
+    fn read_onepassword_together(&self, references: &[&str]) -> Result<Vec<Secret>> {
+        use std::io::Write;
+
+        let marker = format!("--{}--", uuid::Uuid::new_v4().simple());
+        let template = references
+            .iter()
+            // The trimmed reference, for the same reason `read` uses it: the
+            // whitespace around one is a typo, not part of the field's name.
+            .map(|raw| format!("{{{{ {} }}}}", raw.trim()))
+            .collect::<Vec<_>>()
+            .join(&marker);
+
+        let mut child = Command::new(&self.op_bin)
+            .arg("inject")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running `{} inject`", self.op_bin))?;
+        child
+            .stdin
+            .take()
+            .context("`op inject` accepted no template")?
+            .write_all(template.as_bytes())
+            .context("writing the template to `op inject`")?;
+        let output = child
+            .wait_with_output()
+            .context("waiting for `op inject`")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`op inject` failed ({}): {}", output.status, stderr.trim());
+        }
+
+        let mut filled =
+            String::from_utf8(output.stdout).context("1Password returned a non-UTF-8 secret")?;
+        let values: Vec<&str> = filled.split(marker.as_str()).collect();
+        if values.len() != references.len() {
+            let answered = values.len();
+            filled.zeroize();
+            bail!(
+                "`op inject` answered {answered} of {} references",
+                references.len()
+            );
+        }
+        let secrets: Vec<Secret> = values
+            .into_iter()
+            // The same trailing newline `op read --no-newline` is asked not to
+            // add, so a value read this way is the value read the other way.
+            .map(|value| Secret::new(value.trim_end_matches(['\n', '\r']).to_string()))
+            .collect();
+        // Every credential in the file passed through this one buffer; a
+        // `Secret` zeroes itself and the thing it was cut out of should too.
+        filled.zeroize();
+        Ok(secrets)
     }
 
     /// Resolve a raw reference string, returning a cached value when there is
@@ -447,24 +594,171 @@ mod tests {
         );
     }
 
-    /// A `1Password` stand-in that takes as long as the real one does, so the
-    /// shape of the cost is the thing under test rather than the cost itself.
+    /// A `1Password` stand-in that answers both ways the real one is asked —
+    /// `op read <reference>` for one, `op inject` for a template naming many —
+    /// and writes down every invocation.
+    ///
+    /// Counting invocations is the point rather than an aside: a process is the
+    /// unit of authorization on a desktop 1Password, so the number of times
+    /// this script runs is the number of dialogues the operator is shown.
+    ///
+    /// `millis` makes it take as long as the real one does, for the tests where
+    /// the shape of the cost is what is being asserted.
     #[cfg(unix)]
-    fn slow_op(dir: &std::path::Path, millis: u32) -> PathBuf {
+    fn fake_op(dir: &std::path::Path, millis: u32) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let op = dir.join("op");
+        let calls = dir.join("op-calls");
         std::fs::write(
             &op,
             format!(
                 "#!/bin/sh\n\
+                 echo \"$1\" >> {}\n\
                  sleep {}\n\
-                 printf 'value-for-%s' \"$3\"\n",
+                 case \"$1\" in\n\
+                 read) printf 'value-for-%s' \"$3\" ;;\n\
+                 inject) sed -E 's/\\{{\\{{ ([^}}]*) \\}}\\}}/value-for-\\1/g' ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+                calls.display(),
                 millis as f64 / 1000.0
             ),
         )
         .unwrap();
         std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
-        op
+        (op, calls)
+    }
+
+    /// Every way `op` was invoked, in order — one line per process.
+    #[cfg(unix)]
+    fn invocations(calls: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(calls)
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The bug the batching closes: a policy naming six vault-backed services
+    /// asked 1Password six times.
+    ///
+    /// Each `op` is a separate client asking the desktop app for CLI access,
+    /// and they were forked together, so the grant the operator gave the first
+    /// dialogue could not cover the five already stacked behind it. Answering
+    /// an `ask` stopped doing this in SIRI-205; startup, `SIGHUP`, `r` and `c`
+    /// still did, which is the half of the report that was still open.
+    #[cfg(unix)]
+    #[test]
+    fn many_references_are_one_1password_process_rather_than_one_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let (op, calls) = fake_op(dir.path(), 0);
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let references: Vec<String> = (0..6)
+            .map(|n| format!("op://Private/item-{n}/credential"))
+            .collect();
+
+        let answers = resolver.refresh_all(&references);
+        assert!(answers.iter().all(|answer| answer.is_ok()), "{answers:?}");
+
+        assert_eq!(
+            invocations(&calls),
+            vec!["inject"],
+            "six references, six authorization dialogues"
+        );
+        // And each value went to the reference it belongs to. A mis-split here
+        // would hand one service's credential to another.
+        for reference in &references {
+            assert_eq!(
+                resolver.resolve(reference).unwrap().expose(),
+                format!("value-for-{reference}")
+            );
+        }
+    }
+
+    /// A reference this process already holds is not part of the question.
+    ///
+    /// `resolve_all` is what a reload nobody asked for uses, and the template
+    /// it builds names only what it has never read — otherwise an edit that
+    /// added one service would go back to the vault for all of them, which is
+    /// the prompt SIRI-205 is about wearing a different hat.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_first_read_only_asks_about_references_it_has_never_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (op, calls) = fake_op(dir.path(), 0);
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let first: Vec<String> = (0..3)
+            .map(|n| format!("op://Private/item-{n}/credential"))
+            .collect();
+        assert!(resolver.resolve_all(&first).iter().all(Result::is_ok));
+        assert_eq!(invocations(&calls), vec!["inject"]);
+
+        // The edit adds one service and leaves the other three alone.
+        let mut then = first.clone();
+        then.push("op://Private/new-one/credential".to_string());
+        assert!(resolver.resolve_all(&then).iter().all(Result::is_ok));
+
+        assert_eq!(
+            invocations(&calls),
+            vec!["inject", "read"],
+            "one new reference is one lookup, and `read` is what one reference costs"
+        );
+        assert_eq!(
+            resolver
+                .resolve("op://Private/new-one/credential")
+                .unwrap()
+                .expose(),
+            "value-for-op://Private/new-one/credential"
+        );
+    }
+
+    /// The fallback, and why it is worth having.
+    ///
+    /// `op inject` fails a template whole and names one cause, so a batch that
+    /// will not run — an `op` too old to have `inject`, a vault that refused —
+    /// must not become "one of your six references is wrong, work out which".
+    /// Every reference is read the old way and answered on its own terms.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_that_will_not_run_leaves_every_reference_answered_on_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        std::fs::write(
+            &op,
+            "#!/bin/sh\n\
+             [ \"$1\" = read ] || { echo 'unknown command \"inject\"' >&2; exit 1; }\n\
+             case \"$3\" in\n\
+             *broken*) echo \"could not read $3\" >&2; exit 1 ;;\n\
+             *) printf 'value-for-%s' \"$3\" ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let references = vec![
+            "op://Private/fine/credential".to_string(),
+            "op://Private/broken/credential".to_string(),
+            "op://Private/also-fine/credential".to_string(),
+        ];
+        let answers = resolver.refresh_all(&references);
+
+        assert!(answers[0].is_ok(), "{:?}", answers[0]);
+        assert!(answers[2].is_ok(), "{:?}", answers[2]);
+        let error = answers[1].as_ref().expect_err("the broken one");
+        assert!(
+            error.contains("op://Private/broken/credential"),
+            "the failure has to name the line of the file to fix: {error}"
+        );
+        assert_eq!(
+            resolver
+                .resolve("op://Private/fine/credential")
+                .unwrap()
+                .expose(),
+            "value-for-op://Private/fine/credential"
+        );
     }
 
     /// The reload cost that made the console unusable: every `op://` reference
@@ -479,7 +773,7 @@ mod tests {
     #[test]
     fn many_references_cost_about_one_lookup_rather_than_one_each() {
         let dir = tempfile::tempdir().unwrap();
-        let op = slow_op(dir.path(), 200);
+        let (op, _) = fake_op(dir.path(), 200);
         let resolver = SecretResolver::new(op.to_str().unwrap());
 
         let references: Vec<String> = (0..8)
