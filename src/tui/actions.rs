@@ -192,7 +192,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             Ok(Effect::wrote(
                 form,
                 &name,
-                format!("added upstream `{name}` — agents can reach it now"),
+                format!("added upstream `{name}` — {}", ungranted(policy)),
             ))
         }
         Intent::EditUpstream(name) => {
@@ -222,7 +222,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             Ok(Effect::wrote(
                 form,
                 &name,
-                format!("added MCP server `{name}` — agents can reach it now"),
+                format!("added MCP server `{name}` — {}", ungranted(policy)),
             ))
         }
         Intent::Rule => {
@@ -285,6 +285,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                         .map(|(name, value)| format!("{name}={value}"))
                         .collect(),
                     agent: form.opt("agent"),
+                    grant: form.flag("grant"),
                     dry_run,
                 },
             )?;
@@ -296,18 +297,41 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                     verify: None,
                 });
             }
+            let permitted = match added.granted {
+                true => format!("{} rules — live now", added.rules.len()),
+                // Not "0 rules": what happened is a policy decision, and a
+                // count of zero reads as one the form failed to make.
+                false => "nothing granted — the first call stops here".to_string(),
+            };
             Ok(Effect::wrote(
                 form,
                 &added.name,
                 format!(
-                    "added `{}` ({}) at access `{}`, {} rules — live now",
-                    added.name,
-                    added.kind,
-                    added.access,
-                    added.rules.len()
+                    "added `{}` ({}) at access `{}`, {permitted}",
+                    added.name, added.kind, added.access,
                 ),
             ))
         }
+    }
+}
+
+/// The footer line for a service just enrolled with nothing permitting it.
+///
+/// "agents can reach it now" is what this said, on a console whose whole
+/// purpose is that they cannot until somebody says so. The rules have not
+/// changed — nothing above writes one — so the policy in hand is the one the
+/// next call will be decided against.
+fn ungranted(policy: &Policy) -> String {
+    let default = policy.config.acl_default.action;
+    match crate::verify::cannot_ask_warning(&policy.config.acl, default) {
+        Some(_) => format!(
+            "nothing grants it, and nothing in this policy can ask: a call {}. `a` on the acl              pane writes a rule",
+            crate::verify::fallthrough_clause(default)
+        ),
+        None => format!(
+            "nothing grants it yet — a call {}",
+            crate::verify::fallthrough_clause(default)
+        ),
     }
 }
 

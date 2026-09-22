@@ -148,12 +148,16 @@ fn an_explicit_allow_is_still_an_allow() {
     assert_eq!(policy(&path).acl[0].action, Action::Allow);
 }
 
-/// The commands that tell an operator how to open something up say `--action
-/// allow` out loud, now that leaving it off no longer means allow. A hint that
-/// does not do what its own sentence claims is worse than no hint.
+/// What an enrolment says happens next is read out of the file, not asserted.
+///
+/// This said "No `[[acl]]` rules yet, so it is not reachable" and then offered
+/// `--action allow` — wrong twice over on a file whose `acl_default` is `ask`.
+/// An uncovered call is not refused there, it stops on a human; and the way out
+/// it recommended was the standing grant that made SIRI-197 a bug report.
 #[test]
-fn the_printed_next_step_spells_out_the_action_it_promises() {
+fn an_enrolment_says_what_an_ungranted_call_will_actually_meet() {
     let (_dir, path) = minimal_policy();
+    assert_eq!(policy(&path).acl_default.action, Action::Ask);
 
     let output = agent_iap(
         &path,
@@ -169,12 +173,149 @@ fn the_printed_next_step_spells_out_the_action_it_promises() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Allow something with"),
-        "the hint is still printed:\n{stdout}"
+        stdout.contains("Nothing is granted"),
+        "it says nothing was granted:\n{stdout}"
     );
     assert!(
-        stdout.contains("--action allow"),
-        "and running it verbatim allows:\n{stdout}"
+        stdout.contains("stops at the `agent-iap run` console"),
+        "and what `acl_default = ask` does about that:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("not reachable"),
+        "`ask` is not unreachable — a human is asked:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--action allow"),
+        "and nothing here recommends a standing grant:\n{stdout}"
+    );
+    assert!(policy(&path).acl.is_empty(), "nor wrote one");
+}
+
+/// The same command against a policy that cannot ask. The sentence above would
+/// be a promise this file cannot keep, so it is not the sentence printed.
+#[test]
+fn an_enrolment_onto_a_policy_that_cannot_ask_says_so() {
+    let (_dir, path) = minimal_policy();
+    assert!(agent_iap(&path, &["acl", "reset", "--deny", "--yes"])
+        .status
+        .success());
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "anthropic",
+            "--base-url",
+            "https://api.anthropic.com",
+            "--auth",
+            "none",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("nothing in this policy can ask"),
+        "the one diagnosis, at the moment it starts mattering:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("agent-iap acl reset"),
+        "and the way out of it:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("stops at the `agent-iap run` console"),
+        "which is exactly what this policy will not do:\n{stdout}"
+    );
+}
+
+/// The reported bug: enrolling a service granted standing access to it.
+///
+/// `upstream add --profile github` wrote `allow GET /** on github for *` beside
+/// the upstream, so the first call an agent made went straight through with the
+/// real credential attached and nobody asked — on a proxy whose `acl_default`
+/// was `ask` and whose whole pitch is that it stops there.
+#[test]
+fn a_profile_enrols_a_service_without_granting_anything() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "github",
+            "--profile",
+            "github",
+            "--secret",
+            "env:GH_TOKEN",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = policy(&path);
+    assert!(
+        config.upstream("github").is_some(),
+        "the service is enrolled"
+    );
+    assert!(
+        config.acl.is_empty(),
+        "and nothing permits it: {:?}",
+        config.acl
+    );
+
+    // Which is the decision the engine reaches, not just the file's shape.
+    let decision = Acl::compile(&config)
+        .unwrap()
+        .evaluate(&AccessRequest::http(
+            "claude-code",
+            "github",
+            "GET",
+            "/user",
+        ));
+    assert_eq!(decision.action, Action::Ask);
+}
+
+/// `--grant` is the advanced option: the reviewed rules, because a human typed
+/// the flag that writes them.
+#[test]
+fn a_profile_writes_its_rules_when_the_operator_asks_for_them() {
+    let (_dir, path) = minimal_policy();
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "github",
+            "--profile",
+            "github",
+            "--secret",
+            "env:GH_TOKEN",
+            "--grant",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = policy(&path);
+    let decision = Acl::compile(&config)
+        .unwrap()
+        .evaluate(&AccessRequest::http(
+            "claude-code",
+            "github",
+            "GET",
+            "/user",
+        ));
+    assert_eq!(decision.action, Action::Allow);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("github-reads"),
+        "and says which rules it wrote"
     );
 }
 

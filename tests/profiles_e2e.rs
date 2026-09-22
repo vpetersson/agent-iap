@@ -128,6 +128,10 @@ token_sha256 = "{}"
     Harness { proxy, _dir: dir }
 }
 
+/// Every harness in this file is about what a profile's *rules* do once they
+/// are in force, so it asks for them: `grant` is what writes them, and without
+/// it an enrolment writes the service and nothing else. `a_profile_grants_
+/// nothing_on_its_own` below covers the default.
 fn options(secret: &str) -> AddOptions {
     AddOptions {
         name: None,
@@ -135,6 +139,7 @@ fn options(secret: &str) -> AddOptions {
         access: None,
         vars: vec![],
         agent: None,
+        grant: true,
         dry_run: false,
     }
 }
@@ -861,6 +866,7 @@ fn adding_an_upstream_can_start_from_a_profile() {
             "github",
             "--secret",
             "env:GITHUB_TOKEN",
+            "--grant",
         ],
     );
     assert!(
@@ -878,7 +884,8 @@ fn adding_an_upstream_can_start_from_a_profile() {
     assert_eq!(upstream.base_url, "https://api.github.com");
     assert!(
         config.acl.iter().any(|rule| rule.target == "gh"),
-        "and the rules that come with it — the part `upstream add` never wrote"
+        "and, asked for with `--grant`, the rules that go with it — the part \
+         `upstream add` never wrote"
     );
 }
 
