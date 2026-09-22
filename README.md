@@ -1098,9 +1098,9 @@ proxy left running the last policy that did (§ Reloading).
 `r` re-reads the credentials too, and it is the only thing in this console that
 does — a rule you granted from the approval dialogue, or a form you just
 submitted, reloads the policy and serves the credentials this process already
-resolved (§ Reloading). For `op://` references a re-read is a vault lookup each,
-which on a desktop 1Password is an authorization prompt each, and a standing
-answer to an `ask` names no credential at all. So `r` runs off the drawing
+resolved (§ Reloading). For `op://` references a re-read is a vault round trip —
+one `op` for all of them, so one authorization prompt rather than one each — and
+a standing answer to an `ask` names no credential at all. So `r` runs off the drawing
 thread, as every reload does: the keystroke comes back at once, the header says
 `re-reading the policy…` while it is happening, and the panes follow when the
 proxy has the new policy in charge. The answer you gave a waiting request never
@@ -1173,10 +1173,12 @@ unchanged reference — the vault item replaced, the key file rewritten — is
 invisible in the policy, so the only way to pick it up is to read it again, and
 the only honest moment to do that is when somebody said so. An edit is not
 somebody saying so: an `[[acl]]` rule appended by `agent-iap acl add`, or by
-answering an `ask` with *from now on*, names no credential, and re-reading
-twenty references because of it is twenty vault lookups — which on a desktop
-1Password is an authorization dialogue in front of whoever is answering the next
-request. References the edit *added* or repointed are read either way, so a
+answering an `ask` with *from now on*, names no credential, and going back to
+the vault because of it is a dialogue in front of whoever is answering the next
+request — for an answer nothing asked for. (When a re-read *is* asked for, every
+`op://` reference in the file goes in one `op` invocation, so it is one dialogue
+however many references there are — § Where secrets come from.) References the
+edit *added* or repointed are read either way, so a
 policy naming a credential this proxy cannot get is still refused at the reload
 rather than on the first live call.
 
@@ -1391,6 +1393,16 @@ agent-iap upstream add anthropic --base-url https://api.anthropic.com \
 
 Space *around* a reference is a typo rather than part of it, and is trimmed:
 `" op://Private/Anthropic API/credential"` names the same field.
+
+However many `op://` references one read needs — five services at startup, all
+of them again on `SIGHUP` — they go to 1Password in **one** `op` invocation, via
+`op inject`. The desktop app authorizes a *process*, so a proxy that forked one
+`op` per reference asked for CLI access once per reference, concurrently, and
+the grant given to the first dialogue could not cover the ones already stacked
+behind it. One process is one dialogue. Where that cannot be done — an `op`
+without `inject`, a vault that refuses the template — each reference is read on
+its own, so the error still names the line of the file to fix rather than
+leaving you to bisect the policy.
 
 ### TLS
 

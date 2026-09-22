@@ -722,6 +722,91 @@ auth = {{ type = "bearer", secret = "op://Private/github/credential" }}
         assert_eq!(lookups(), 2, "a SIGHUP did not pick up a rotated value");
     }
 
+    /// The other half of SIRI-205: a proxy fronting several vault-backed
+    /// services asked 1Password once per service.
+    ///
+    /// A reload that reads nothing fixed answering an `ask`. It did nothing for
+    /// the reloads that are *supposed* to read — startup and `SIGHUP` — where
+    /// the references were forked as one `op` each, concurrently, so the
+    /// operator got a stack of authorization dialogues rather than one. The
+    /// unit of authorization is the process, so the count that matters here is
+    /// processes, not lookups.
+    #[cfg(unix)]
+    #[test]
+    fn a_policy_full_of_vault_references_asks_1password_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        let calls = dir.path().join("op-calls");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$1\" >> {}\n\
+                 case \"$1\" in\n\
+                 read) printf 'value-for-%s' \"$3\" ;;\n\
+                 inject) sed -E 's/\\{{\\{{ ([^}}]*) \\}}\\}}/value-for-\\1/g' ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let processes = || {
+            std::fs::read_to_string(&calls)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+
+        let upstreams: String = (0..5)
+            .map(|n| {
+                format!(
+                    r#"
+[[upstreams]]
+name = "svc-{n}"
+base_url = "https://svc-{n}.example.com"
+auth = {{ type = "bearer", secret = "op://Private/svc-{n}/credential" }}
+"#
+                )
+            })
+            .collect();
+        let policy = || {
+            toml::from_str::<Config>(&format!(
+                r#"
+[server]
+op_binary = "{}"
+
+[audit]
+path = "{}"
+stderr = false
+{upstreams}"#,
+                op.display(),
+                dir.path().join("audit.jsonl").display(),
+            ))
+            .unwrap()
+        };
+
+        let state = AppState::build(policy(), false).unwrap();
+        assert_eq!(processes(), 1, "five services, five dialogues at startup");
+
+        state
+            .reload(policy(), crate::reload::Trigger::Signal)
+            .unwrap();
+        assert_eq!(processes(), 2, "and five more on every SIGHUP");
+
+        // The values still landed where they belong — a batch that mis-split
+        // would front one service with another's credential.
+        for n in 0..5 {
+            let reference = format!("op://Private/svc-{n}/credential");
+            assert_eq!(
+                state.resolver.resolve(&reference).unwrap().expose(),
+                format!("value-for-{reference}")
+            );
+        }
+    }
+
     #[test]
     fn every_broken_reference_is_reported_not_just_the_first() {
         // Twenty upstreams should not mean twenty restarts to find three typos.
