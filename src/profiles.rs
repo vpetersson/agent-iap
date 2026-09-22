@@ -207,11 +207,57 @@ pub fn probe_for(base_url: &str) -> Option<String> {
         let Service::Http { base_url, .. } = &profile.service else {
             return None;
         };
-        if base_url.trim_end_matches('/') != wanted {
+        if !is_the_same_service(base_url.trim_end_matches('/'), wanted) {
             return None;
         }
         profile.probe.filter(|probe| !probe.contains('{'))
     })
+}
+
+/// Whether an enrolled base URL is the one this profile writes.
+///
+/// A regional or self-hosted profile spells its base URL with the var still in
+/// it — PostHog's is `https://{region}.posthog.com` — while the upstream holds
+/// what the operator's answer expanded it to. Comparing the two as strings
+/// therefore declines exactly the profiles whose upstreams most need the
+/// fallback, so a var matches here the way it was filled in: one non-empty run
+/// of a single URL component. It never spans a `/`, which is what stops a
+/// template from claiming a path that belongs to some other service.
+fn is_the_same_service(template: &str, concrete: &str) -> bool {
+    let mut literals = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}').map(|at| at + open) else {
+            // An unterminated `{` is a bug in the catalogue, not a wildcard.
+            return false;
+        };
+        literals.push(&rest[..open]);
+        rest = &rest[close + 1..];
+    }
+    literals.push(rest);
+
+    let (first, later) = literals.split_first().expect("a trailing literal");
+    let Some(mut left) = concrete.strip_prefix(*first) else {
+        return false;
+    };
+    let Some((last, between)) = later.split_last() else {
+        // No vars at all: the base URLs are the same service or they are not.
+        return left.is_empty();
+    };
+    for literal in between {
+        let Some(at) = left.find(literal).filter(|at| *at > 0) else {
+            return false;
+        };
+        if left[..at].contains('/') {
+            return false;
+        }
+        left = &left[at + literal.len()..];
+    }
+    // Whatever is left over is the last var, held to the same two rules.
+    match left.strip_suffix(last) {
+        Some(value) => !value.is_empty() && !value.contains('/'),
+        None => false,
+    }
 }
 
 /// The MCP methods that carry the session rather than doing anything with it.
@@ -1203,7 +1249,14 @@ pub fn catalog() -> Vec<Profile> {
                  line in `agent-iap list`, and an agent scoped to one cannot reach the other."
                     .into(),
             ),
-            probe: None,
+            // The route PostHog's own docs name for checking a personal API
+            // key. The base URL is the app, whose root answers a browser
+            // redirect to the login page however good the key is — so without
+            // this the only thing `verify` could report was `redirected`, which
+            // reads as a wrong base URL and is not one. A key scoped away from
+            // `user:read` answers 403 here, which `verify` names as a scope
+            // problem rather than a bad credential.
+            probe: Some("/api/users/@me/".into()),
         },
         Profile {
             id: "posthog-mcp".into(),
@@ -2407,6 +2460,66 @@ mod tests {
         // A known service with no free read-only route stays unprobed.
         assert_eq!(probe_for("https://api.semrush.com/apis/v4"), None);
         assert_eq!(probe_for("https://api.example.com"), None);
+        // The regional profiles: the upstream holds the expanded URL, and the
+        // catalogue holds the template it came from.
+        assert_eq!(
+            probe_for("https://us.posthog.com").as_deref(),
+            Some("/api/users/@me/")
+        );
+        assert_eq!(
+            probe_for("https://eu.posthog.com/").as_deref(),
+            Some("/api/users/@me/")
+        );
+        assert_eq!(
+            probe_for("https://us.sentry.io/api/0").as_deref(),
+            Some("/organizations/")
+        );
+        // A var fills one component and never reaches across a `/`, so
+        // `https://{region}.posthog.com` does not claim somebody else's path.
+        assert_eq!(probe_for("https://us.posthog.com/api"), None);
+        assert_eq!(probe_for("https://posthog.com"), None);
+    }
+
+    /// The matching a templated base URL needs, and the ways it says no.
+    #[test]
+    fn a_var_in_a_base_url_matches_one_component_of_the_enrolled_one() {
+        assert!(is_the_same_service(
+            "https://{region}.posthog.com",
+            "https://us.posthog.com"
+        ));
+        assert!(is_the_same_service(
+            "{scheme}://{host}/api/0",
+            "https://sentry.example.com/api/0"
+        ));
+        assert!(is_the_same_service(
+            "https://{host}/api",
+            "https://g.lan/api"
+        ));
+        // A var is never empty: the template names a component, and an
+        // upstream that has not got one is not this service.
+        assert!(!is_the_same_service(
+            "https://{region}.posthog.com",
+            "https://.posthog.com"
+        ));
+        assert!(!is_the_same_service("https://{host}/api", "https:///api"));
+        // ...and never spans a `/`.
+        assert!(!is_the_same_service(
+            "https://{region}.posthog.com",
+            "https://evil.example.com/us.posthog.com"
+        ));
+        assert!(!is_the_same_service(
+            "https://{host}/api",
+            "https://g.lan/nested/api"
+        ));
+        // A literal template is still an equality test.
+        assert!(is_the_same_service(
+            "https://api.github.com",
+            "https://api.github.com"
+        ));
+        assert!(!is_the_same_service(
+            "https://api.github.com",
+            "https://api.github.com/v3"
+        ));
     }
 
     /// The reason there is a Sentry MCP profile at all rather than another
