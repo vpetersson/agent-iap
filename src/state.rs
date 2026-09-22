@@ -42,8 +42,11 @@ pub struct AppState {
     pub admin_token: String,
     pub workload: WorkloadIssuer,
     /// Announced after every successful reload, for the parts that cannot be
-    /// swapped behind a lock because they are holding a socket open.
-    reloads: broadcast::Sender<Arc<Config>>,
+    /// swapped behind a lock because they are holding a socket open. Carries
+    /// what caused it, because one of those parts — the listeners' TLS
+    /// material — has the same question to answer as `preload_secrets`: read it
+    /// again, or serve what this process already holds.
+    reloads: broadcast::Sender<Reloaded>,
 }
 
 /// The client the proxy forwards with. Its timeouts cannot be changed after it
@@ -62,31 +65,48 @@ fn build_http_client(config: &Config) -> Result<reqwest::Client> {
         .context("building the upstream HTTP client")
 }
 
+/// A policy that is now in charge, and what put it there.
+#[derive(Clone)]
+pub struct Reloaded {
+    pub config: Arc<Config>,
+    pub why: crate::reload::Trigger,
+}
+
 fn timeouts_changed(current: &Config, edited: &Config) -> bool {
     current.server.upstream_timeout_secs != edited.server.upstream_timeout_secs
         || current.server.upstream_connect_timeout_secs
             != edited.server.upstream_connect_timeout_secs
 }
 
-/// Re-read every reference the policy file names, before anything binds a port.
+/// Resolve every reference the policy file names, before anything binds a port.
 ///
 /// Reports all of the failures rather than the first: a proxy fronting twenty
 /// upstreams should not need twenty restarts to discover that three of its
 /// references are wrong.
 ///
-/// `refresh` rather than `resolve`, so this both warms the cache at startup and
-/// re-reads it on reload — a credential rotated behind an unchanged reference
-/// takes effect the moment the file is reloaded, not only on a full restart.
-/// A reference that no longer resolves fails the reload, which leaves the proxy
-/// on the policy it already had (`AppState::reload` resolves before it swaps).
-fn preload_secrets(config: &Config, resolver: &SecretResolver) -> Result<()> {
+/// `fresh` is whether the values this process already holds are good enough.
+/// At startup it holds none, so nothing is cached and the question does not
+/// arise. Under a running proxy it decides between the two things a reload can
+/// mean, and `Trigger::rereads_credentials` is where that is argued: a reload
+/// somebody asked for re-reads every reference, so a credential rotated behind
+/// an unchanged one takes effect without a restart; a reload that only followed
+/// an edit serves what it has and reads only the references the edit brought
+/// with it.
+///
+/// Either way a reference that does not resolve fails the reload, which leaves
+/// the proxy on the policy it already had (`AppState::reload` resolves before
+/// it swaps).
+fn preload_secrets(config: &Config, resolver: &SecretResolver, fresh: bool) -> Result<()> {
     let references = config.secret_refs();
     // All at once rather than one after another: see `refresh_all`. Every
-    // reference is still read, and the failures still come back in file order,
-    // because this list is what an operator reads to find the line that is
-    // wrong.
-    let failures: Vec<(String, String)> = resolver
-        .refresh_all(&references)
+    // reference is still answered, and the failures still come back in file
+    // order, because this list is what an operator reads to find the line that
+    // is wrong.
+    let answers = match fresh {
+        true => resolver.refresh_all(&references),
+        false => resolver.resolve_all(&references),
+    };
+    let failures: Vec<(String, String)> = answers
         .into_iter()
         .zip(&references)
         .filter_map(|(answer, reference)| answer.err().map(|error| (reference.clone(), error)))
@@ -127,7 +147,7 @@ impl AppState {
 
         // Resolve everything now: a missing key or a locked 1Password vault should
         // stop startup, not surface as a mystery 502 on the first real request.
-        preload_secrets(&config, &resolver)?;
+        preload_secrets(&config, &resolver, true)?;
 
         let agents = AgentRegistry::build(&config, &resolver)?;
         let acl = Acl::compile(&config)?;
@@ -199,7 +219,7 @@ impl AppState {
 
     /// Told about every reload, for the listeners — a socket bound to one
     /// address cannot be swapped behind a lock.
-    pub fn subscribe_reloads(&self) -> broadcast::Receiver<Arc<Config>> {
+    pub fn subscribe_reloads(&self) -> broadcast::Receiver<Reloaded> {
         self.reloads.subscribe()
     }
 
@@ -213,7 +233,7 @@ impl AppState {
     /// the proxy carries on serving what it was already serving.
     pub fn reload(&self, config: Config, why: crate::reload::Trigger) -> Result<Arc<Config>> {
         // 1. Everything that can say no.
-        preload_secrets(&config, &self.resolver)?;
+        preload_secrets(&config, &self.resolver, why.rereads_credentials())?;
         let rules = Acl::prepare(&config)?;
         let roster = AgentRegistry::prepare(&config, &self.resolver)?;
 
@@ -303,7 +323,10 @@ impl AppState {
         }));
         self.audit.write_best_effort(record);
 
-        let _ = self.reloads.send(Arc::clone(&config));
+        let _ = self.reloads.send(Reloaded {
+            config: Arc::clone(&config),
+            why,
+        });
         Ok(config)
     }
 
@@ -632,12 +655,81 @@ auth = {{ type = "oauth2_client_credentials", token_url = "https://id.example.co
         );
     }
 
+    /// The daemon's own two triggers, and the difference between them.
+    ///
+    /// `agent-iap acl add` in the next terminal is a file that changed, and a
+    /// rule says nothing about any credential — so it must not cost a vault
+    /// lookup per reference, which on a desktop 1Password is an authorization
+    /// prompt (SIRI-205). `SIGHUP` is the opposite: it is what a
+    /// config-management tool sends after writing a rotated key, and the only
+    /// way a value that moved behind an unchanged reference can ever be
+    /// noticed.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_serves_what_it_holds_and_a_sighup_reads_it_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        let calls = dir.path().join("op-calls");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\necho call >> {}\nprintf 'sk-not-real'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lookups = || {
+            std::fs::read_to_string(&calls)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+
+        let policy = || {
+            toml::from_str::<Config>(&format!(
+                r#"
+[server]
+op_binary = "{}"
+
+[audit]
+path = "{}"
+stderr = false
+
+[[upstreams]]
+name = "gh"
+base_url = "https://api.github.com"
+auth = {{ type = "bearer", secret = "op://Private/github/credential" }}
+"#,
+                op.display(),
+                dir.path().join("audit.jsonl").display(),
+            ))
+            .unwrap()
+        };
+
+        let state = AppState::build(policy(), false).unwrap();
+        assert_eq!(lookups(), 1, "startup reads it once");
+
+        state
+            .reload(policy(), crate::reload::Trigger::Edited)
+            .unwrap();
+        assert_eq!(lookups(), 1, "an edit went back to the vault");
+
+        state
+            .reload(policy(), crate::reload::Trigger::Signal)
+            .unwrap();
+        assert_eq!(lookups(), 2, "a SIGHUP did not pick up a rotated value");
+    }
+
     #[test]
     fn every_broken_reference_is_reported_not_just_the_first() {
         // Twenty upstreams should not mean twenty restarts to find three typos.
         let config = config_with(&["env:AGENT_IAP_NOT_SET_ONE", "env:AGENT_IAP_NOT_SET_TWO"]);
         let resolver = SecretResolver::new("op");
-        let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
+        let error = preload_secrets(&config, &resolver, true)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("2 of 2"), "{error}");
         assert!(error.contains("AGENT_IAP_NOT_SET_ONE"), "{error}");
@@ -651,7 +743,9 @@ auth = {{ type = "oauth2_client_credentials", token_url = "https://id.example.co
         // does not mention.
         let config = config_with(&["env:AGENT_IAP_NOT_SET_ONE"]);
         let resolver = SecretResolver::new("op");
-        let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
+        let error = preload_secrets(&config, &resolver, true)
+            .unwrap_err()
+            .to_string();
 
         assert!(!error.contains("op"), "{error}");
         assert!(error.contains("is not set"), "{error}");
@@ -663,7 +757,9 @@ auth = {{ type = "oauth2_client_credentials", token_url = "https://id.example.co
         // A binary that cannot exist, so the `op` branch fails without needing
         // the real CLI installed or signed in.
         let resolver = SecretResolver::new("agent-iap-no-such-op-binary");
-        let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
+        let error = preload_secrets(&config, &resolver, true)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("is `op` signed in?"), "{error}");
         assert!(error.contains("op://Vault/Item/field"), "{error}");
@@ -673,6 +769,6 @@ auth = {{ type = "oauth2_client_credentials", token_url = "https://id.example.co
     fn a_config_whose_references_all_resolve_preloads_cleanly() {
         let config = config_with(&["literal:sk-test"]);
         let resolver = SecretResolver::new("op");
-        preload_secrets(&config, &resolver).unwrap();
+        preload_secrets(&config, &resolver, true).unwrap();
     }
 }

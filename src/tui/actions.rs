@@ -64,7 +64,7 @@ impl Policy {
     /// The watcher the daemon is running, shared with this console.
     ///
     /// Handed out because the reload itself happens on a thread of its own —
-    /// re-reading the file is a vault lookup per credential, which is not
+    /// reading the file can be a vault lookup per credential, which is not
     /// something the console can stop drawing for. See `spawn_reloader`.
     pub fn watcher(&self) -> &Arc<Watcher> {
         &self.watcher
@@ -80,20 +80,22 @@ impl Policy {
         Ok(())
     }
 
-    /// Resolve every credential reference and record what happened.
+    /// Record what a re-read of the credential references found.
     ///
-    /// Deliberately on a keystroke rather than on a timer: an `op://` reference
-    /// is a subprocess and a network call, and a console that ran one every
-    /// frame would be a console that rate-limits a vault.
-    pub fn check_credentials(&mut self, state: &Arc<AppState>) {
-        for row in &mut self.credentials {
-            row.resolves = Some(
-                state
-                    .resolver
-                    .resolve(&row.reference)
-                    .map(|_| ())
-                    .map_err(|error| format!("{error:#}")),
-            );
+    /// Answers arrive by reference rather than by row number: the check runs
+    /// off the thread that draws, and the policy can be replaced while it is
+    /// out. A row that is no longer in the file is simply not found, and a row
+    /// that arrived while it was out keeps saying `not checked`, which is what
+    /// it is.
+    pub fn checked(&mut self, answers: &[(String, Result<(), String>)]) {
+        for (reference, answer) in answers {
+            for row in self
+                .credentials
+                .iter_mut()
+                .filter(|row| row.reference == *reference)
+            {
+                row.resolves = Some(answer.clone());
+            }
         }
     }
 }
