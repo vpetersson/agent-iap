@@ -491,6 +491,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
+| Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Others | `anthropic`, `openai`, `github`, `linear`, `slack`, `stripe` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
@@ -525,6 +526,24 @@ The honest limits, all printed by `profile show`:
   same rules at your own host. The release does: an endpoint your version
   predates 404s rather than being denied, which is why the `triage` rules name
   the project-scoped issue path as well as the organization-wide one.
+- **A Spotify token is app-only, and expires in an hour.** Spotify issues no
+  long-lived API key: every call carries an OAuth access token. So `spotify` is
+  the one profile whose credential the proxy *spends* rather than forwards — it
+  trades the app's client secret for an access token at
+  `accounts.spotify.com/api/token` and injects that, which is the whole reason
+  a profile can exist for a service whose own credential would have stopped
+  working before the agent's next task. The Client ID identifies the app rather
+  than authenticating it, so it is a `--var client_id=…` in the clear and only
+  the secret is a reference. What that grant does *not* reach is anybody's
+  account: `/v1/me/**`, playlists, the library and playback need a listener's
+  authorization-code grant with a refresh token, which this proxy does not
+  perform, and they come back 401 from Spotify rather than denied by the ACL.
+  There is no `write` level for the same reason. Spotify also restricted
+  several catalogue endpoints for apps registered after 27 November 2024 — audio
+  features, audio analysis, recommendations, related artists and the
+  featured/category playlist lists — so the default `catalogue` level names the
+  endpoints that survived it rather than `/v1/**`; `--access read` is every GET,
+  including the ones a new app will be refused.
 - **A path the ACL cannot split.** Semrush's v3 analytics puts every report at
   the same path and names it in a query parameter — `/?type=domain_ranks` — so
   rules can say "reports, read-only" and nothing finer. The credential goes in
@@ -1026,12 +1045,49 @@ from a shell is a form here, over the same functions with the same validation:
 | credentials | every reference the file names, and whether it still resolves | `c` re-check |
 | profiles | the ready-made service definitions | `enter` add |
 
-`n` on the upstreams pane opens on a profile picker rather than a blank form.
-`←`/`→` walks the catalogue, and landing on one replaces the form with that
-profile's: no base URL to type, no scheme to pick, its variables and access
-levels as named fields, and the credential reference the only thing left to fill
-in. Left where it starts — *none* — it is the form it always was. Only the HTTP
-profiles are offered here; an MCP profile belongs to the `mcp` pane.
+`n` on the upstreams pane opens on the catalogue rather than on a blank form,
+and the catalogue is the whole screen: which service this is decides every field
+under it, and there are approaching sixty to choose from.
+
+```
+┌ pick a profile ────────────────────────────────────────────────────────┐
+│ search: s▏                                                             │
+│ S ▶ semrush                Semrush        Semrush API (v3)             │
+│     semrush-trends         Semrush        Semrush Trends API           │
+│     semrush-v4             Semrush        Semrush API (v4)             │
+│     sentry                 Sentry         Sentry API (sentry.io)       │
+│     sentry-self-hosted     Sentry         Sentry API (self-hosted)     │
+│     slack                  Slack          Slack Web API                │
+│     spotify                Spotify        Spotify Web API              │
+│     stripe                 Stripe         Stripe API                   │
+│ G   google-cloud-storage   Google         Google Cloud Storage         │
+│     google-search-console  Google         Google Search Console        │
+│     google-sheets          Google         Google Sheets                │
+│                                                                        │
+│ https://api.semrush.com  Domain, keyword and backlink reports.         │
+│  ↑/↓  move   a–z  narrow   enter  pick   esc  clear what was typed     │
+└ 11 of 25 ──────────────────────────────────────────────────────────────┘
+```
+
+**Typing narrows by what things are *called*.** `s` is every profile filed under
+`s` — not the forty whose description happens to contain the letter — because a
+needle matches at the start of a word: the id, each `-` separated part of it,
+and each word of the vendor and the title. So `mcp` is every MCP profile at
+once, spread through an alphabetical list as they are, and `analytics` is the
+two Google ones. The ones whose *name* starts with what you typed come first
+and the ones that merely have a word starting with it follow, which is why
+`google-sheets` is under `stripe` above rather than missing. Only when nothing
+is *called* what you typed does it look inside the descriptions instead, so
+`sitemaps` still finds Search Console and nothing is unreachable. The list is alphabetical and the gutter carries each
+initial once, which is what makes it a thing to read as well as a thing to
+search.
+
+Landing on a profile replaces the form with that profile's: no base URL to type,
+no scheme to pick, its variables and access levels as named fields, and the
+credential reference the only thing left to fill in. `esc` off the picker is the
+hand-written form — *none* — for a service the catalogue does not have, and
+`ctrl-o` on the `profile` field opens it again. Only the HTTP profiles are
+offered here; an MCP profile belongs to the `mcp` pane.
 
 Like the command, the form grants nothing: the switch that writes the access
 level's rules is `grant now`, and it is off. Leave it off and the first call

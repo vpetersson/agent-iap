@@ -30,6 +30,7 @@
 mod actions;
 mod approve;
 mod browse;
+mod catalogue;
 mod choose;
 mod form;
 mod views;
@@ -1183,7 +1184,17 @@ impl App {
         if let Some(picker) = &hits.browser {
             if let (Some(Modal::Form(form)), true) = (&mut self.modal, within(picker.popup, at)) {
                 if let Some((_, row)) = picker.rows.iter().find(|(rect, _)| within(*rect, at)) {
+                    let picked = picked(form);
                     form.click_browse(*row, double);
+                    // A profile picked with the mouse is a different enrolment
+                    // with different fields, exactly as one picked with
+                    // `enter` is — and the rebuild lives on that keystroke's
+                    // path, which a click never takes.
+                    if let Some(before) = picked {
+                        if form.text("id") != before {
+                            **form = upstream_form(&self.profiles, &form.text("id"));
+                        }
+                    }
                 }
             }
             return;
@@ -1301,10 +1312,15 @@ impl App {
             }
 
             (Tab::Upstreams, KeyCode::Char('n')) => {
-                self.modal = Some(Modal::Form(Box::new(upstream_form(
-                    &self.profiles,
-                    NO_PROFILE,
-                ))))
+                // Opened on the catalog rather than on the form behind it.
+                // "Which service is this?" is the first thing the form asks
+                // and the thing that decides every field under it, and the
+                // answer is a list of sixty — so the list is the first screen,
+                // and `esc` off it is the hand-written form for a service the
+                // catalog does not have.
+                let mut form = Box::new(upstream_form(&self.profiles, NO_PROFILE));
+                form.pick();
+                self.modal = Some(Modal::Form(form));
             }
             // `enter` too, so a double-click on the row opens what the row is
             // — the same pairing every other pane has.
@@ -2731,6 +2747,23 @@ fn agent_form() -> Form {
 /// Deliberately not a word that could ever be a profile id.
 const NO_PROFILE: &str = "— none: spell it out below —";
 
+/// The catalog as the full-screen picker reads it, in the order
+/// `profiles::catalog` hands it over — which is alphabetical by id, and so
+/// already the sections the picker's gutter draws.
+fn catalogue_entries(offered: &[&Profile]) -> Vec<catalogue::Entry> {
+    let mut entries = vec![catalogue::Entry::none(NO_PROFILE)];
+    entries.extend(offered.iter().map(|profile| catalogue::Entry {
+        value: profile.id.clone(),
+        title: profile.title.clone(),
+        vendor: profile.vendor.clone(),
+        kind: profile.service.kind().to_string(),
+        endpoint: profile.endpoint(),
+        summary: profile.summary.clone(),
+        none: false,
+    }));
+    entries
+}
+
 /// Add an upstream, from a profile or by hand.
 ///
 /// The picker is the first field because it decides what the rest of the form
@@ -2768,10 +2801,11 @@ fn upstream_form(catalogue: &[Profile], picked: &str) -> Form {
     let mut fields = vec![Field::choices(
         "id",
         "profile",
-        "a service worked out in advance: its endpoint, its credential scheme and a reviewed set of ACL rules. ←/→ to browse.",
+        "a service worked out in advance: its endpoint, its credential scheme and a reviewed set of ACL rules",
         options,
         selected,
-    )];
+    )
+    .picking(catalogue_entries(&offered))];
 
     match offered.into_iter().find(|profile| profile.id == picked) {
         Some(profile) => {
@@ -3873,8 +3907,9 @@ action = "allow"
         app.tab = Tab::Upstreams;
 
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
-        // The form opens on the profile picker, left where it starts: this is
-        // the operator who is spelling the service out.
+        // `n` opens on the catalogue and `esc` declines it: this is the
+        // operator who is spelling the service out.
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
         type_in(&mut app, "linear");
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
@@ -3959,11 +3994,18 @@ action = "allow"
             "it opens on no profile — the blank form is still one keystroke away"
         );
 
-        // `→` walks the catalogue. Every step is a different form.
-        while picked(&app) != "github" {
-            app.handle(KeyEvent::from(KeyCode::Right)).unwrap();
-            assert!(app.modal.is_some(), "browsing does not close the form");
-        }
+        // And it opens on the catalogue, which is the whole list and is drawn
+        // over the form rather than beside it.
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            rendered.contains("pick a profile") && rendered.contains("github"),
+            "`n` opens the catalogue: {rendered}"
+        );
+
+        // Typed, not walked: `g` is the profiles filed under `g`.
+        type_in(&mut app, "github");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert_eq!(picked(&app), "github", "the pick rebuilds the form");
 
         let Some(Modal::Form(form)) = &app.modal else {
             panic!("the form is open")
@@ -4047,6 +4089,67 @@ action = "allow"
         rule.name
             .as_deref()
             .is_some_and(|name| name.starts_with("gh-"))
+    }
+
+    /// The reported problem: the catalogue was a `◂ … ▸` strip, so reaching
+    /// the profile you came for meant pressing `→` past every one before it.
+    /// Typing a letter now brings up that letter's profiles, on a screen big
+    /// enough to show them — which is also how you find out what is in there.
+    #[tokio::test]
+    async fn a_letter_brings_up_the_profiles_filed_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+
+        type_in(&mut app, "s");
+        let rendered = render(&mut app, 120, 34);
+        for filed_under_s in ["semrush", "sentry", "slack", "spotify", "stripe"] {
+            assert!(
+                rendered.contains(filed_under_s),
+                "`s` should bring up `{filed_under_s}`: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("anthropic"),
+            "`anthropic` merely contains an `s`; it is not filed under one: {rendered}"
+        );
+
+        // And `esc` puts back what was typed rather than the form, so a
+        // mistyped letter does not cost the catalogue.
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("anthropic"), "{rendered}");
+        assert!(rendered.contains("pick a profile"), "{rendered}");
+    }
+
+    /// `esc` off the catalogue is the hand-written form, and `ctrl-o` on the
+    /// `profile` field is the way back in — so declining the list once is not
+    /// a decision you are stuck with.
+    #[tokio::test]
+    async fn the_catalogue_can_be_declined_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+
+        let rendered = render(&mut app, 120, 34);
+        assert!(
+            rendered.contains("add an upstream") && !rendered.contains("pick a profile"),
+            "`esc` leaves the catalogue and keeps the form: {rendered}"
+        );
+        assert!(
+            rendered.contains("ctrl-o"),
+            "the way back into the catalogue is announced: {rendered}"
+        );
+
+        app.handle(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .unwrap();
+        let rendered = render(&mut app, 120, 34);
+        assert!(rendered.contains("pick a profile"), "{rendered}");
     }
 
     /// An MCP profile is not an upstream. Offering one here would write an
@@ -4197,13 +4300,14 @@ action = "allow"
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
 
         // Any profile whose credential is a file will do; this is the one the
-        // report came in on.
+        // report came in on. Reached the way an operator reaches it: typed
+        // into the catalogue `n` opened on, then `enter`.
         let wanted = "google-analytics-data";
-        for _ in 0..app.profiles.len() + 1 {
-            match &app.modal {
-                Some(Modal::Form(form)) if form.text("id") == wanted => break,
-                _ => app.handle(KeyEvent::from(KeyCode::Right)).unwrap(),
-            };
+        type_in(&mut app, wanted);
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        match &app.modal {
+            Some(Modal::Form(form)) => assert_eq!(form.text("id"), wanted),
+            _ => panic!("picking a profile rebuilds the form rather than closing it"),
         }
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // name
         app.handle(KeyEvent::from(KeyCode::Tab)).unwrap(); // secret
@@ -4396,6 +4500,9 @@ base_url = "https://api.github.com"
         app.tab = Tab::Upstreams;
         app.clamp_cursors();
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        // `n` opens on the catalogue; `esc` off it is the hand-written form,
+        // which is the one this helper is setting up.
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
 
         let Some(Modal::Form(form)) = &mut app.modal else {
             panic!("the upstream form is not open");
