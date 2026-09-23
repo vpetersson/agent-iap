@@ -240,6 +240,25 @@ enum SecretCommand {
         #[command(flatten)]
         config: ConfigArg,
     },
+    /// Read every `op://` reference the policy names — once — and keep the
+    /// values here instead, so nothing asks 1Password again.
+    ///
+    /// One authorization prompt for the whole file, and then none: not at
+    /// startup, not on reload, not when an agent opens an MCP server, and not
+    /// in any of the one-shot commands. The policy file keeps pointing at a
+    /// name rather than holding a credential, so it stays safe to commit.
+    ///
+    /// The trade is the one `secret set` makes and prints: the store is
+    /// plaintext on this machine, readable by this user. Worth it for a
+    /// read-only token on a laptop; think twice for a credential that can
+    /// spend money. `--dry-run` shows exactly what it would do.
+    Import {
+        /// Show what would be read, stored and repointed — and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        config: ConfigArg,
+    },
     /// Forget a stored credential.
     Rm {
         /// Name to forget.
@@ -1170,6 +1189,9 @@ fn main() -> Result<()> {
         }
         Command::Secret(SecretCommand::Set { name, config }) => set_secret(&name, &config.config),
         Command::Secret(SecretCommand::List { config }) => list_secrets(&config.config),
+        Command::Secret(SecretCommand::Import { dry_run, config }) => {
+            import_secrets(&config.config, dry_run)
+        }
         Command::Secret(SecretCommand::Rm {
             name,
             force,
@@ -1243,6 +1265,212 @@ fn set_secret(name: &str, config_path: &Path) -> Result<()> {
         "\nA running proxy picks this up on its next reload: `SIGHUP`, or `r` in the console."
     );
     Ok(())
+}
+
+/// `secret import`: the whole policy off the vault, in one authorization.
+///
+/// The prompting this ends is structural rather than a bug left in one place.
+/// A credential behind `op://` is read by whichever process needs it, and the
+/// processes are many and short-lived: the daemon at startup and on every
+/// reload that means it, `check`, `verify`, and — the one that made this
+/// intolerable — the MCP bridge the agent spawns fresh for every session. Each
+/// is a new client asking the desktop app for CLI access. agent-iap can make
+/// each of those one dialogue rather than several, and it has; it cannot make
+/// them zero while the credential lives somewhere that asks (SIRI-205).
+///
+/// So: read them all in one pass — one dialogue — write them into the store,
+/// and repoint the file. After it, no `op` runs at all.
+fn import_secrets(config_path: &Path, dry_run: bool) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let planned = plan_import(&config);
+    if planned.is_empty() {
+        println!(
+            "No `op://` references in {} — nothing to import.",
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} `op://` reference(s) in {}:\n",
+        planned.len(),
+        config_path.display()
+    );
+    for entry in &planned {
+        println!("  {}  →  iap://{}", entry.reference, entry.name);
+        for owner in &entry.owners {
+            println!("      {owner}");
+        }
+    }
+
+    if dry_run {
+        println!("\n--dry-run: nothing read, nothing stored, nothing written.");
+        return Ok(());
+    }
+
+    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone())
+        .with_store(config.server.secret_store_path());
+    let references: Vec<String> = planned
+        .iter()
+        .map(|entry| entry.reference.clone())
+        .collect();
+
+    println!("\nReading them from 1Password — one prompt for all of them…");
+    let answers = resolver.resolve_all(&references);
+    let failures: Vec<String> = answers
+        .iter()
+        .zip(&references)
+        .filter_map(|(answer, reference)| {
+            answer
+                .as_ref()
+                .err()
+                .map(|error| format!("  {reference}: {error}"))
+        })
+        .collect();
+    if !failures.is_empty() {
+        // Nothing is stored and the file is untouched: a half-imported policy
+        // pointing at a store that has half the credentials is worse than one
+        // that still points at the vault.
+        bail!(
+            "{} of {} could not be read — nothing was stored and `{}` is unchanged\n{}",
+            failures.len(),
+            references.len(),
+            config_path.display(),
+            failures.join("\n")
+        );
+    }
+
+    let store = store_for(config_path);
+    let mut moves = Vec::new();
+    let mut replaced = 0;
+    for entry in &planned {
+        let value = resolver
+            .resolve(&entry.reference)
+            .context("a reference that resolved a moment ago")?;
+        if store.set(&entry.name, value.expose())? {
+            replaced += 1;
+        }
+        moves.push((entry.reference.clone(), format!("iap://{}", entry.name)));
+    }
+
+    let moved = enroll::repoint_references(config_path, &moves)?;
+    println!(
+        "\nStored {} credential(s){} and repointed {moved} reference(s) in {}.",
+        planned.len(),
+        match replaced {
+            0 => String::new(),
+            n => format!(" ({n} replaced a name already in the store)"),
+        },
+        config_path.display()
+    );
+    println!(
+        "\nNothing here reads 1Password now. The values are plaintext at `{}`,\n\
+         readable by this user — that is the trade against `op://`. `agent-iap secret list`\n\
+         shows the names; the policy file still holds pointers and is still safe to commit.",
+        store.path().display()
+    );
+    if store.exposed() {
+        eprintln!(
+            "\nwarning  `{}` is readable by more than its owner — `chmod 600` it",
+            store.path().display()
+        );
+    }
+    eprintln!(
+        "\nA running proxy picks this up on its next reload: `SIGHUP`, or `r` in the console."
+    );
+    Ok(())
+}
+
+/// One credential to move, the name it will have, and what points at it.
+struct Import {
+    reference: String,
+    name: String,
+    owners: Vec<String>,
+}
+
+/// Every `op://` reference in the policy, once each, with a name to keep it
+/// under.
+///
+/// Grouped by reference rather than by field: twenty upstreams sharing a vault
+/// item are one credential, and importing it twenty times under twenty names
+/// would turn one rotation into twenty.
+fn plan_import(config: &Config) -> Vec<Import> {
+    let mut planned: Vec<Import> = Vec::new();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (owner, field, reference) in agent_iap::list::credential_sites(config) {
+        if !matches!(
+            agent_iap::secrets::SecretRef::parse(&reference),
+            Ok(agent_iap::secrets::SecretRef::OnePassword(_))
+        ) {
+            continue;
+        }
+        if let Some(entry) = planned
+            .iter_mut()
+            .find(|entry| entry.reference.trim() == reference.trim())
+        {
+            entry.owners.push(format!("{owner} {field}"));
+            continue;
+        }
+        let name = unique_name(&owner, &field, &mut taken);
+        planned.push(Import {
+            reference: reference.trim().to_string(),
+            name,
+            owners: vec![format!("{owner} {field}")],
+        });
+    }
+    planned
+}
+
+/// A store name from the thing that holds the credential.
+///
+/// `upstream github` + `auth.secret` is `github`, because that is what the
+/// operator calls it. Anything the store would not take — and anything already
+/// used — is narrowed until it would.
+fn unique_name(owner: &str, field: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let owner = owner
+        .strip_prefix("upstream ")
+        .or_else(|| owner.strip_prefix("mcp "))
+        .unwrap_or(owner);
+    // An environment variable already carries a name somebody chose —
+    // `SEMRUSH_TOKEN` says more than `semrush-env-semrush-token` does, and a
+    // collision between two servers is what the numbering below is for.
+    let base = match field.strip_prefix("env.") {
+        Some(variable) => slug(variable),
+        // `auth.secret` is the ordinary case and adds nothing to the name;
+        // every other field is there to tell two credentials on one service
+        // apart.
+        None => {
+            let suffix = match field {
+                "auth.secret" => String::new(),
+                field => format!("-{}", field.trim_start_matches("auth.").replace('.', "-")),
+            };
+            slug(&format!("{owner}{suffix}"))
+        }
+    };
+    let base = match store::Store::check_name(&base) {
+        Ok(()) => base,
+        Err(_) => "credential".to_string(),
+    };
+    let mut name = base.clone();
+    let mut n = 2;
+    while !taken.insert(name.clone()) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    name
+}
+
+fn slug(text: &str) -> String {
+    let slug: String = text
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
+            '-' | '_' | '.' => c,
+            _ => '-',
+        })
+        .collect();
+    slug.trim_matches('-').to_string()
 }
 
 /// Read the credential itself: piped in, or typed at a prompt that does not echo.
@@ -1933,19 +2161,24 @@ fn check(path: &Path) -> Result<()> {
     if references.is_empty() {
         println!("secrets     none referenced");
     }
+    // Every reference in one pass rather than one call each: the `op://` ones
+    // then go to 1Password in a single `op`, which is a single authorization
+    // dialogue. `check` asking eight times is `check` being the command an
+    // operator stops running (SIRI-205).
+    let answers = resolver.resolve_all(&references);
     let mut failed = 0;
-    for reference in &references {
+    for (reference, answer) in references.iter().zip(answers) {
         // `display_ref` rather than the raw string, for the same reason
         // `agent-iap list` uses it: every scheme but one is a *pointer* and safe
         // on a terminal, and `literal:` is the credential itself. It is also the
         // reference as the resolver read it, so a stray space in the file is not
         // echoed back as though it were part of the vault's name.
         let shown = agent_iap::secrets::display_ref(reference);
-        match resolver.resolve(reference) {
-            Ok(_) => println!("secrets     ok      {shown}"),
+        match answer {
+            Ok(()) => println!("secrets     ok      {shown}"),
             Err(error) => {
                 failed += 1;
-                println!("secrets     FAILED  {shown}: {error:#}");
+                println!("secrets     FAILED  {shown}: {error}");
             }
         }
     }

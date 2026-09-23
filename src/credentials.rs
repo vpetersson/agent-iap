@@ -3,7 +3,7 @@
 //! This is where the real key enters the request — on the way *out* of the proxy,
 //! after the ACL has already said yes, and never anywhere the agent can observe.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::audit::{AuditLog, AuditRecord};
 use crate::config::AuthConfig;
-use crate::secrets::{Secret, SecretResolver};
+use crate::secrets::{display_ref, Secret, SecretResolver};
 use crate::service_account::{ServiceAccount, JWT_BEARER_GRANT};
 
 /// Refresh a minted token this long before it actually expires.
@@ -134,10 +134,28 @@ impl CredentialInjector {
     }
 
     /// Resolve every `env`/`file`/`op://` reference an MCP child process needs.
+    ///
+    /// One pass over the lot rather than one call each, because this runs in
+    /// the *bridge* — a process the agent starts fresh for every MCP session,
+    /// holding a cache that is empty every time. A server naming three `op://`
+    /// variables was three `op` processes, and on a desktop 1Password three
+    /// authorization dialogues, every time the agent opened the server. One
+    /// pass makes it one (SIRI-205).
     pub fn resolve_env(
         &self,
         env: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, Secret)>> {
+        let references: Vec<String> = env.values().cloned().collect();
+        // The answers land in the resolver's cache; what comes back is only
+        // whether each one got there, and the first failure names its variable.
+        for ((key, reference), answer) in env.iter().zip(self.resolver.resolve_all(&references)) {
+            if let Err(error) = answer {
+                bail!(
+                    "resolving env `{key}` ({}): {error}",
+                    display_ref(reference)
+                );
+            }
+        }
         env.iter()
             .map(|(key, reference)| {
                 let secret = self
@@ -464,6 +482,80 @@ mod tests {
         let resolver = Arc::new(SecretResolver::new("op"));
         resolver.preset("literal:sk-real", Secret::new("sk-real".into()));
         CredentialInjector::new(resolver, crate::http_client(), None)
+    }
+
+    /// The bridge's own fan-out, which was the worst of them.
+    ///
+    /// `agent-iap mcp` is started fresh by the agent for every session, with a
+    /// cache that is empty every time, and it resolved the child's environment
+    /// one variable at a time — so a server naming three `op://` variables was
+    /// three `op` processes and three authorization dialogues, per session, all
+    /// day (SIRI-205).
+    #[cfg(unix)]
+    #[test]
+    fn a_servers_environment_is_one_trip_to_the_vault_rather_than_one_each() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        let calls = dir.path().join("op-calls");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$1\" >> {}\n\
+                 case \"$1\" in\n\
+                 read) printf 'value-for-%s' \"$3\" ;;\n\
+                 inject) sed -E 's/\\{{\\{{ ([^}}]*) \\}}\\}}/value-for-\\1/g' ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let injector = CredentialInjector::new(
+            Arc::new(SecretResolver::new(op.to_str().unwrap())),
+            crate::http_client(),
+            None,
+        );
+        let env: std::collections::BTreeMap<String, String> = [
+            ("SEMRUSH_TOKEN", "op://Private/semrush/password"),
+            ("SENTRY_TOKEN", "op://Private/sentry/password"),
+            ("DATAFORSEO_TOKEN", "op://Private/dataforseo/api-token"),
+        ]
+        .into_iter()
+        .map(|(key, reference)| (key.to_string(), reference.to_string()))
+        .collect();
+
+        let resolved = injector.resolve_env(&env).unwrap();
+
+        let invocations = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            vec!["inject"],
+            "three variables, three dialogues, every session"
+        );
+        // And each variable still carries its own value — a batch that
+        // mis-split would hand one server's token to another's variable.
+        assert_eq!(resolved.len(), 3);
+        for (key, secret) in &resolved {
+            assert_eq!(secret.expose(), format!("value-for-{}", env[key]));
+        }
+    }
+
+    /// The variable that failed is the one the error names.
+    #[test]
+    fn a_broken_reference_in_the_environment_names_its_variable() {
+        let env: std::collections::BTreeMap<String, String> = [(
+            "SEMRUSH_TOKEN".to_string(),
+            "env:AGENT_IAP_DEFINITELY_NOT_SET".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let error = format!("{:#}", injector().resolve_env(&env).unwrap_err());
+        assert!(error.contains("SEMRUSH_TOKEN"), "{error}");
     }
 
     fn request() -> reqwest::Request {

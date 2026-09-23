@@ -1496,6 +1496,7 @@ agent-iap upstream add gh --base-url https://api.github.com \
 
 agent-iap secret list          # names, when they were set, and what uses each
 agent-iap secret rm <name>     # refuses while the policy file still points at it
+agent-iap secret import        # move a whole policy off `op://`, in one prompt
 ```
 
 In the console, typing a credential straight into a credential field offers
@@ -1546,11 +1547,46 @@ error still names the line of the file to fix rather than leaving you to bisect
 the policy. That fallback is logged at `warn`, because the visible consequence
 of it is more dialogues. It stops at the first refusal too.
 
-If 1Password asks every single time even after you approve it, check whether the
-binary changed between runs: the app authorizes the calling program, and a
+#### Getting off the vault entirely
+
+Batching makes each *process* one dialogue. It cannot make them none, because a
+credential behind `op://` is read by whichever process needs it — and the
+processes are many and short-lived: the daemon at startup and on each reload
+that means it, `check`, `verify`, and the MCP bridge your agent spawns fresh for
+every session. Each is a new client asking the desktop app for CLI access.
+
+`agent-iap secret import` ends that. It reads every `op://` reference the policy
+names in one go — one prompt — keeps the values in agent-iap's own store, and
+repoints the file at them:
+
+```shell
+agent-iap secret import --dry-run   # what it would read, store and repoint
+agent-iap secret import
+```
+
+Afterwards nothing runs `op` at all. The file keeps pointing at names rather
+than holding credentials, so it is still safe to commit, and your comments and
+formatting come back as you wrote them. An item two services share is imported
+once, under one name, so rotating it is still one job. A reference that will not
+read stops the whole thing: nothing is stored and the file is untouched, because
+a policy pointing at a store holding half the credentials is worse than one
+still pointing at the vault.
+
+The trade is the one `secret set` prints: the store is plaintext on this
+machine, readable by this user, with no encryption at rest. That is the same
+trade as `~/.aws/credentials` — right for a read-only token on a laptop, worth
+thinking about for a credential that can spend money.
+
+If you want to stay on 1Password and still not be asked, use a **service
+account**: export `OP_SERVICE_ACCOUNT_TOKEN` before starting agent-iap and `op`
+authenticates with it instead of the desktop app, which prompts for nothing.
+Nothing here needs configuring for that — `op` is run with the environment it
+inherits.
+
+And if 1Password asks every single time even after you approve it, check whether
+the binary changed between runs: the app authorizes the calling program, and a
 rebuilt `./target/debug/agent-iap` is not the program it was asked about last
-time. `agent-iap secret set` keeps a credential in agent-iap's own store instead
-(`iap://NAME`), which involves no vault and no prompt.
+time.
 
 ### TLS
 
