@@ -1531,10 +1531,26 @@ of them again on `SIGHUP` — they go to 1Password in **one** `op` invocation, v
 `op inject`. The desktop app authorizes a *process*, so a proxy that forked one
 `op` per reference asked for CLI access once per reference, concurrently, and
 the grant given to the first dialogue could not cover the ones already stacked
-behind it. One process is one dialogue. Where that cannot be done — an `op`
-without `inject`, a vault that refuses the template — each reference is read on
-its own, so the error still names the line of the file to fix rather than
-leaving you to bisect the policy.
+behind it. One process is one dialogue.
+
+**Dismissing that dialogue ends the read.** It is an answer, and asking the same
+person the same question once per remaining reference is the thing this section
+is about. The references come back unresolved — the first with what 1Password
+said, the rest saying they were not asked — and the proxy refuses to start on a
+policy it cannot serve. Unlock 1Password, start it again, approve the one
+prompt.
+
+Where the single invocation cannot be used — an `op` too old to have `inject`, a
+template it will not take — each reference is read on its own instead, so the
+error still names the line of the file to fix rather than leaving you to bisect
+the policy. That fallback is logged at `warn`, because the visible consequence
+of it is more dialogues. It stops at the first refusal too.
+
+If 1Password asks every single time even after you approve it, check whether the
+binary changed between runs: the app authorizes the calling program, and a
+rebuilt `./target/debug/agent-iap` is not the program it was asked about last
+time. `agent-iap secret set` keeps a credential in agent-iap's own store instead
+(`iap://NAME`), which involves no vault and no prompt.
 
 ### TLS
 

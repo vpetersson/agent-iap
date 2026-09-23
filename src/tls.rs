@@ -208,6 +208,24 @@ enum Stop {
 /// address change is not a hang.
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The context on a bind that did not happen.
+///
+/// "Permission denied" on an address the operator just typed reads as a problem
+/// with the address, and the operating system will not say which half it
+/// objected to. On a reserved port it is always the port — and a typo'd one
+/// (`:808` for `:8080`) is how that happens — so name it while the number is
+/// still on screen.
+fn bind_failed(addr: SocketAddr, kind: std::io::ErrorKind) -> String {
+    if kind == std::io::ErrorKind::PermissionDenied && addr.port() < 1024 {
+        return format!(
+            "binding {addr} — port {} is reserved to root, and agent-iap is meant to run \
+             unprivileged; pick a port above 1023",
+            addr.port()
+        );
+    }
+    format!("binding {addr}")
+}
+
 impl Listener {
     /// Bind and start serving. Binding here rather than inside the task means
     /// an address already in use is an error the caller gets, not one that
@@ -217,8 +235,10 @@ impl Listener {
         router: Router,
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<Self> {
-        let listener =
-            std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+        let listener = std::net::TcpListener::bind(addr).map_err(|error| {
+            let context = bind_failed(addr, error.kind());
+            anyhow::Error::new(error).context(context)
+        })?;
         let addr = listener
             .local_addr()
             .context("asking the listener what address it got")?;
@@ -527,5 +547,30 @@ mod tests {
         );
         assert!(error.contains("server.tls"), "{error}");
         assert!(error.contains("cert"), "{error}");
+    }
+
+    /// `--listen 192.168.7.5:808` is `:8080` with a digit missing, and the
+    /// kernel answers it with "Permission denied" — which reads as a problem
+    /// with the address rather than with the port. Say which.
+    #[test]
+    fn a_reserved_port_says_it_is_the_port() {
+        let denied = std::io::ErrorKind::PermissionDenied;
+        let context = bind_failed("192.168.7.5:808".parse().unwrap(), denied);
+        assert!(context.contains("reserved to root"), "{context}");
+        assert!(context.contains("808"), "{context}");
+
+        // And nothing is added where the port is not the explanation: a port
+        // that is simply taken, or a reserved one refused for another reason.
+        assert_eq!(
+            bind_failed("127.0.0.1:8080".parse().unwrap(), denied),
+            "binding 127.0.0.1:8080"
+        );
+        assert_eq!(
+            bind_failed(
+                "127.0.0.1:80".parse().unwrap(),
+                std::io::ErrorKind::AddrInUse
+            ),
+            "binding 127.0.0.1:80"
+        );
     }
 }

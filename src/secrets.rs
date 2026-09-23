@@ -169,6 +169,66 @@ fn render(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// Start `op`, waiting out an executable that is momentarily busy.
+///
+/// `ETXTBSY` is what `exec` says when the binary is open for writing somewhere
+/// else: a package manager part-way through replacing `op`, or another thread
+/// of a program that has just written one and not closed it yet. It clears on
+/// its own in microseconds, and the alternative to waiting is a reload that
+/// failed for a reason which has nothing to do with the policy — or, worse, a
+/// batch that "could not run" and sends every reference to the vault on its own.
+fn spawn_op(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const TRIES: usize = 4;
+    const BUSY: std::time::Duration = std::time::Duration::from_millis(5);
+
+    for _ in 1..TRIES {
+        match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(BUSY)
+            }
+            settled => return settled,
+        }
+    }
+    command.spawn()
+}
+
+/// What a reference is told when 1Password refused earlier in the same read.
+///
+/// It is not "this reference is broken" — nothing has been asked about it. The
+/// operator has one thing to fix, named on the line that does carry a reason,
+/// and the rest of the list says why it is a list of one.
+const NOT_ASKED_AGAIN: &str = "not read — 1Password refused this read and was not asked again";
+
+/// Did 1Password decline to answer *at all*, as opposed to answering about a
+/// reference?
+///
+/// The difference is the whole of what SIRI-205 had left. "Authorization prompt
+/// dismissed" is a human closing a dialogue; reading the next reference asks
+/// them again, and reading eight asks them eight times — which is the thing
+/// they were closing dialogues about. A field that is not there, a vault that is
+/// not theirs, an `op` too old to have `inject`: those are answers, the
+/// authorization behind them is already given, and reading the rest one at a
+/// time costs nothing but a moment.
+///
+/// Matched on text because `op` exits 1 for everything; the needles are
+/// deliberately broad, since the cost of calling a reference error a refusal is
+/// one re-run, and the cost of calling a refusal a reference error is the stack
+/// of dialogues this exists to prevent.
+pub fn is_authorization_failure(error: &str) -> bool {
+    const REFUSALS: [&str; 8] = [
+        "authoriz",
+        "error initializing client",
+        "not signed in",
+        "no account",
+        "session expired",
+        "desktop app",
+        "biometric",
+        "unlock",
+    ];
+    let error = error.to_ascii_lowercase();
+    REFUSALS.iter().any(|needle| error.contains(needle))
+}
+
 impl SecretResolver {
     pub fn new(op_bin: impl Into<String>) -> Self {
         SecretResolver {
@@ -268,13 +328,16 @@ impl SecretResolver {
     }
 
     fn read_all(&self, references: &[String], fresh: bool) -> Vec<Result<(), String>> {
-        // Every `op://` reference this call was going to fork a process for,
-        // fetched in one. Whatever came back is in the cache now, so the pass
-        // below answers those from it — including under `fresh`, which is the
-        // whole point: they *were* just read from source.
-        let primed = self.prime_onepassword(references, fresh);
-        let read_one = |reference: &String| {
-            self.read_one(reference, fresh && !primed.contains(reference.as_str()))
+        // 1Password first, and apart from everything else. However many
+        // references this pass needs from the vault, it is one process if it
+        // can be — and it never asks a second time once the answer was no.
+        let vault = self.read_onepassword_pass(references, fresh);
+        let read_one = |reference: &String| match vault.get(reference.as_str()) {
+            Some(answer) => answer.clone(),
+            // Everything the vault pass did not take: `env:`, `file:`,
+            // `iap://`, `literal:`, and the `op://` references it had no reason
+            // to read because this process already holds them.
+            None => self.read_one(reference, fresh),
         };
 
         if references.len() < 2 {
@@ -308,78 +371,146 @@ impl SecretResolver {
         })
     }
 
-    /// Read every `op://` reference this pass needs in a single `op`, and put
-    /// what comes back in the cache. Returns the raw spellings that landed.
+    /// Every `op://` reference this pass needs from the vault, read in as few
+    /// `op` processes as it can be done in — and in none at all once 1Password
+    /// has said no. One answer per reference, keyed by the spelling the policy
+    /// file used.
     ///
-    /// One process, because on a desktop 1Password a process is the unit of
-    /// authorization. Each `op` invocation is a separate client asking the app
-    /// for CLI access, and a proxy fronting six vault-backed services asked six
-    /// times — concurrently, so the grant given to the first could not cover
-    /// the five already waiting. What the operator saw was a stack of identical
-    /// dialogues over the console, for a grant they had given (SIRI-205); what
-    /// this process wanted was one question answered six ways.
+    /// A process is the unit of authorization on a desktop 1Password: each `op`
+    /// is a separate client asking the app for CLI access. A proxy fronting
+    /// eight vault-backed services asked eight times, and asked them at once,
+    /// so the grant given to the first dialogue could not cover the seven
+    /// already stacked behind it. One `op inject` is one dialogue, whatever the
+    /// policy names.
     ///
-    /// Nothing is promised here. A batch that will not run — no `op` on the
-    /// path, a version without `inject`, a reference `op` refuses — returns
-    /// nothing at all and every reference goes the way it always did, one
-    /// `op read` each. That fallback is what keeps the per-reference error an
-    /// operator needs to find the line of the file that is wrong: `op inject`
-    /// fails the whole template and names one cause, and "which of your six
-    /// references is the broken one" is not a question a policy file should
-    /// have to be bisected to answer.
-    fn prime_onepassword(&self, references: &[String], fresh: bool) -> HashSet<String> {
-        let mut wanted: Vec<&str> = Vec::new();
-        {
-            let cache = self.cache.lock();
-            let mut seen = HashSet::new();
-            for raw in references {
-                if !matches!(SecretRef::parse(raw), Ok(SecretRef::OnePassword(_))) {
-                    continue;
+    /// The batch is not promised, and *how* it fails decides what happens next.
+    ///
+    /// * 1Password refused — the prompt was dismissed, the app is not running,
+    ///   nobody is signed in. Nothing was authorized, so reading one at a time
+    ///   would put the same question in front of the same person once per
+    ///   reference. That is the bug, not the fallback: every reference gets the
+    ///   one reason, and no further `op` runs.
+    /// * Anything else — an `op` too old for `inject`, a template it would not
+    ///   take. The authorization is already given, so reading each one costs a
+    ///   moment and nothing else, and it buys back the per-reference error an
+    ///   operator needs: `op inject` fails a template whole and names one
+    ///   cause, and "which of your eight is the broken one" is not a question a
+    ///   policy file should have to be bisected to answer. Sequential, and it
+    ///   stops at the first refusal, for the reason above.
+    fn read_onepassword_pass(
+        &self,
+        references: &[String],
+        fresh: bool,
+    ) -> HashMap<String, Result<(), String>> {
+        let wanted = self.onepassword_wanted(references, fresh);
+        let mut answers = HashMap::new();
+        if wanted.is_empty() {
+            return answers;
+        }
+
+        // One reference is already one process, and `op read` says more about
+        // it than `op inject` would.
+        if wanted.len() > 1 {
+            match self.read_onepassword_together(&wanted) {
+                Ok(values) => {
+                    let mut cache = self.cache.lock();
+                    for (raw, value) in wanted.iter().zip(values) {
+                        // The one answer `op read` calls an error rather than a
+                        // value, kept an error here.
+                        if value.expose().is_empty() {
+                            answers.insert(
+                                (*raw).to_string(),
+                                Err(format!("`{}` resolved to an empty value", display_ref(raw))),
+                            );
+                            continue;
+                        }
+                        cache.insert((*raw).to_string(), value);
+                        answers.insert((*raw).to_string(), Ok(()));
+                    }
+                    return answers;
                 }
-                // Cache-first means this one is not going anywhere near `op`,
-                // so it is not part of the question being asked.
-                if !fresh && cache.contains_key(raw.as_str()) {
-                    continue;
-                }
-                if seen.insert(raw.as_str()) {
-                    wanted.push(raw.as_str());
+                Err(error) => {
+                    let error = render(error);
+                    if is_authorization_failure(&error) {
+                        tracing::warn!(
+                            %error,
+                            references = wanted.len(),
+                            "1Password would not authorize this read; not asking again for it"
+                        );
+                        // The reason once, on the first line, and the rest
+                        // saying why they are not eight more reasons. Eight
+                        // copies of the same sentence is a wall an operator
+                        // has to read all of to learn there is one thing wrong.
+                        for (at, raw) in wanted.iter().enumerate() {
+                            let answer = match at {
+                                0 => error.clone(),
+                                _ => NOT_ASKED_AGAIN.to_string(),
+                            };
+                            answers.insert((*raw).to_string(), Err(answer));
+                        }
+                        return answers;
+                    }
+                    // Loud, because the consequence is visible and the cause is
+                    // not: one process becomes one per reference, and on a
+                    // desktop 1Password that is the difference between one
+                    // dialogue and a column of them. An operator seeing the
+                    // dialogues should be able to find out why from the log.
+                    tracing::warn!(
+                        %error,
+                        references = wanted.len(),
+                        "could not read the 1Password references together; \
+                         falling back to one `op read` each"
+                    );
                 }
             }
         }
-        // One reference is already one process; there is nothing to save, and
-        // `op read` gives the better error.
-        if wanted.len() < 2 {
-            return HashSet::new();
-        }
 
-        let values = match self.read_onepassword_together(&wanted) {
-            Ok(values) => values,
-            Err(error) => {
-                // Not a warning: the fallback below reads every one of these
-                // properly, and reports whatever is actually wrong with the
-                // reference that is wrong.
-                tracing::debug!(
-                    error = %format!("{error:#}"),
-                    references = wanted.len(),
-                    "reading the 1Password references together did not come off; \
-                     falling back to one lookup each"
-                );
-                return HashSet::new();
-            }
-        };
-
-        let mut cache = self.cache.lock();
-        let mut primed = HashSet::new();
-        for (raw, value) in wanted.iter().zip(values) {
-            // An empty field is the one answer `op read` calls an error, and it
-            // says which reference. Leave it out and let the fallback say so.
-            if value.expose().is_empty() {
+        let mut refused: Option<String> = None;
+        for raw in &wanted {
+            if refused.is_some() {
+                answers.insert((*raw).to_string(), Err(NOT_ASKED_AGAIN.to_string()));
                 continue;
             }
-            cache.insert((*raw).to_string(), value);
-            primed.insert((*raw).to_string());
+            match self.read(raw) {
+                Ok(value) => {
+                    self.cache.lock().insert((*raw).to_string(), value);
+                    answers.insert((*raw).to_string(), Ok(()));
+                }
+                Err(error) => {
+                    let error = render(error);
+                    if is_authorization_failure(&error) {
+                        refused = Some(error.clone());
+                    }
+                    answers.insert((*raw).to_string(), Err(error));
+                }
+            }
         }
-        primed
+        answers
+    }
+
+    /// The `op://` references a pass has to go to the vault for: the ones this
+    /// process has never read, or all of them when the caller asked for a
+    /// re-read. Deduplicated — twenty upstreams sharing a vault item are one
+    /// question — and in the order the file named them, which is the order the
+    /// failures come back in.
+    fn onepassword_wanted<'a>(&self, references: &'a [String], fresh: bool) -> Vec<&'a str> {
+        let cache = self.cache.lock();
+        let mut seen = HashSet::new();
+        let mut wanted = Vec::new();
+        for raw in references {
+            if !matches!(SecretRef::parse(raw), Ok(SecretRef::OnePassword(_))) {
+                continue;
+            }
+            // Cache-first means this one is not going near `op`, so it is not
+            // part of the question being asked.
+            if !fresh && cache.contains_key(raw.as_str()) {
+                continue;
+            }
+            if seen.insert(raw.as_str()) {
+                wanted.push(raw.as_str());
+            }
+        }
+        wanted
     }
 
     /// The single `op` invocation: a template naming every reference, answered
@@ -405,19 +536,28 @@ impl SecretResolver {
             .collect::<Vec<_>>()
             .join(&marker);
 
-        let mut child = Command::new(&self.op_bin)
-            .arg("inject")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| format!("running `{} inject`", self.op_bin))?;
-        child
+        let mut child = spawn_op(
+            Command::new(&self.op_bin)
+                .arg("inject")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .with_context(|| format!("running `{} inject`", self.op_bin))?;
+        let mut stdin = child
             .stdin
             .take()
-            .context("`op inject` accepted no template")?
-            .write_all(template.as_bytes())
-            .context("writing the template to `op inject`")?;
+            .context("`op inject` accepted no template")?;
+        // Kept rather than returned. An `op` that objects to something before
+        // it reads the template — not signed in, a flag it does not have —
+        // exits while this write is still going, and the write then fails with
+        // a broken pipe. Reporting *that* loses the only thing worth knowing:
+        // 1Password's own reason, which is on the process's stderr, and which
+        // decides whether the references are read one at a time next or not
+        // asked about again at all. The write is asked about after the process
+        // has had its say.
+        let wrote = stdin.write_all(template.as_bytes());
+        drop(stdin);
         let output = child
             .wait_with_output()
             .context("waiting for `op inject`")?;
@@ -426,6 +566,9 @@ impl SecretResolver {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("`op inject` failed ({}): {}", output.status, stderr.trim());
         }
+        // A process that says it succeeded on a template it did not get is a
+        // different problem, and this is where it surfaces.
+        wrote.context("writing the template to `op inject`")?;
 
         let mut filled =
             String::from_utf8(output.stdout).context("1Password returned a non-UTF-8 secret")?;
@@ -483,15 +626,22 @@ impl SecretResolver {
     }
 
     fn resolve_onepassword(&self, reference: &str) -> Result<Secret> {
-        let output = Command::new(&self.op_bin)
-            .args(["read", "--no-newline", reference])
-            .output()
-            .with_context(|| {
-                format!(
-                    "running `{}` — install the 1Password CLI to use `op://` references",
-                    self.op_bin
-                )
-            })?;
+        let child = spawn_op(
+            Command::new(&self.op_bin)
+                .args(["read", "--no-newline", reference])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .with_context(|| {
+            format!(
+                "running `{}` — install the 1Password CLI to use `op://` references",
+                self.op_bin
+            )
+        })?;
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("waiting for `{} read`", self.op_bin))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -802,6 +952,121 @@ mod tests {
                 .expose(),
             "value-for-op://Private/fine/credential"
         );
+    }
+
+    /// The bug the fallback introduced, reported against a real policy: eight
+    /// vault-backed services, one dismissed dialogue, and then eight more.
+    ///
+    /// `op inject` cannot be authorized without the human who dismissed the
+    /// prompt, so reading the eight references one at a time after it fails is
+    /// putting the identical question in front of the identical person eight
+    /// more times. Dismissing a dialogue is an answer. It is taken as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_dismissed_authorization_prompt_is_not_asked_again_once_per_reference() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        let calls = dir.path().join("op-calls");
+        // What the real `op` says, verbatim from the report.
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$1\" >> {}\n\
+                 echo \"[ERROR] could not read secret: error initializing client: \
+                 authorization prompt dismissed, please try again\" >&2\n\
+                 exit 1\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let references: Vec<String> = (0..8)
+            .map(|n| format!("op://Private/item-{n}/credential"))
+            .collect();
+        let answers = resolver.refresh_all(&references);
+
+        assert_eq!(
+            invocations(&calls),
+            vec!["inject"],
+            "the dialogue the operator dismissed was put back in front of them"
+        );
+        assert_eq!(answers.len(), 8);
+        assert!(answers.iter().all(Result::is_err), "{answers:?}");
+        // One reason, said once. Eight copies of the same sentence is a wall
+        // an operator has to read all of to learn there is one thing wrong.
+        assert!(
+            answers[0]
+                .as_ref()
+                .unwrap_err()
+                .contains("authorization prompt dismissed"),
+            "{:?}",
+            answers[0]
+        );
+        for answer in &answers[1..] {
+            assert_eq!(answer.as_ref().unwrap_err(), NOT_ASKED_AGAIN);
+        }
+    }
+
+    /// The same rule one layer down: if the batch was not the thing that failed,
+    /// the first reference to be refused is the last one that asks.
+    ///
+    /// Reached when `op inject` is unusable for a reason that is not the vault
+    /// — an `op` too old to have it — and the vault then refuses anyway. The
+    /// references after the refusal are not broken and are not described as
+    /// though they were; nothing was asked about them.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_partway_through_stops_the_rest_of_the_reads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        let calls = dir.path().join("op-calls");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$1 $3\" >> {}\n\
+                 [ \"$1\" = read ] || {{ echo 'unknown command \"inject\"' >&2; exit 1; }}\n\
+                 case \"$3\" in\n\
+                 *item-0*) printf 'value-for-%s' \"$3\" ;;\n\
+                 *) echo 'error initializing client: authorization prompt dismissed' >&2; \
+                 exit 1 ;;\n\
+                 esac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let references: Vec<String> = (0..5)
+            .map(|n| format!("op://Private/item-{n}/credential"))
+            .collect();
+        let answers = resolver.refresh_all(&references);
+
+        assert_eq!(
+            invocations(&calls).len(),
+            3,
+            "one `inject`, one read that worked, one that was refused — and then it stopped"
+        );
+        assert!(answers[0].is_ok(), "{:?}", answers[0]);
+        assert!(answers[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("authorization prompt dismissed"));
+        for answer in &answers[2..] {
+            assert_eq!(
+                answer.as_ref().unwrap_err(),
+                NOT_ASKED_AGAIN,
+                "a reference nothing was asked about must not read as a broken one"
+            );
+        }
     }
 
     /// The reload cost that made the console unusable: every `op://` reference
