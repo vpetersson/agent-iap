@@ -9,23 +9,53 @@
 class AgentIap < Formula
   desc "Identity-aware proxy for LLM agents: ACL-gated, audited access to APIs and MCP"
   homepage "https://github.com/vpetersson/agent-iap"
+  version "2026.9.0"
   license "MIT"
 
-  # No `v…` tag has been cut yet, so there is no release asset to pin a
-  # sha256 against and nothing for a stable install to download. Until there
-  # is, the formula builds master:
-  #
-  #   brew install --HEAD agent-iap
-  #
-  # The first release regenerates this file with the binaries in it, and the
-  # plain `brew install` starts working with no change to the tap.
-  head "https://github.com/vpetersson/agent-iap.git", branch: "master"
+  # `brew install --HEAD agent-iap` builds master instead, for a fix that is
+  # merged but not yet tagged.
+  head do
+    url "https://github.com/vpetersson/agent-iap.git", branch: "master"
+    depends_on "rust" => :build
+  end
 
-  depends_on "rust" => :build
+  # Otherwise the release tarballs, not a build: the binaries are the ones the
+  # release tested and checksummed, so nothing is compiled on the way in and
+  # there is no toolchain to install first. Linux is static musl — Homebrew's
+  # own glibc story does not come into it.
+  on_macos do
+    on_arm do
+      url "https://github.com/vpetersson/agent-iap/releases/download/v2026.9.0/agent-iap-2026.9.0-macos-arm64.tar.gz"
+      sha256 "03171323ca633859b36bc0d4e54c0f616ab4ebe5cd7ce05322aeb20232d81870"
+    end
+    on_intel do
+      url "https://github.com/vpetersson/agent-iap/releases/download/v2026.9.0/agent-iap-2026.9.0-macos-x86_64.tar.gz"
+      sha256 "d1f64f214c74170124198a8d96a9576faff4cae945c0c777bb4d79c548d62fb6"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/vpetersson/agent-iap/releases/download/v2026.9.0/agent-iap-2026.9.0-linux-aarch64.tar.gz"
+      sha256 "e3604c1e8e88d4c79204b20e5568449bf892fed09fd6dcf3d63e342df89f4ac5"
+    end
+    on_intel do
+      url "https://github.com/vpetersson/agent-iap/releases/download/v2026.9.0/agent-iap-2026.9.0-linux-x86_64.tar.gz"
+      sha256 "941053cbe245f93e23838898b12b7ba62a871f8fe5b9c5c69f3efa621c829c2b"
+    end
+  end
 
   def install
-    system "cargo", "install", *std_cargo_args
+    if build.head?
+      system "cargo", "install", *std_cargo_args
+    else
+      bin.install "agent-iap"
+      doc.install "README.md"
+    end
 
+    # `brew services` starts nothing until these exist, and creating them at
+    # install time means the service block below is the only thing that has to
+    # agree about where they are.
     (var/"lib/agent-iap").mkpath
     (var/"log").mkpath
   end
