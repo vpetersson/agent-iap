@@ -63,6 +63,7 @@ pub mod service_account;
 pub mod skills;
 pub mod state;
 pub mod stdio;
+pub mod store;
 pub mod term;
 pub mod tls;
 pub mod tokens;

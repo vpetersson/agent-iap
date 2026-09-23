@@ -75,6 +75,18 @@ pub struct ServerConfig {
     /// Binary used to resolve `op://` references.
     #[serde(default = "default_op_bin")]
     pub op_binary: String,
+    /// Where `iap://` references are read from — the credentials agent-iap
+    /// keeps itself.
+    ///
+    /// Absent, `secrets.toml` in the state directory, beside `admin-token` and
+    /// for the same reason: it holds credentials rather than configuration, and
+    /// the config directory is the one people put in a dotfile repository. Named
+    /// separately from `IAP_STATE_DIR` because the audit log wants a disk that
+    /// grows and this wants one that does not leave the machine — a deployment
+    /// putting the store on a mounted secret volume should not have to move the
+    /// log with it.
+    #[serde(default)]
+    pub secret_store: Option<PathBuf>,
     /// TLS for the agent-facing listener. Absent means plain HTTP, so an
     /// existing deployment keeps the behaviour it has.
     #[serde(default)]
@@ -124,6 +136,7 @@ impl Default for ServerConfig {
             upstream_connect_timeout_secs: default_connect_timeout(),
             max_body_bytes: default_max_body(),
             op_binary: default_op_bin(),
+            secret_store: None,
             tls: None,
             admin_tls: None,
             workload_identity: WorkloadIdentityConfig::default(),
@@ -198,6 +211,18 @@ fn default_workload_lifetime() -> u64 {
 }
 
 impl ServerConfig {
+    /// Where this deployment keeps the credentials agent-iap holds itself.
+    ///
+    /// A relative path is anchored to the state directory rather than to
+    /// wherever the operator was standing, which is the same rule `[audit].path`
+    /// follows and exists for the same reason.
+    pub fn secret_store_path(&self) -> PathBuf {
+        match &self.secret_store {
+            Some(path) => crate::paths::in_state_dir(path),
+            None => crate::store::Store::default_path(),
+        }
+    }
+
     /// Apply a `--listen` / `IAP_LISTEN` override to the proxy address.
     ///
     /// A full `HOST:PORT` replaces the address outright. A bare port moves the

@@ -20,6 +20,7 @@ use super::browse::{self, Browser, Pick};
 use super::choose::{Candidate, Chooser};
 use crate::config::AuthConfig;
 use crate::enroll::{AuthInput, AUTH_SCHEMES};
+use crate::secrets::SecretRef;
 
 /// What a field holds.
 pub enum Value {
@@ -180,6 +181,22 @@ impl Field {
         self
     }
 
+    /// Is this field holding a credential somebody typed instead of a
+    /// reference to one?
+    ///
+    /// Only on the fields that take a reference — the same `browses` list
+    /// `AuthConfig::secret_fields` is held against, so a scheme that grows a
+    /// sixth reference gets this with it — and only when what is in it parses
+    /// as no reference at all. A field holding `op://…` is a field that is
+    /// already right, and offering to take a copy of it would be offering to
+    /// duplicate a vault item into a plaintext file.
+    fn keeps(&self) -> bool {
+        let Value::Text(text) = &self.value else {
+            return false;
+        };
+        self.browses && !text.trim().is_empty() && SecretRef::parse(text).is_err()
+    }
+
     /// Which picker `ctrl-o` opens here, or nothing for a field with none
     /// behind it.
     fn opens(&self) -> Option<Opens> {
@@ -212,6 +229,10 @@ pub struct Hits {
     /// the field's own line, once in the key row. Clicking any of them opens
     /// that field's picker.
     pub browse: Vec<Rect>,
+    /// Everywhere the `ctrl-k` offer was drawn, on the same terms as `browse`:
+    /// once on the field's line, once in the key row. Clicking either keeps
+    /// the value that field is holding.
+    pub keep: Vec<Rect>,
     /// The picker, when it is open over the form. Present means it owns the
     /// screen, and the fields underneath are not reachable.
     pub browser: Option<browse::Hits>,
@@ -222,6 +243,14 @@ pub enum Outcome {
     Continue,
     Cancel,
     Submit,
+    /// `ctrl-k` on a field holding a bare credential: hand it to agent-iap's
+    /// own store and put the reference back in the field.
+    ///
+    /// Answered by the console rather than here because it writes a file, and
+    /// this module is the one part of the dialogue that does not — a form that
+    /// could put a credential on disk from inside `handle` would be a form
+    /// whose tests write to the operator's store.
+    Keep,
 }
 
 pub struct Form {
@@ -492,6 +521,15 @@ impl Form {
                 }
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.pick(),
+            // Never typed into the field, whether or not there is anything to
+            // keep: a `ctrl-k` that lands as a literal `k` in the middle of a
+            // credential is a credential that no longer works, discovered
+            // later as a 401.
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.keeping().is_some() {
+                    return Outcome::Keep;
+                }
+            }
             code => self.edit(code),
         }
 
@@ -501,6 +539,39 @@ impl Form {
             self.focus = visible.first().copied().unwrap_or(0);
         }
         Outcome::Continue
+    }
+
+    /// The field `ctrl-k` would act on, and the value it is holding.
+    ///
+    /// `None` unless the cursor is on a reference field with a bare credential
+    /// in it, which is the only place the offer is drawn.
+    pub fn keeping(&self) -> Option<(usize, String)> {
+        let field = self.fields.get(self.focus)?;
+        if !field.keeps() || !self.visible().contains(&self.focus) {
+            return None;
+        }
+        match &field.value {
+            Value::Text(text) => Some((self.focus, text.clone())),
+            _ => None,
+        }
+    }
+
+    /// Write a value into a field by index, as a picker does. What the console
+    /// puts the `iap://` reference back through once the store has the value.
+    pub fn fill(&mut self, index: usize, value: String) {
+        if let Some(Value::Text(text)) = self.fields.get_mut(index).map(|f| &mut f.value) {
+            *text = value;
+        }
+        self.focus(index);
+    }
+
+    /// The name of the thing being enrolled, for a store name derived from it.
+    /// `as` is what a profile form calls it and `name` is what the others do.
+    pub fn subject(&self) -> Option<String> {
+        ["as", "name"]
+            .iter()
+            .map(|key| self.text(key))
+            .find(|value| !value.trim().is_empty())
     }
 
     fn focused_mut(&mut self) -> Option<&mut Value> {
@@ -688,6 +759,7 @@ impl Form {
             popup,
             fields: Vec::new(),
             browse: Vec::new(),
+            keep: Vec::new(),
             browser: None,
         };
         let lines: Vec<Line> = visible
@@ -766,6 +838,23 @@ impl Form {
                     spans.push(Span::raw(opens.what()));
                     hits.browse.extend(fits(line, before, opens.width()));
                 }
+                // The other way out of a credential field, and the opposite
+                // case to the one above: `ctrl-o browse` is for a field with
+                // nothing in it, and this is for a field with the credential
+                // itself in it. They never appear together, because a typed
+                // value is not blank and a blank field is not a credential.
+                //
+                // Drawn here rather than left to the save error because by the
+                // time the error arrives the operator has typed a credential
+                // into a field, been told it is not a reference, and has no way
+                // of knowing from the form that the console will take it. This
+                // is the moment they can still act on.
+                if focused && field.keeps() {
+                    let before = 4 + label_width + shown.chars().count();
+                    spans.push(Span::styled(KEEP_KEY, key_style()));
+                    spans.push(Span::raw(KEEP_WHAT));
+                    hits.keep.extend(fits(line, before, keep_width()));
+                }
                 Line::from(spans)
             })
             .collect();
@@ -773,6 +862,10 @@ impl Form {
         frame.render_widget(Paragraph::new(lines), rows[1]);
 
         let hint: Cow<'_, str> = match self.fields.get(self.focus) {
+            Some(field) if field.keeps() => Cow::Owned(format!(
+                "{}  —  ctrl-k to let agent-iap keep this value and use a reference to it",
+                field.hint
+            )),
             Some(field) => match field.opens() {
                 Some(opens) => Cow::Owned(format!("{}  —  ctrl-o {}", field.hint, opens.route())),
                 None => Cow::Borrowed(field.hint.as_ref()),
@@ -801,7 +894,25 @@ impl Form {
             Span::styled(" esc ", key_style()),
             Span::raw(" cancel"),
         ];
-        if let Some(opens) = self.fields.get(self.focus).and_then(Field::opens) {
+        // One offer, as on the field line above, and for a plainer reason than
+        // taste: this row is four keys wide already and the dialogue is 78
+        // columns whatever the terminal is, so a second one is an offer drawn
+        // off the end of the line — announced, by `fits`, to nobody.
+        //
+        // Which one is not a close call. `ctrl-o browse` is the offer for a
+        // field with nothing in it; a field holding a credential has the one
+        // problem this console can solve from here, and `ctrl-o` on it would
+        // replace what was typed with a path. Emptying the field with `ctrl-u`
+        // brings the picker's offer straight back, exactly as it does on the
+        // field's own line.
+        let focused = self.fields.get(self.focus);
+        if focused.is_some_and(Field::keeps) {
+            let before: usize = keys.iter().map(|span| span.content.chars().count()).sum();
+            keys.push(Span::raw("  "));
+            keys.push(Span::styled(KEEP_KEY, key_style()));
+            keys.push(Span::raw(KEEP_WHAT));
+            hits.keep.extend(fits(rows[3], before + 2, keep_width()));
+        } else if let Some(opens) = focused.and_then(Field::opens) {
             let before: usize = keys.iter().map(|span| span.content.chars().count()).sum();
             keys.push(Span::raw("  "));
             keys.push(Span::styled(PICK_KEY, key_style()));
@@ -826,6 +937,15 @@ impl Form {
 /// The key every picker in this console is reached by. ASCII, so `len` is the
 /// column count.
 const PICK_KEY: &str = " ctrl-o ";
+
+/// The key that hands a typed credential to agent-iap's own store. ASCII, as
+/// `PICK_KEY` is.
+const KEEP_KEY: &str = " ctrl-k ";
+const KEEP_WHAT: &str = " keep";
+
+fn keep_width() -> usize {
+    KEEP_KEY.len() + KEEP_WHAT.len()
+}
 
 /// Which picker a field opens, and how the offer of it is worded.
 ///
@@ -1227,5 +1347,124 @@ mod tests {
         );
         form.fields[1].value = Value::Text("TOKEN".into());
         assert!(form.pairs("env").is_err(), "a pair without `=` is a typo");
+    }
+
+    /// A form opened on `bearer` with the cursor on `secret`, which is where
+    /// every one of these starts.
+    fn on_the_secret() -> Form {
+        let mut form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        while form.text("auth") != "bearer" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        form.handle(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(form.fields[form.focus].key, "secret");
+        form
+    }
+
+    fn type_in(form: &mut Form, text: &str) {
+        for c in text.chars() {
+            form.handle(KeyEvent::from(KeyCode::Char(c)));
+        }
+    }
+
+    /// The offer exists exactly where a credential has been typed where a
+    /// reference goes — which used to be a dead end, and is the one state the
+    /// operator needs a way out of.
+    #[test]
+    fn keeping_is_offered_on_a_typed_credential_and_nowhere_else() {
+        let mut form = on_the_secret();
+        // Nothing typed: the field is blank, and `ctrl-o browse` is the offer.
+        assert!(form.keeping().is_none());
+
+        type_in(&mut form, "ghp_areadonlytoken");
+        assert_eq!(
+            form.keeping().map(|(_, value)| value),
+            Some("ghp_areadonlytoken".to_string())
+        );
+
+        // A reference is already right. Offering to take a copy of a vault item
+        // into a plaintext file is not a favour.
+        form.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut form, "op://Private/GitHub/token");
+        assert!(form.keeping().is_none());
+
+        form.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut form, "env:GITHUB_TOKEN");
+        assert!(form.keeping().is_none());
+    }
+
+    /// `--header x-api-key` is a header name, not a credential. An offer to
+    /// store it would be an offer to put a header name in the credential store
+    /// and a `iap://` reference in the header.
+    #[test]
+    fn a_field_that_takes_no_reference_is_never_offered_the_store() {
+        let mut form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        while form.text("auth") != "header" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        let at = form
+            .fields
+            .iter()
+            .position(|field| field.key == "header")
+            .unwrap();
+        form.focus(at);
+        type_in(&mut form, "x-api-key");
+        assert!(form.keeping().is_none());
+    }
+
+    /// `ctrl-k` is never typed. A `k` landing in the middle of a credential is
+    /// a credential that no longer works, found later as a 401.
+    #[test]
+    fn ctrl_k_is_answered_or_ignored_but_never_typed_into_the_field() {
+        let ctrl_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+
+        let mut form = on_the_secret();
+        type_in(&mut form, "ghp_token");
+        assert!(matches!(form.handle(ctrl_k), Outcome::Keep));
+        assert_eq!(form.text("secret"), "ghp_token", "nothing typed into it");
+
+        // And where there is nothing to keep it is inert — not a `k`, and not
+        // a `Keep` the console would have to answer with an error.
+        let mut form = on_the_secret();
+        type_in(&mut form, "env:TOKEN");
+        assert!(matches!(form.handle(ctrl_k), Outcome::Continue));
+        assert_eq!(form.text("secret"), "env:TOKEN");
+    }
+
+    /// What the console writes back once the store has the value.
+    #[test]
+    fn filling_the_field_puts_the_reference_where_the_credential_was() {
+        let mut form = on_the_secret();
+        type_in(&mut form, "ghp_token");
+        let (at, _) = form.keeping().unwrap();
+        form.fill(at, "iap://gh".into());
+        assert_eq!(form.text("secret"), "iap://gh");
+        // And the offer is gone, because the field now holds a reference.
+        assert!(form.keeping().is_none());
+        assert_eq!(form.auth().secret.as_deref(), Some("iap://gh"));
+    }
+
+    /// The name a derived store name is built from, whichever form asked.
+    #[test]
+    fn the_subject_is_read_from_whichever_key_the_form_names_it_with() {
+        let form = Form::new(
+            Intent::Upstream,
+            "t",
+            "a",
+            vec![Field::prefilled("name", "name", "", "github")],
+        );
+        assert_eq!(form.subject().as_deref(), Some("github"));
+
+        // A profile form calls it `as`.
+        let form = Form::new(
+            Intent::Profile,
+            "t",
+            "a",
+            vec![Field::prefilled("as", "name", "", "github-2")],
+        );
+        assert_eq!(form.subject().as_deref(), Some("github-2"));
+
+        let form = Form::new(Intent::Upstream, "t", "a", auth_fields());
+        assert_eq!(form.subject(), None, "nothing named yet");
     }
 }

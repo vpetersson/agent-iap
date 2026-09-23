@@ -14,5 +14,11 @@ iap-audit.*
 *.jsonl
 admin-token
 
+# The credentials agent-iap keeps itself. Normally under the state directory and
+# nowhere near a checkout, but `[server].secret_store` takes any path and this is
+# the one file here that is the credential rather than a reference to one.
+secrets.toml
+secrets.toml.tmp
+
 # Binaries staged for the container image (see Dockerfile).
 /dist

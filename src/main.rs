@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,9 +16,10 @@ use agent_iap::mcp;
 use agent_iap::paths;
 use agent_iap::profiles;
 use agent_iap::reload::Watcher;
-use agent_iap::secrets::SecretResolver;
+use agent_iap::secrets::{self, SecretResolver};
 use agent_iap::state::AppState;
 use agent_iap::stdio;
+use agent_iap::store;
 use agent_iap::tls::{self, Listener, ServerTls};
 use agent_iap::tui::{self, Console};
 use agent_iap::verify;
@@ -79,7 +80,8 @@ enum Command {
         #[arg(long, default_value = init::DEFAULT_AGENT_ID)]
         agent: String,
         /// Credential reference for the starter upstream: `env:NAME`,
-        /// `file:/path` or `op://vault/item/field`. Starter template only.
+        /// `file:/path`, `op://vault/item/field` or `iap://NAME`. Starter
+        /// template only.
         #[arg(long, value_name = "REF")]
         secret: Option<String>,
         /// `minimal` is the proxy and nothing else; `starter` adds one agent
@@ -207,6 +209,47 @@ enum Command {
     /// Inspect the audit log.
     #[command(subcommand)]
     Audit(AuditCommand),
+    /// Credentials agent-iap keeps itself, for a value with no vault behind it.
+    #[command(subcommand)]
+    Secret(SecretCommand),
+}
+
+/// `iap://<name>` — the scheme for a credential that has nowhere else to live.
+///
+/// `env:`, `file:` and `op://` all point at something that already holds the
+/// credential. A read-only token on a personal account often has no such place,
+/// and standing one up costs more than the token is worth — so agent-iap holds
+/// it, under the state directory, and the policy file keeps a pointer like
+/// every other entry.
+#[derive(clap::Subcommand)]
+enum SecretCommand {
+    /// Store a credential under a name, and print the reference for it.
+    ///
+    /// The value is read from stdin, or typed at a prompt that does not echo.
+    /// There is deliberately no flag carrying it: an argument is visible to
+    /// every process on the machine through `ps`, and stays in the shell
+    /// history afterwards.
+    Set {
+        /// Name to store it under. The reference is then `iap://<name>`.
+        name: String,
+        #[command(flatten)]
+        config: ConfigArg,
+    },
+    /// Names this proxy is holding, and what references them. Never the values.
+    List {
+        #[command(flatten)]
+        config: ConfigArg,
+    },
+    /// Forget a stored credential.
+    Rm {
+        /// Name to forget.
+        name: String,
+        /// Remove it even though the policy file still points at it.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        config: ConfigArg,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -518,7 +561,8 @@ enum ProfileCommand {
         /// is how one proxy fronts two accounts of the same service.
         #[arg(long = "as", value_name = "NAME")]
         name: Option<String>,
-        /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
+        /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`,
+        /// or `iap://NAME` for one `agent-iap secret set` keeps.
         #[arg(long, value_name = "REF")]
         secret: Option<String>,
         /// Which bundle of scopes the credential is minted with, and which
@@ -556,7 +600,8 @@ struct AuthFlags {
     /// Credential scheme to inject on the way out.
     #[arg(long, value_enum, default_value_t = AuthArg::None)]
     auth: AuthArg,
-    /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
+    /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`,
+    /// or `iap://NAME` for one `agent-iap secret set` keeps.
     #[arg(long, value_name = "REF")]
     secret: Option<String>,
     /// Header name for `--auth header`, e.g. `x-api-key`.
@@ -1109,6 +1154,13 @@ fn main() -> Result<()> {
             println!("{}", identity::token_hash(&token));
             Ok(())
         }
+        Command::Secret(SecretCommand::Set { name, config }) => set_secret(&name, &config.config),
+        Command::Secret(SecretCommand::List { config }) => list_secrets(&config.config),
+        Command::Secret(SecretCommand::Rm {
+            name,
+            force,
+            config,
+        }) => remove_secret(&name, force, &config.config),
         Command::Audit(AuditCommand::Verify { path, config }) => {
             verify_audit(&audit_log_path(path, &config.config, true)?)
         }
@@ -1131,6 +1183,262 @@ fn main() -> Result<()> {
             },
         ),
     }
+}
+
+/// Store a credential under a name and print the reference that reaches it.
+///
+/// The value never arrives as an argument. `ps` shows one to every user on the
+/// machine, and the shell writes it to a history file that is not the store and
+/// is not `0600` — so a credential passed as a flag has leaked before this
+/// process starts, and adding the flag would be adding the leak.
+fn set_secret(name: &str, config_path: &Path) -> Result<()> {
+    store::Store::check_name(name)?;
+    let store = store_for(config_path);
+    let value = read_secret_value(name)?;
+
+    let replaced = store.set(name, &value)?;
+    println!(
+        "{} `{name}`",
+        match replaced {
+            true => "replaced",
+            false => "stored",
+        }
+    );
+    println!("\n  iap://{name}\n");
+    println!("Use it wherever a credential reference goes:");
+    println!("  agent-iap upstream add <name> --base-url … --auth bearer --secret iap://{name}");
+    // Said here rather than only in the README, because this is the command
+    // that makes the trade and the operator is standing in front of it. The
+    // store is a place to keep a credential, not a way to protect one.
+    println!(
+        "\nStored in plaintext at `{}`, readable by this user. That is the trade against\n\
+         `op://`: fine for a read-only token, not for a credential that can spend money.",
+        store.path().display()
+    );
+    if store.exposed() {
+        eprintln!(
+            "\nwarning  `{}` is readable by more than its owner — `chmod 600` it",
+            store.path().display()
+        );
+    }
+    // A running proxy resolved this reference at startup and cached it. Saying
+    // so here is cheaper than the alternative, which is an operator who rotated
+    // a credential, saw `stored`, and spent the afternoon on the 401s that
+    // followed.
+    eprintln!(
+        "\nA running proxy picks this up on its next reload: `SIGHUP`, or `r` in the console."
+    );
+    Ok(())
+}
+
+/// Read the credential itself: piped in, or typed at a prompt that does not echo.
+fn read_secret_value(name: &str) -> Result<zeroize::Zeroizing<String>> {
+    if !std::io::stdin().is_terminal() {
+        let mut buffer = zeroize::Zeroizing::new(String::new());
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("reading the credential from stdin")?;
+        // The same trailing-newline rule `file:` references follow, and for the
+        // same reason: `echo token | …` is how a value gets piped, and a
+        // credential with a newline on the end is a 401 nobody can see.
+        let trimmed = buffer.trim_end_matches(['\n', '\r']).to_string();
+        if trimmed.is_empty() {
+            bail!("nothing arrived on stdin — `agent-iap secret set {name}` needs the credential");
+        }
+        return Ok(zeroize::Zeroizing::new(trimmed));
+    }
+    prompt_for_secret(name)
+}
+
+/// Type a credential at a terminal without it appearing on the terminal.
+///
+/// Raw mode rather than a library: `crossterm` is already here for the console
+/// and already owns this terminal's modes, and one more dependency to turn
+/// echo off is one more dependency in a process that holds credentials.
+fn prompt_for_secret(name: &str) -> Result<zeroize::Zeroizing<String>> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    // The prompt goes to stderr: stdout is this command's output, and a
+    // redirect of it should not swallow the line telling somebody to type.
+    eprint!("credential for `{name}` (not echoed): ");
+    std::io::stderr().flush().ok();
+
+    enable_raw_mode().context("putting the terminal into raw mode to read a credential")?;
+    let mut typed = zeroize::Zeroizing::new(String::new());
+    let outcome = loop {
+        let pressed = match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => key,
+            Ok(_) => continue,
+            Err(error) => break Err(anyhow::Error::from(error).context("reading the credential")),
+        };
+        match (pressed.code, pressed.modifiers) {
+            (KeyCode::Enter, _) => break Ok(()),
+            (KeyCode::Backspace, _) => {
+                typed.pop();
+            }
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                break Err(anyhow::anyhow!("cancelled — nothing was stored"))
+            }
+            (KeyCode::Char(c), modifiers)
+                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+            {
+                typed.push(c);
+            }
+            _ => {}
+        }
+    };
+    // Raw mode off before anything else, including before the error is
+    // returned: leaving a terminal in raw mode is leaving the operator without
+    // a shell.
+    disable_raw_mode().context("restoring the terminal")?;
+    eprintln!();
+    outcome?;
+
+    if typed.is_empty() {
+        bail!("nothing was typed — `agent-iap secret set {name}` needs the credential");
+    }
+    Ok(typed)
+}
+
+/// What is in the store, and what in the policy file points at it.
+///
+/// Both halves, because a name with nothing pointing at it is either a
+/// credential enrolled somewhere this list cannot see or one that was left
+/// behind, and a reference with nothing behind it is a proxy that will not
+/// start. Neither is visible from the other list alone.
+fn list_secrets(config_path: &Path) -> Result<()> {
+    let store = store_for(config_path);
+    let stored = store.list()?;
+    let used = managed_references(config_path);
+
+    if stored.is_empty() {
+        println!("No credentials stored.\n");
+        println!(
+            "  agent-iap secret set <name>    stores one, for a token with no vault behind it"
+        );
+    } else {
+        println!("{:<28} {:<22} USED BY", "NAME", "SET");
+        for entry in &stored {
+            let by = used.get(&entry.name).cloned().unwrap_or_default();
+            println!(
+                "{:<28} {:<22} {}",
+                entry.name,
+                entry.updated.as_deref().unwrap_or("-"),
+                match by.is_empty() {
+                    // Not an error: a name can be stored before the upstream
+                    // that will use it exists, which is the order the console
+                    // pushes an operator into.
+                    true => "-".to_string(),
+                    false => by.join(", "),
+                }
+            );
+        }
+        println!("\nStored in plaintext at `{}`.", store.path().display());
+        if store.exposed() {
+            eprintln!(
+                "warning  `{}` is readable by more than its owner — `chmod 600` it",
+                store.path().display()
+            );
+        }
+    }
+
+    // A reference the store cannot answer is a proxy that refuses to start, and
+    // this is the one list where that is obvious — `check` reports it as a
+    // resolution failure among all the others.
+    let names: std::collections::HashSet<&str> =
+        stored.iter().map(|entry| entry.name.as_str()).collect();
+    let dangling: Vec<&String> = used
+        .keys()
+        .filter(|name| !names.contains(name.as_str()))
+        .collect();
+    if !dangling.is_empty() {
+        println!();
+        for name in &dangling {
+            println!(
+                "MISSING  `{}` names `iap://{name}`, which is not stored — `agent-iap secret set {name}`",
+                config_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Forget a name, refusing to strand a reference that still points at it.
+///
+/// The refusal is the point. Removing a credential the policy file still names
+/// leaves a file that parses, a daemon that will not start, and an error at
+/// startup rather than at the command that caused it.
+fn remove_secret(name: &str, force: bool, config_path: &Path) -> Result<()> {
+    store::Store::check_name(name)?;
+    let used = managed_references(config_path);
+    if let Some(by) = used.get(name) {
+        if !by.is_empty() && !force {
+            bail!(
+                "`iap://{name}` is still the credential for {} — repoint {} first, \
+                 or `--force` to remove it anyway and leave the proxy unable to start",
+                by.join(", "),
+                match by.len() {
+                    1 => "it",
+                    _ => "them",
+                }
+            );
+        }
+    }
+    match store_for(config_path).remove(name)? {
+        true => println!("removed `{name}`"),
+        false => println!("no credential named `{name}` was stored"),
+    }
+    Ok(())
+}
+
+/// The store this policy file points at.
+///
+/// `[server].secret_store` moves it, so every command that touches the store has
+/// to read the same answer the daemon will: a `secret set` that wrote somewhere
+/// the proxy does not read is a credential that is silently not there, found as
+/// a failed resolution at the next restart.
+///
+/// A policy file that does not parse falls back to the default rather than
+/// refusing. The operator is holding a credential and an unrelated syntax error
+/// three sections down is not a reason to make them fix the file first — and the
+/// default is where an unconfigured deployment keeps it anyway.
+fn store_for(config_path: &Path) -> store::Store {
+    match Config::load(config_path) {
+        Ok(config) => store::Store::at(config.server.secret_store_path()),
+        Err(_) => store::Store::at(store::Store::default_path()),
+    }
+}
+
+/// Which `iap://` names the policy file uses, and what uses each of them.
+///
+/// Read best-effort: a policy file that does not parse is a real problem, but
+/// it is not this command's problem, and refusing to list the store because of
+/// it would hide the credentials from the operator trying to fix the file.
+fn managed_references(config_path: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut used: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let Ok(config) = Config::load(config_path) else {
+        return used;
+    };
+    let mut note = |reference: &str, label: String| {
+        if let Ok(secrets::SecretRef::Managed(name)) = secrets::SecretRef::parse(reference) {
+            used.entry(name).or_default().push(label);
+        }
+    };
+    for upstream in &config.upstreams {
+        for reference in upstream.auth.secret_refs() {
+            note(reference, format!("upstream `{}`", upstream.name));
+        }
+    }
+    for server in &config.mcp_servers {
+        for reference in server.auth.secret_refs() {
+            note(reference, format!("mcp `{}`", server.name));
+        }
+        for (variable, reference) in &server.env {
+            note(reference, format!("mcp `{}` env {variable}", server.name));
+        }
+    }
+    used
 }
 
 fn tokio_runtime() -> Result<tokio::runtime::Runtime> {
@@ -1590,7 +1898,8 @@ fn check(path: &Path) -> Result<()> {
         }
     }
 
-    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone());
+    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone())
+        .with_store(config.server.secret_store_path());
     let references = config.secret_refs();
     if references.is_empty() {
         println!("secrets     none referenced");
@@ -1776,7 +2085,10 @@ fn print_report(report: &verify::Report) {
 }
 
 fn resolver_for(config: &Config) -> Arc<SecretResolver> {
-    Arc::new(SecretResolver::new(config.server.op_binary.clone()))
+    Arc::new(
+        SecretResolver::new(config.server.op_binary.clone())
+            .with_store(config.server.secret_store_path()),
+    )
 }
 
 /// Print a freshly minted token, and put it on the clipboard on the way past.

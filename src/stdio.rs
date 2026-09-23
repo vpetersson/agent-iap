@@ -22,7 +22,8 @@ pub struct StdioOptions {
 }
 
 pub async fn run(config: crate::config::Config, options: StdioOptions) -> Result<()> {
-    let resolver = crate::secrets::SecretResolver::new(config.server.op_binary.clone());
+    let resolver = crate::secrets::SecretResolver::new(config.server.op_binary.clone())
+        .with_store(config.server.secret_store_path());
     // The data plane may serve a certificate no public root signs, which is the
     // normal case for a loopback listener. This process reads the same policy
     // file as the daemon, so it can trust exactly that certificate rather than

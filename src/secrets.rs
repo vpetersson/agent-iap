@@ -49,6 +49,9 @@ pub enum SecretRef {
     File(PathBuf),
     /// `op://Private/Anthropic/credential` — resolved with the 1Password CLI.
     OnePassword(String),
+    /// `iap://github-readonly` — a credential agent-iap keeps itself, in its
+    /// own store rather than in the policy file. See `store`.
+    Managed(String),
     /// `literal:sk-...` — supported for tests and demos, warned about on load.
     Literal(String),
 }
@@ -76,6 +79,14 @@ impl SecretRef {
             Ok(SecretRef::File(PathBuf::from(rest)))
         } else if reference.starts_with("op://") {
             Ok(SecretRef::OnePassword(reference.to_string()))
+        } else if let Some(rest) = reference.strip_prefix("iap://") {
+            // A name, not a credential — so the same trimming the other
+            // pointers get, and the same validation `secret set` applied when
+            // it wrote the name down. A typo here is caught where it is typed
+            // rather than at the next `op`-less resolution.
+            crate::store::Store::check_name(rest)
+                .context("`iap://` names a credential stored by `agent-iap secret set`")?;
+            Ok(SecretRef::Managed(rest.to_string()))
         } else if let Some(rest) = raw.trim_start().strip_prefix("literal:") {
             // The one scheme whose payload *is* the credential, so only the
             // space in front of it comes off: a trailing one may be part of the
@@ -83,15 +94,29 @@ impl SecretRef {
             // to do.
             Ok(SecretRef::Literal(rest.to_string()))
         } else {
+            // `literal:` is deliberately not offered here. It is the one
+            // spelling that would put the credential in the policy file, so
+            // every enrolment surface refuses it — and this message used to
+            // suggest it, which meant a pasted value was answered by a scheme
+            // that was then refused for a different reason, with no way out
+            // between them (SIRI-215). `iap://` is the way out: the value is
+            // kept by agent-iap and the file still holds a pointer.
             bail!(
-                "unrecognised secret reference `{}` — expected `env:NAME`, `file:/path`, \
-                 `op://vault/item/field` or `literal:VALUE`",
+                "unrecognised secret reference `{}` — a reference points at the credential \
+                 rather than being it. Expected `env:NAME`, `file:/path`, \
+                 `op://vault/item/field`, or `iap://NAME` for a value agent-iap keeps itself \
+                 (`agent-iap secret set NAME`)",
                 redact_for_error(reference)
             )
         }
     }
 
     /// True for reference kinds that put the plaintext in the config file itself.
+    ///
+    /// `iap://` is not one of them, and that is the whole reason it exists: the
+    /// credential is in agent-iap's own store under the state directory, and
+    /// the policy file holds the name of it. A file full of `iap://` references
+    /// is as safe to commit as one full of `op://` ones.
     pub fn is_inline(&self) -> bool {
         matches!(self, SecretRef::Literal(_))
     }
@@ -125,6 +150,10 @@ fn redact_for_error(raw: &str) -> String {
 pub struct SecretResolver {
     cache: Mutex<HashMap<String, Secret>>,
     op_bin: String,
+    /// Where `iap://` references are read from. Defaults to the store this
+    /// machine uses, so every existing caller gets one without being changed —
+    /// the path is only named by a test, which must not read the operator's.
+    store: crate::store::Store,
 }
 
 /// How many secret references are read at the same time.
@@ -145,7 +174,20 @@ impl SecretResolver {
         SecretResolver {
             cache: Mutex::new(HashMap::new()),
             op_bin: op_bin.into(),
+            store: crate::store::Store::at(crate::store::Store::default_path()),
         }
+    }
+
+    /// Read `iap://` references from a store somewhere else. For tests, and for
+    /// anything that has already decided where the state directory is.
+    pub fn with_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.store = crate::store::Store::at(path);
+        self
+    }
+
+    /// The store behind this resolver's `iap://` references.
+    pub fn store(&self) -> &crate::store::Store {
+        &self.store
     }
 
     /// Seed the cache directly. Used by tests and by `--standalone` bootstrapping.
@@ -435,6 +477,7 @@ impl SecretResolver {
                 Secret::new(value.trim_end_matches(['\n', '\r']).to_string())
             }
             SecretRef::OnePassword(reference) => self.resolve_onepassword(&reference)?,
+            SecretRef::Managed(name) => self.store.get(&name)?,
             SecretRef::Literal(value) => Secret::new(value),
         })
     }
@@ -835,6 +878,55 @@ mod tests {
     }
 
     #[test]
+    fn a_managed_reference_names_a_credential_and_is_not_one() {
+        assert_eq!(
+            SecretRef::parse("iap://github-readonly").unwrap(),
+            SecretRef::Managed("github-readonly".into())
+        );
+        // It is a pointer, so it trims like one and prints like one.
+        assert_eq!(
+            SecretRef::parse(" iap://github-readonly\n").unwrap(),
+            SecretRef::Managed("github-readonly".into())
+        );
+        assert_eq!(
+            display_ref(" iap://github-readonly "),
+            "iap://github-readonly"
+        );
+
+        // And the value it points at is not in the policy file, which is the
+        // whole reason it is allowed where `literal:` is refused.
+        assert!(!SecretRef::parse("iap://github-readonly")
+            .unwrap()
+            .is_inline());
+        assert!(SecretRef::parse("literal:hunter2").unwrap().is_inline());
+    }
+
+    /// A name that cannot be stored cannot be referenced either — caught here,
+    /// where it is typed, rather than as a resolution failure at startup.
+    #[test]
+    fn a_managed_reference_with_an_unstorable_name_is_refused_at_the_reference() {
+        for raw in ["iap://", "iap://has spaces", "iap://has/slashes"] {
+            assert!(SecretRef::parse(raw).is_err(), "`{raw}` parsed");
+        }
+    }
+
+    /// The refusal that had no way out: the message used to offer `literal:`,
+    /// which every enrolment surface then refused for a different reason. What
+    /// it offers has to be something a credential can actually be enrolled as.
+    #[test]
+    fn the_refusal_offers_a_spelling_that_is_not_refused_again() {
+        let error = SecretRef::parse("ghp_pasted_token")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("iap://NAME"), "{error}");
+        assert!(error.contains("agent-iap secret set"), "{error}");
+        assert!(
+            !error.contains("literal:"),
+            "offering `literal:` sends the operator to the next refusal: {error}"
+        );
+    }
+
+    #[test]
     fn rejects_bare_values_so_a_pasted_key_is_never_silently_accepted() {
         let err = SecretRef::parse("sk-ant-secret").unwrap_err().to_string();
         assert!(err.contains("unrecognised secret reference"));
@@ -894,6 +986,42 @@ mod tests {
                 .expose(),
             "from-env"
         );
+    }
+
+    /// The store behind `iap://`, through the resolver the proxy uses — and
+    /// through `refresh`, which is what a reload calls, so `secret set` against
+    /// a running proxy takes effect on the next reload rather than on a restart.
+    #[test]
+    fn a_managed_reference_resolves_from_the_store_and_refreshes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.toml");
+        let store = crate::store::Store::at(&path);
+        store.set("readonly", "ghp_v1").unwrap();
+
+        let resolver = SecretResolver::new("op-not-installed").with_store(&path);
+        assert_eq!(
+            resolver.resolve("iap://readonly").unwrap().expose(),
+            "ghp_v1"
+        );
+
+        // Rotated behind an unchanged reference, exactly as `file:` and `op://`
+        // can be.
+        store.set("readonly", "ghp_v2").unwrap();
+        assert_eq!(
+            resolver.resolve("iap://readonly").unwrap().expose(),
+            "ghp_v1",
+            "resolve keeps serving the cached value"
+        );
+        assert_eq!(
+            resolver.refresh("iap://readonly").unwrap().expose(),
+            "ghp_v2"
+        );
+
+        // A name nobody stored fails saying how to store it, and never by
+        // blaming 1Password — `op` was never going to be asked.
+        let error = resolver.resolve("iap://absent").unwrap_err().to_string();
+        assert!(error.contains("agent-iap secret"), "{error}");
+        assert!(!error.contains("1Password"), "{error}");
     }
 
     #[test]
