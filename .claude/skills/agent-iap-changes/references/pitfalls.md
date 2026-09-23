@@ -5,6 +5,15 @@ fix. Check the relevant ones before claiming a change is done.
 
 ## Policy and the ACL
 
+- **A grant is about a service, so `allow` may not be written over a `target`
+  pattern.** `target = "*"` (or `google-*`) on an `allow` rule covers whatever
+  is enrolled next: the operator adds an upstream, the first call goes out with
+  the credential attached, and the console that exists to ask about that call
+  shows nothing. `enroll::add_rule`/`insert_rule` refuse one unless the caller
+  says `any_target`, `verify::standing_grants` names the ones already in the
+  file for `check` and for every enrolment, and no row of the approval dialogue
+  writes a target it was not asked about (SIRI-186). `ask` and `deny` over a
+  pattern are fine — neither widens as the file grows.
 - **First match wins, so rule order is the policy.** Anything that appends a
   rule appends it *last*; anything that prints rules prints them in file order.
   A wide rule written in front of `deny` is how a default-deny proxy became

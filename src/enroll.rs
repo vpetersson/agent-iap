@@ -883,11 +883,48 @@ pub struct RuleSpec<'a> {
     pub action: &'a str,
     /// When the rule stops applying. `None` is the grant with no end.
     pub expires: Option<DateTime<Utc>>,
+    /// A pattern in `target` was asked for, rather than arrived at by leaving
+    /// a flag alone.
+    ///
+    /// `agent add` learned this about `targets` (#59): "I did not say" and "I
+    /// meant everything" cannot be the same value, because the difference is
+    /// every service enrolled from now on. `target = "*"` on an `allow` rule
+    /// is the same grant one door over, and `add_rule` will not write one
+    /// unless this says it was meant.
+    pub any_target: bool,
+}
+
+/// Refuse an `allow` rule about services that are not in the file yet.
+///
+/// A grant is about a service. When its `target` is a pattern the grant is
+/// about every service the pattern will ever match, so the next
+/// `agent-iap upstream add` lands inside a decision taken before it existed —
+/// the proxy fronts it, an agent calls it, the real credential goes out, and
+/// the console that exists to ask about exactly that shows nothing. This is
+/// the reported bug (SIRI-186), and the file had three ways to get there: the
+/// console's widest approval row, a bare `acl add --action allow`, and a hand
+/// edit.
+///
+/// `ask` and `deny` are untouched. Neither widens: `deny` on a pattern is how
+/// a whole class of service is kept out, and `ask` on one is this proxy's own
+/// default doing its job.
+fn check_target_breadth(spec: &RuleSpec<'_>) -> Result<()> {
+    if spec.action != "allow" || spec.any_target || !crate::acl::is_pattern(spec.target) {
+        return Ok(());
+    }
+    bail!(
+        "`target = \"{}\"` is a pattern, so this rule would allow every service it matches — \
+         including ones enrolled later, which nobody would be asked about. Say which:\n  \
+         --target <name>   the service this grant is about\n  --any-target      all of them, \
+         including ones added later",
+        spec.target
+    )
 }
 
 /// Add `[[acl]]`. Appended last, because first match wins and an earlier rule
 /// would silently take precedence over everything already in the file.
 pub fn add_rule(path: &Path, spec: &RuleSpec<'_>) -> Result<usize> {
+    check_target_breadth(spec)?;
     let mut document = read(path)?;
     append(&mut document, "acl", rule_entry(spec));
     let landed = document_config(&document)?.acl.len().saturating_sub(1);
@@ -904,6 +941,7 @@ pub fn add_rule(path: &Path, spec: &RuleSpec<'_>) -> Result<usize> {
 /// the next call. An `index` past the end appends, which is what a decision
 /// taken by the *default* action means.
 pub fn insert_rule(path: &Path, index: usize, spec: &RuleSpec<'_>) -> Result<usize> {
+    check_target_breadth(spec)?;
     let mut document = read(path)?;
     let entry = rule_entry(spec);
 
@@ -1008,6 +1046,7 @@ fn rule<'a>(
         paths,
         action,
         expires: None,
+        any_target: false,
     }
 }
 
@@ -2385,6 +2424,116 @@ mod tests {
         assert!(error.contains("username"), "{error}");
     }
 
+    /// The write side of SIRI-186: a grant about services that do not exist.
+    ///
+    /// `target = "*"` on an `allow` rule is a decision about every service the
+    /// proxy will ever front, and the next `upstream add` lands inside it
+    /// without anybody being asked. Three surfaces could write one — a bare
+    /// `acl add --action allow`, the console's rule form, and the widest row
+    /// of its approval dialogue — so the refusal lives here, where all three
+    /// arrive.
+    #[test]
+    fn an_allow_rule_may_not_be_written_about_services_that_are_not_in_the_file() {
+        let (_dir, path) = empty_policy();
+
+        for target in ["*", "gith*", "{github,gitlab}"] {
+            let error = add_rule(
+                &path,
+                &rule(
+                    None,
+                    "*",
+                    "*",
+                    target,
+                    &["*".into()],
+                    &["**".into()],
+                    "allow",
+                ),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(target), "names the pattern: {error}");
+            assert!(
+                error.contains("--any-target"),
+                "and the way to mean it: {error}"
+            );
+        }
+        assert!(load(&path).acl.is_empty(), "and wrote nothing");
+    }
+
+    /// Available, and asked for by name — the shape `agent add` settled on.
+    #[test]
+    fn the_blanket_grant_is_written_when_it_is_asked_for() {
+        let (_dir, path) = empty_policy();
+
+        add_rule(
+            &path,
+            &RuleSpec {
+                any_target: true,
+                ..rule(None, "*", "*", "*", &["*".into()], &["**".into()], "allow")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(load(&path).acl[0].target, "*");
+    }
+
+    /// The refusal is about widening, not about patterns. `deny` on one keeps
+    /// a whole class of service out, and `ask` on one is this proxy working.
+    #[test]
+    fn a_pattern_that_does_not_grant_is_written_without_being_asked_twice() {
+        let (_dir, path) = empty_policy();
+
+        for action in ["ask", "deny"] {
+            add_rule(
+                &path,
+                &rule(None, "*", "*", "*", &["*".into()], &["**".into()], action),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(load(&path).acl.len(), 2);
+    }
+
+    /// The console's "from now on" goes through `insert_rule`, so the same
+    /// refusal has to be in front of that door too.
+    #[test]
+    fn inserting_a_blanket_grant_is_refused_the_same_way() {
+        let (_dir, path) = empty_policy();
+        add_rule(
+            &path,
+            &rule(
+                None,
+                "*",
+                "*",
+                "github",
+                &["*".into()],
+                &["**".into()],
+                "ask",
+            ),
+        )
+        .unwrap();
+
+        let error = insert_rule(
+            &path,
+            0,
+            &rule(
+                None,
+                "claude",
+                "*",
+                "*",
+                &["*".into()],
+                &["**".into()],
+                "allow",
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--any-target"), "{error}");
+        assert_eq!(load(&path).acl.len(), 1, "and the file is unchanged");
+    }
+
     #[test]
     fn a_rule_can_be_put_in_front_of_the_one_it_overrides() {
         // The approval console's "from now on": an `ask` rule already matches,
@@ -2441,6 +2590,7 @@ mod tests {
                 paths: &["/repos/**".into()],
                 action: "allow",
                 expires: Some(expires),
+                any_target: false,
             },
         )
         .unwrap();

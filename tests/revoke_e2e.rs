@@ -74,6 +74,7 @@ fn policy(dir: &Path, upstream: SocketAddr) -> (PathBuf, String) {
             paths: &["/v1/models".into()],
             action: "allow",
             expires: None,
+            any_target: false,
         },
     )
     .unwrap();
