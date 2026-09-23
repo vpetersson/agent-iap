@@ -1897,6 +1897,11 @@ impl App {
             paths: &rule.paths,
             action,
             expires: ttl.map(|ttl| chrono::Utc::now() + ttl),
+            // Every row of the dialogue names the target the request was for.
+            // The one that did not — "any request from <agent>", which wrote
+            // `target = "*"` — is gone, because an answer about one call is
+            // not an answer about a service nobody has enrolled yet.
+            any_target: false,
         };
         let path = self.policy.path.as_path();
         match before {
@@ -2936,6 +2941,16 @@ fn rule_form(inventory: &Inventory) -> Form {
             ),
             Field::prefilled("target", "target", "upstream or MCP server name, or *", "*")
                 .offering("a target", enrolled_targets(inventory)),
+            // The way out of the refusal `add_rule` makes, rather than a
+            // dead end the operator has to leave the console to get past.
+            // Off: the field above is prefilled `*`, so a walk-through of
+            // this form's defaults must not be able to write a grant over
+            // services nobody has enrolled yet.
+            Field::flag(
+                "any-target",
+                "any target",
+                "with `allow` and a pattern above: mean it — every service it matches, including ones enrolled later",
+            ),
             Field::prefilled(
                 "methods",
                 "methods",
@@ -3615,8 +3630,9 @@ action = "deny"
         let mut app = app_for_test(dir.path());
         let view = waiting();
 
-        // The second row: anything on `github`.
-        let reach = approve::reaches(&view)[1].clone();
+        // The widest row there is: anything on `github`. It names the service,
+        // which every row does now — the one that did not is gone.
+        let reach = approve::reaches(&view)[0].clone();
         app.answer(&view, Verdict::Allow, approve::Duration::UntilQuit, reach);
 
         let other = AccessRequest::http("claude-code", "github", "DELETE", "/repos/acme/api");
@@ -4725,6 +4741,7 @@ base_url = "https://api.github.com"
                 paths: &["/repos/**".into()],
                 action: "allow",
                 expires: None,
+                any_target: false,
             },
         )
         .unwrap();
@@ -5377,6 +5394,56 @@ base_url = "https://api.github.com"
         let error = form.error.as_deref().expect("with the reason on it");
         assert!(error.contains("--any-target"), "{error}");
     }
+    /// The rules pane's own door into the same grant. `target` is prefilled
+    /// `*`, so a form walked through on its defaults with `allow` picked is
+    /// the console typing the rule SIRI-186 was reported about.
+    #[tokio::test]
+    async fn the_rule_form_will_not_grant_every_target_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+
+        let mut form = rule_form(&app.policy.inventory);
+        // `target` is already prefilled `*`; this is the one field the
+        // operator changes, and it is the whole of what makes the rule a
+        // standing grant.
+        pick(&mut form, "action", "allow");
+
+        let error = match actions::submit(&app.policy, &form) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a grant over every service is not a default"),
+        };
+        assert!(error.contains("--any-target"), "{error}");
+
+        // And with the switch beside it turned on, it is written — the
+        // blanket grant is available, it is just said out loud.
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "any-target")
+            .expect("the switch is on the form")
+            .value = form::Value::Flag(true);
+        assert!(
+            actions::submit(&app.policy, &form).is_ok(),
+            "the blanket grant is available, asked for by name"
+        );
+    }
+
+    /// Put a `Choice` field on the named option, by name rather than by how
+    /// many times ← would have to be pressed.
+    fn pick(form: &mut form::Form, key: &str, option: &str) {
+        let field = form
+            .fields
+            .iter_mut()
+            .find(|field| field.key == key)
+            .unwrap_or_else(|| panic!("no `{key}` field"));
+        let form::Value::Choice { options, selected } = &mut field.value else {
+            panic!("`{key}` is not a choice");
+        };
+        *selected = options
+            .iter()
+            .position(|candidate| candidate == option)
+            .unwrap_or_else(|| panic!("`{key}` has no option `{option}`"));
+    }
+
     /// `R` on the rules pane. The confirm first — this is the one key in the
     /// console that can delete a policy — then the file, then the running
     /// proxy, which is the part a file-only test would miss.

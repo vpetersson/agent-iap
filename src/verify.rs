@@ -964,6 +964,24 @@ fn reachability(
         })
         .collect();
 
+    // A grant that names this service, and a grant that merely swept it up,
+    // are not the same finding. The second reads as a configured service on
+    // every surface that counts rules — which is how a pattern written before
+    // this service existed goes on looking like somebody's decision about it.
+    let swept = standing_grants_for(&config.acl, name, kind);
+    if let Some(grant) = swept.first() {
+        return (
+            Outcome::Warned,
+            "granted by a pattern",
+            format!(
+                "no rule names it: {} allows every target matching `{}`, so this service \
+                 inherited a grant written before it existed. Narrow that rule, or take \
+                 it out with `agent-iap acl rm {}`",
+                grant.label, grant.target, grant.index
+            ),
+        );
+    }
+
     let admitting: Vec<String> = reaching
         .iter()
         .filter(|(_, rule)| rule.action != Action::Deny)
@@ -1130,6 +1148,83 @@ pub fn fallthrough_clause(default: Action) -> &'static str {
         Action::Allow => "is forwarded — `acl_default` is allow",
         Action::Deny => "is refused by `<default>`, with nobody asked",
     }
+}
+
+/// A rule that grants a service it does not name.
+///
+/// `allow` plus a `target` pattern is a decision about every service the
+/// pattern will ever match. The ones in the file when it was written were at
+/// least in front of whoever wrote it; the ones enrolled afterwards were not,
+/// and they inherit the grant before anybody sees them — the proxy fronts a new
+/// service, the first call goes out with the real credential attached, and the
+/// console that exists to ask about that call shows nothing (SIRI-186).
+///
+/// `deny` and `ask` patterns are not this: neither widens with the file.
+#[derive(Debug, Clone)]
+pub struct StandingGrant {
+    pub index: usize,
+    /// The rule's name, or `acl[n]` — what `list acl` prints and `acl rm` takes.
+    pub label: String,
+    pub agent: String,
+    pub target: String,
+}
+
+impl StandingGrant {
+    /// The whole fact in one line, for `check`'s policy summary.
+    pub fn line(&self) -> String {
+        format!(
+            "{} allows `{}` every call to `{}` — including services enrolled later, which \
+             nobody is asked about. `agent-iap acl rm {}` takes it out",
+            self.label, self.agent, self.target, self.index
+        )
+    }
+
+    /// The command that ends it, on its own line to be pasted.
+    pub fn fix(&self) -> String {
+        format!("  agent-iap acl rm {}", self.index)
+    }
+}
+
+/// Every standing grant in the file, in rule order.
+///
+/// Expired rules are left out: a grant that has run out is not one a service
+/// added tomorrow walks into.
+pub fn standing_grants(rules: &[AclRuleConfig]) -> Vec<StandingGrant> {
+    let now = chrono::Utc::now();
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.action == Action::Allow
+                && crate::acl::is_pattern(&rule.target)
+                && !rule.expired_at(now)
+        })
+        .map(|(index, rule)| StandingGrant {
+            index,
+            label: rule
+                .name
+                .clone()
+                .map(|name| format!("acl[{index}] `{name}`"))
+                .unwrap_or_else(|| format!("acl[{index}]")),
+            agent: rule.agent.clone(),
+            target: rule.target.clone(),
+        })
+        .collect()
+}
+
+/// The standing grants a service enrolled under `name` has just walked into.
+///
+/// What `upstream add`, `mcp-server add` and `profile add` have to say instead
+/// of "nothing is granted yet": the enrolment granted nothing, and the policy
+/// may still have granted it before the service existed.
+pub fn standing_grants_for(rules: &[AclRuleConfig], name: &str, kind: &str) -> Vec<StandingGrant> {
+    standing_grants(rules)
+        .into_iter()
+        .filter(|grant| {
+            let rule = &rules[grant.index];
+            (rule.kind == kind || rule.kind == "*") && glob_matches(&rule.target, name)
+        })
+        .collect()
 }
 
 /// How a terminal fixes the state [`cannot_ask_warning`] describes. The console
@@ -1599,13 +1694,57 @@ base_url = "https://api.github.com"
 [[acl]]
 name = "github-reads"
 kind = "http"
-target = "gith*"
+target = "github"
 action = "allow"
 "#
         ));
         let (outcome, _, detail) = reachability(&allowed, "github", "http", "…");
         assert_eq!(outcome, Outcome::Passed);
         assert!(detail.contains("github-reads"), "{detail}");
+    }
+
+    /// A rule that reaches a service without naming it is not the same
+    /// finding as one written about it, and used to report as the same one.
+    ///
+    /// `target = "gith*"` was written when `github` may not have existed. It
+    /// covers whatever is enrolled next, so "reachable by acl" here is a pass
+    /// for a service nobody decided anything about — the state SIRI-186 was
+    /// reported from.
+    #[test]
+    fn a_grant_that_only_matched_the_name_by_pattern_says_so() {
+        let swept = config(&format!(
+            r#"{UPSTREAM}
+[[acl]]
+name = "everything"
+kind = "http"
+target = "gith*"
+action = "allow"
+"#
+        ));
+
+        let (outcome, brief, detail) = reachability(&swept, "github", "http", "…");
+
+        assert_eq!(outcome, Outcome::Warned);
+        assert_eq!(brief, "granted by a pattern");
+        assert!(detail.contains("acl[0] `everything`"), "{detail}");
+        assert!(detail.contains("acl rm 0"), "and the way out: {detail}");
+    }
+
+    /// The same pattern, asking rather than allowing, is this proxy working.
+    #[test]
+    fn a_pattern_that_asks_is_not_a_standing_grant() {
+        let asking = config(&format!(
+            r#"{UPSTREAM}
+[[acl]]
+kind = "http"
+target = "*"
+action = "ask"
+"#
+        ));
+
+        assert!(standing_grants(&asking.acl).is_empty());
+        let (outcome, _, _) = reachability(&asking, "github", "http", "…");
+        assert_eq!(outcome, Outcome::Passed);
     }
 
     /// A rule that only says no is not a way in, and neither is one whose

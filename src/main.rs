@@ -729,9 +729,21 @@ enum AclCommand {
         /// `http`, `mcp`, or `*`.
         #[arg(long, default_value = "*")]
         kind: String,
-        /// Upstream or MCP server name, or `*`.
+        /// Upstream or MCP server name. Defaults to `*`, which `--action
+        /// allow` will not accept without `--any-target`.
         #[arg(long, default_value = "*")]
         target: String,
+        /// Mean the pattern in `--target`: allow every service it matches,
+        /// including ones enrolled later.
+        ///
+        /// A grant is about a service, and `--target` defaults to `*` like
+        /// every other flag here. Without this, `--action allow` over a
+        /// pattern is refused rather than written — otherwise the next
+        /// `agent-iap upstream add` walks into a decision taken before it
+        /// existed, and the console that exists to ask about that first call
+        /// never sees it.
+        #[arg(long)]
+        any_target: bool,
         /// HTTP verbs, or JSON-RPC methods such as `tools/call`. Repeatable.
         #[arg(long = "methods", value_name = "METHOD", default_values_t = [String::from("*")])]
         methods: Vec<String>,
@@ -1118,6 +1130,7 @@ fn main() -> Result<()> {
             agent,
             kind,
             target,
+            any_target,
             methods,
             paths,
             action,
@@ -1128,6 +1141,7 @@ fn main() -> Result<()> {
             agent,
             kind,
             target,
+            any_target,
             methods,
             paths,
             action,
@@ -1853,6 +1867,21 @@ fn check(path: &Path) -> Result<()> {
         config.acl.len(),
         config.acl_default.action
     );
+    // The grants that are not about any service in this file. `allow` over a
+    // `target` pattern covers whatever is enrolled next, so the file says yes
+    // to a service before anybody has seen it — the same shape as an agent
+    // with no `targets`, one line down from where that is counted, and the
+    // reason a freshly added upstream could already be in accept mode.
+    // `acl add` will not write one unasked any more; this is how the ones
+    // already in the file get seen.
+    for grant in verify::standing_grants(&config.acl) {
+        // Wrapped under the same gutter the other lines use: this one is a
+        // sentence rather than a list, and a line that runs off the terminal
+        // is one an operator skips.
+        for line in verify::wrap(&grant.line(), 66) {
+            println!("            {line}");
+        }
+    }
     // Worth a line of its own: whether the data plane takes a standing grant or
     // an hour of one is the single biggest thing this file decides.
     let workload = &config.server.workload_identity;
@@ -2392,7 +2421,7 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     enroll::add_upstream(&path, &name, &base_url, &auth, &headers)?;
     println!("Added upstream `{name}` to {}.", path.display());
     println!("Agents reach it at `/{name}/<path>`.");
-    print!("{}", first_call_notice(&path, &name)?);
+    print!("{}", first_call_notice(&path, &name, "http")?);
     verify_after_write(&path, &name, verify)
 }
 
@@ -2407,8 +2436,28 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
 /// deliberately did not write.
 ///
 /// Ends with a newline when it says anything at all.
-fn first_call_notice(path: &Path, name: &str) -> Result<String> {
+fn first_call_notice(path: &Path, name: &str, kind: &str) -> Result<String> {
     let config = enroll::policy(path)?;
+    // Before anything about `acl_default`: a rule that already allows this
+    // service settles what the first call meets, and the sentence below would
+    // be false. The enrolment granted nothing — and the policy granted it
+    // anyway, in a rule written when this name meant nothing, which is what
+    // "I added an upstream and it is already in accept mode" is (SIRI-186).
+    let inherited = verify::standing_grants_for(&config.acl, name, kind);
+    if let Some(grant) = inherited.first() {
+        let mut lines = verify::wrap(
+            &format!(
+                "WARNING: `{name}` is already allowed, and nothing here granted it: {} allows \
+                 every target matching `{}`, which now includes this one. Its first call goes \
+                 out with the credential attached and nobody asked. Narrow that rule to the \
+                 services it is about, or take it out:",
+                grant.label, grant.target
+            ),
+            78,
+        );
+        lines.push(grant.fix());
+        return Ok(format!("\n{}\n", lines.join("\n")));
+    }
     // One diagnosis: the same one `check`, the headless banner and the console
     // show for a policy that can never stop a request on a human.
     if let Some(warning) = verify::cannot_ask_warning(&config.acl, config.acl_default.action) {
@@ -2535,7 +2584,7 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
     let auth = auth.to_spec()?;
     enroll::add_mcp_server(&path, &name, &transport, &auth)?;
     println!("Added MCP server `{name}` to {}.", path.display());
-    print!("{}", first_call_notice(&path, &name)?);
+    print!("{}", first_call_notice(&path, &name, "mcp")?);
     // The one thing that is specific to MCP and has no symptom when it is got
     // wrong: `initialize` names no tool, so a policy holding only tool-scoped
     // rules is a server whose session never opens.
@@ -2567,6 +2616,7 @@ struct AddRule {
     agent: String,
     kind: String,
     target: String,
+    any_target: bool,
     methods: Vec<String>,
     paths: Vec<String>,
     action: ActionArg,
@@ -2592,6 +2642,7 @@ fn add_rule(options: AddRule) -> Result<()> {
             paths: &options.paths,
             action: options.action.as_str(),
             expires,
+            any_target: options.any_target,
         },
     )?;
 
@@ -3103,7 +3154,10 @@ fn add_from_profile(
     // saying "access level `read`" and stopping would read as a grant. What
     // was and was not permitted is the whole of what this command decided.
     if !added.granted {
-        print!("{}", first_call_notice(path, &added.name)?);
+        print!(
+            "{}",
+            first_call_notice(path, &added.name, profile.service.kind())?
+        );
         println!(
             "\n  agent-iap profile add {} --as {} --access {} --grant\n  \
              # the reviewed rules for this level, as a standing grant, if that is what you want",

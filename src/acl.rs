@@ -405,6 +405,21 @@ fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {
     })
 }
 
+/// Does this spelling match names that are not in the policy file yet?
+///
+/// The question every `allow` rule has to answer about its `target`. A rule
+/// that names `github` is a decision about GitHub; a rule whose target is `*`,
+/// or `google-*`, is a decision about every service this proxy will ever front
+/// — including the one enrolled tomorrow, which nobody will be asked about
+/// because a rule written before it existed already says yes.
+///
+/// One implementation, because three surfaces ask it: `acl add` refuses to
+/// write one unasked, `check` names the ones already in the file, and
+/// `upstream add` says so at the moment the new service walks into one.
+pub fn is_pattern(spec: &str) -> bool {
+    spec.contains(['*', '?', '[', '{'])
+}
+
 /// `*` matches anything, including `/`. Used for names and for JSON-RPC methods,
 /// which contain a separator of their own (`tools/call`).
 pub(crate) fn plain_glob(pattern: &str) -> Result<GlobMatcher> {

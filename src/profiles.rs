@@ -538,6 +538,10 @@ fn planned_spec<'a>(
         paths: &rule.paths,
         action: &rule.action,
         expires: None,
+        // A profile's rules are written for the service just enrolled, under
+        // the name it was given — `target` is always that name, never a
+        // pattern, so there is nothing here to ask for by name.
+        any_target: false,
     }
 }
 

@@ -249,6 +249,11 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 paths: &paths,
                 action: &action,
                 expires,
+                // The switch beside `target` on the form, and off unless the
+                // operator turned it on: `*` is what the field is prefilled
+                // with, so a grant about every service must not be what a
+                // walk-through of the defaults produces.
+                any_target: form.flag("any-target"),
             };
 
             let landed = match form.opt("position") {

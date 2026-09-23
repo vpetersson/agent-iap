@@ -334,6 +334,35 @@ let the bare command grant everything to everyone, ahead of the `acl_default`
 this is all built on. The widest rule it can write stops on a human instead; to
 grant, say `--action allow`.
 
+**And a grant has to be about a service.** `--target` defaults to `*` like the
+rest, so `--action allow` with nothing else would be a rule about every service
+the proxy will ever front — including the one enrolled next week, which nobody
+would be asked about, because a rule written before it existed already says
+yes. That is refused rather than written:
+
+```bash
+agent-iap acl add --target github --action allow    # this service
+agent-iap acl add --action allow --any-target       # all of them, said out loud
+agent-iap acl add --action allow                    # refused: which service?
+```
+
+`ask` and `deny` over a pattern are untouched — neither widens as the file
+grows. A blanket grant already in the file is named by `agent-iap check`, and
+by the enrolment that walks into one:
+
+```console
+$ agent-iap upstream add stripe --base-url https://api.stripe.com --auth bearer \
+    --secret op://Private/Stripe/key
+Added upstream `stripe` to /home/you/.config/agent-iap/iap.toml.
+Agents reach it at `/stripe/<path>`.
+
+WARNING: `stripe` is already allowed, and nothing here granted it: acl[0]
+`console-allow-claude-code-*` allows every target matching `*`, which now
+includes this one. Its first call goes out with the credential attached and
+nobody asked. Narrow that rule to the services it is about, or take it out:
+  agent-iap acl rm 0
+```
+
 The same goes for enrolment. `upstream add`, `mcp-server add` and `profile add`
 write the service and nothing else: what an agent may do with it is a separate
 decision, and the default is that a human makes it when the agent actually
@@ -970,8 +999,7 @@ this much, for how long.
 │                                                              │
 │    Once   5 min   1 hour   1 day   Until quit   From now on  │
 │                                                              │
-│      ( ) any request from Claude Code                        │
-│      ( ) → anything on github                                │
+│      ( ) anything on github                                  │
 │      ( ) → POST on github                                    │
 │      (•) → POST /repos/acme/api/issues on github             │
 │                                                              │
@@ -1010,6 +1038,15 @@ has to remember to take it away.
 The cursor starts on the narrowest row and on `Once`, so the default hands out
 no more than was asked for. `a`/`d` on the queue itself answer once, at that
 scope, without opening anything.
+
+**Every row names the service the request was for.** There used to be one above
+them — "any request from Claude Code" — which wrote `target = "*"`, and so
+turned an answer about one call into a standing grant over every service this
+proxy would ever front: the next `upstream add` was allowed before anybody saw
+it, and this queue stayed empty. The blanket grant is still available from the
+command line, where it can be read back before it is written
+(`agent-iap acl add --action allow --any-target`); what it is not is one
+keystroke away from a question about GitHub.
 
 #### The other panes
 
@@ -2312,9 +2349,12 @@ What this gives you:
   the console, refuses every request without an edit, a reload or a restart,
   and cannot be lifted by anything that rewrites the policy file
   (§ Stopping everything).
-- No command grants anything by default. `acl add` writes `ask`, `agent add`
-  refuses to enrol an agent until it is told what that agent may reach, and an
-  unmatched request falls through to `acl_default` — `ask` in the file
+- No command grants anything by default, and no grant covers a service that was
+  not in the file when it was written: an `allow` rule has to name the service
+  it is about, `--any-target` being the blanket grant asked for by name, and
+  `agent-iap check` lists the ones already written. `acl add` writes `ask`,
+  `agent add` refuses to enrol an agent until it is told what that agent may
+  reach, and an unmatched request falls through to `acl_default` — `ask` in the file
   `agent-iap init` writes and after an `acl reset`, `deny` after `acl reset
   --deny`, and never `allow` unless somebody wrote it there. An `ask` with
   nobody to ask denies, so nothing is waved through by a default either way;
@@ -2378,7 +2418,7 @@ federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 527 tests: unit + end-to-end through a real proxy, plain and over TLS
+cargo test        # 605 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

@@ -105,6 +105,16 @@ pub struct Reach {
 
 /// How far an answer can be made to reach, broadest first — the order the
 /// original dialogue used, with the cursor starting on the narrowest.
+///
+/// Every row names the service the request was for. There used to be one above
+/// these that did not — "any request from <agent>", which wrote a rule with
+/// `target = "*"` — and it was the console's own way into the reported bug
+/// (SIRI-186): one keystroke turned an answer about this call into a standing
+/// grant over every service the proxy would ever front, so the next
+/// `agent-iap upstream add` was allowed before anybody saw it, and this queue
+/// stayed empty. The blanket grant is still available, said out loud, from the
+/// one surface where it can be read back before it is written:
+/// `agent-iap acl add --action allow --any-target`.
 pub fn reaches(view: &PendingView) -> Vec<Reach> {
     let request = &view.request;
     let agent = request.agent.clone();
@@ -113,20 +123,6 @@ pub fn reaches(view: &PendingView) -> Vec<Reach> {
     let method = request.method.clone();
 
     let mut reaches = vec![
-        Reach {
-            label: format!("any request from {}", view.agent_name),
-            scope: Scope {
-                agent: Some(agent.clone()),
-                ..Scope::default()
-            },
-            rule: RuleShape {
-                agent: agent.clone(),
-                kind: "*".into(),
-                target: "*".into(),
-                methods: vec!["*".into()],
-                paths: vec!["**".into()],
-            },
-        },
         Reach {
             label: format!("→ anything on {target}"),
             scope: Scope {
@@ -612,8 +608,30 @@ mod tests {
             "tools/list",
             "",
         )));
-        assert_eq!(reaches.len(), 3);
+        assert_eq!(reaches.len(), 2);
         assert!(reaches.last().unwrap().label.contains("tools/list"));
+    }
+
+    /// The row that wrote `target = "*"`, gone. An answer given about one
+    /// service is not an answer about the service enrolled tomorrow.
+    #[test]
+    fn no_row_offers_a_grant_over_a_service_the_request_never_named() {
+        for request in [
+            AccessRequest::http("claude", "github", "POST", "/repos/acme/api/issues"),
+            AccessRequest::mcp("claude", "sentry", "tools/call", "create_issue"),
+        ] {
+            let target = request.target.clone();
+            for reach in reaches(&view(request)) {
+                assert_eq!(reach.rule.target, target, "{}", reach.label);
+                assert_eq!(reach.scope.target.as_deref(), Some(target.as_str()));
+                assert!(
+                    !crate::acl::is_pattern(&reach.rule.target),
+                    "a console answer may not write a rule about services that are not \
+                     in the file: {}",
+                    reach.label
+                );
+            }
+        }
     }
 
     #[test]
