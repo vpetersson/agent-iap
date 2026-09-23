@@ -521,7 +521,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
-| Others | `anthropic`, `openai`, `github`, `linear`, `slack`, `stripe` |
+| Others | `anthropic`, `openai`, `xai`, `github`, `linear`, `slack`, `stripe` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
@@ -573,6 +573,24 @@ The honest limits, all printed by `profile show`:
   featured/category playlist lists — so the default `catalogue` level names the
   endpoints that survived it rather than `/v1/**`; `--access read` is every GET,
   including the ones a new app will be refused.
+- **An xAI key is already scoped, and the proxy can only narrow it.** A key
+  made in the xAI console carries its own allow-list of endpoints and models,
+  and that list is checked before this policy is ever consulted: a call the ACL
+  allows still comes back 403 if the key was not given the endpoint, and no rule
+  written here widens it. So `xai` probes `/v1/api-key`, which describes the key
+  — its permissions, and whether it has been blocked or disabled — rather than
+  `/v1/models`, which answers for the account. xAI rejects a wrong key with
+  `400 invalid-argument` rather than a 401, so `verify` calls that `http error`
+  rather than `rejected`; it does not pass, and the status is in the detail
+  line, but the word is milder than the problem. The other thing one key covers
+  is spend: text generation, image generation and video generation sit behind the
+  same credential under the same `/v1` prefix, and only the first is in the
+  default `inference` level. Images and video need `--access all`, which is a
+  per-asset bill and therefore something a human types. `https://api.x.ai` is
+  the global endpoint; `https://us.api.x.ai` pins handling and inference to the
+  United States and is an edit to `base_url`, not a second profile. xAI's
+  management API is a different host and a different credential — a management
+  key — and no profile fronts it.
 - **A path the ACL cannot split.** Semrush's v3 analytics puts every report at
   the same path and names it in a query parameter — `/?type=domain_ranks` — so
   rules can say "reports, read-only" and nothing finer. The credential goes in

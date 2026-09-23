@@ -2117,6 +2117,87 @@ pub fn catalog() -> Vec<Profile> {
             note: None,
             probe: Some("/v1/models".into()),
         },
+        Profile {
+            id: "xai".into(),
+            title: "xAI API".into(),
+            vendor: "xAI".into(),
+            summary: "Responses, chat completions and the Grok model list.".into(),
+            default_name: "xai".into(),
+            credential: Credential {
+                about: "an API key".into(),
+                url: "https://console.x.ai/team/default/api-keys".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.x.ai".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: vec![
+                access(
+                    "inference",
+                    "the endpoints that generate text, and nothing that bills per asset",
+                    &[],
+                    vec![
+                        rule(
+                            "generate",
+                            &["POST"],
+                            &["/v1/responses", "/v1/chat/completions", "/v1/tokenize-text"],
+                            "allow",
+                        ),
+                        // A `deferred` chat completion and a stored response
+                        // are both collected by id on a later request, so a
+                        // level that could only start one would never get to
+                        // read what it produced.
+                        rule(
+                            "results",
+                            &["GET"],
+                            &["/v1/responses/*", "/v1/chat/deferred-completion/*"],
+                            "allow",
+                        ),
+                        rule(
+                            "models",
+                            &["GET"],
+                            &[
+                                "/v1/models",
+                                "/v1/models/*",
+                                "/v1/language-models",
+                                "/v1/language-models/*",
+                            ],
+                            "allow",
+                        ),
+                        // What the probe calls. It describes the key rather
+                        // than the account, so it belongs to the narrowest
+                        // level the way `/v1/models` does for the neighbours.
+                        rule("key", &["GET"], &["/v1/api-key"], "allow"),
+                    ],
+                ),
+                access(
+                    "all",
+                    "every endpoint",
+                    &[],
+                    vec![rule("all", &["*"], &["/v1/**"], "allow")],
+                ),
+            ],
+            note: Some(
+                "An xAI key carries its own allow-list of endpoints and models, chosen in the \
+                 console when the key is made and checked before this policy is ever \
+                 consulted: a call the ACL allows can still come back 403, and nothing \
+                 written here widens what the key may do. `verify` probes `/v1/api-key`, \
+                 which describes the key itself rather than the account — its permissions, \
+                 and whether it has been blocked or disabled. Read the verdict carefully: \
+                 xAI answers a wrong key with `400 invalid-argument` rather than a 401, so \
+                 a rejected credential is reported as `http error` and not as `rejected`. \
+                 It is still not a pass, and the status is in the detail line. Image and \
+                 video generation bill per asset and are reachable only at `--access all`. \
+                 The base URL is the global endpoint; `https://us.api.x.ai` pins request \
+                 handling and inference to the United States, and is an edit to `base_url` \
+                 rather than a profile of its own. The management API is a different host \
+                 and a different credential — a management key, not an API key — and this \
+                 profile does not front it."
+                    .into(),
+            ),
+            probe: Some("/v1/api-key".into()),
+        },
         bearer_api(BearerApi {
             id: "github",
             title: "GitHub REST API",
@@ -2485,6 +2566,58 @@ mod tests {
         assert_eq!(spotify.probe.as_deref(), Some("/v1/markets"));
         let note = spotify.note.as_deref().expect("the limit is written down");
         assert!(note.contains("/v1/me/**"), "{note}");
+    }
+
+    /// What the narrowest xAI level covers, and what it leaves for `all`.
+    ///
+    /// xAI puts more than a text API behind one key and one `/v1` prefix:
+    /// image and video generation sit alongside the chat endpoints and bill
+    /// per asset. A default level spelled `/v1/**` would therefore be a spend
+    /// nobody reviewed, so `inference` names the endpoints that generate text,
+    /// the two ways a result is collected afterwards, the model lists and the
+    /// probe — and nothing else.
+    #[test]
+    fn xais_default_level_generates_text_and_bills_for_nothing_else() {
+        let xai = get("xai").unwrap();
+        let vars = BTreeMap::new();
+        match build_auth(&xai.service, "env:XAI_API_KEY", &vars, &[]).unwrap() {
+            AuthSpec::Bearer { secret } => assert_eq!(secret, "env:XAI_API_KEY"),
+            other => panic!("xAI authenticates a bearer token, got {other:?}"),
+        }
+
+        let default = xai.default_access();
+        assert_eq!(default.name, "inference");
+        let paths: Vec<&str> = default
+            .rules
+            .iter()
+            .flat_map(|rule| rule.paths.iter().map(String::as_str))
+            .collect();
+        for reachable in [
+            "/v1/responses",
+            "/v1/chat/completions",
+            // Started with `deferred`, collected later by id: without this the
+            // level could spend the tokens and never read the answer.
+            "/v1/chat/deferred-completion/*",
+            "/v1/models",
+        ] {
+            assert!(paths.contains(&reachable), "{reachable} is not reachable");
+        }
+        assert!(
+            !paths.contains(&"/v1/**"),
+            "the narrowest level would grant image and video generation"
+        );
+
+        // The probe has to be a call the level already allows, and it is the
+        // one read that answers for the key rather than for the account.
+        assert_eq!(xai.probe.as_deref(), Some("/v1/api-key"));
+        assert!(paths.contains(&"/v1/api-key"));
+
+        // The two limits no rule here can fix, written down rather than met
+        // as a 403 on a call the ACL said yes to, or read off a `verify`
+        // verdict that is milder than what happened.
+        let note = xai.note.as_deref().expect("the limits are written down");
+        assert!(note.contains("403"), "{note}");
+        assert!(note.contains("400"), "{note}");
     }
 
     #[test]

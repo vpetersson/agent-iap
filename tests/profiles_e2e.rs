@@ -667,6 +667,71 @@ fn spotifys_default_grant_covers_the_catalogue_and_nothing_personal() {
     assert!(!allowed("PUT", "/v1/me/player/play"));
 }
 
+/// The xAI grant an agent actually gets, decided by the ACL the profile writes
+/// rather than discovered on a bill.
+///
+/// One key and one `/v1` prefix cover text generation, image generation and
+/// video generation, and only the first is what "inference" means to the agent
+/// being enrolled. Nothing in the base URL shows that split, so the rules have
+/// to: a default level spelled `/v1/**` would be a per-asset spend granted by a
+/// profile nobody read that far into.
+#[test]
+fn xais_default_grant_generates_text_and_no_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iap.toml");
+    agent_iap::init::init(&agent_iap::init::InitOptions {
+        path: path.clone(),
+        agent: "a".into(),
+        secret: None,
+        template: agent_iap::init::Template::Minimal,
+        force: true,
+    })
+    .unwrap();
+
+    let profile = profiles::get("xai").unwrap();
+    profiles::add(&path, &profile, &options("env:XAI_API_KEY")).unwrap();
+
+    let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config.validate().unwrap();
+    let acl = agent_iap::acl::Acl::compile(&config).unwrap();
+    let allowed = |method: &str, request_path: &str| {
+        acl.evaluate(&agent_iap::acl::AccessRequest {
+            agent: "a".into(),
+            kind: agent_iap::acl::Kind::Http,
+            target: "xai".into(),
+            method: method.into(),
+            path: request_path.into(),
+        })
+        .action
+            == agent_iap::config::Action::Allow
+    };
+
+    assert!(allowed("POST", "/v1/responses"));
+    assert!(allowed("POST", "/v1/chat/completions"));
+    assert!(allowed("POST", "/v1/tokenize-text"));
+    // A `deferred` completion and a stored response are both collected by id
+    // on a second request, so a grant that could only start one would spend
+    // the tokens and never read the answer.
+    assert!(allowed("GET", "/v1/chat/deferred-completion/1a2b3c"));
+    assert!(allowed("GET", "/v1/responses/resp_1a2b3c"));
+    assert!(allowed("GET", "/v1/models"));
+    assert!(allowed("GET", "/v1/language-models/grok-4"));
+    assert!(
+        allowed("GET", "/v1/api-key"),
+        "the probe has to be callable"
+    );
+
+    // Same key, same prefix, billed per asset: `all` reaches these and the
+    // level an operator gets by default does not.
+    assert!(!allowed("POST", "/v1/images/generations"));
+    assert!(!allowed("POST", "/v1/images/edits"));
+    assert!(!allowed("POST", "/v1/videos/generations"));
+    // Reading a stored response back is a read; throwing it away is not.
+    assert!(!allowed("DELETE", "/v1/responses/resp_1a2b3c"));
+    // And nothing here manages the account or the keys.
+    assert!(!allowed("POST", "/v1/api-key"));
+}
+
 #[test]
 fn every_profile_produces_a_policy_file_the_proxy_would_load() {
     // A profile is only useful if what it writes survives the same `validate()`
