@@ -334,6 +334,16 @@ let the bare command grant everything to everyone, ahead of the `acl_default`
 this is all built on. The widest rule it can write stops on a human instead; to
 grant, say `--action allow`.
 
+**And a grant has to name what it grants.** An `allow` whose `target` is `*`
+covers every upstream and MCP server in the file *and every one enrolled after
+it*, so the service added next week is permitted by a rule written before it
+existed — nobody is asked, and nothing reaches the approval queue to say so.
+Nothing writes one: `acl add --action allow` without a `--target` is refused,
+and so is the console's rule form and the approval dialogue. `ask` and `deny`
+still cover everything, because neither of them widens anything. A file that
+already carries such a rule — they were writable until recently — is told so by
+`check`, by `run` and on the console's approvals pane, with the rule named.
+
 The same goes for enrolment. `upstream add`, `mcp-server add` and `profile add`
 write the service and nothing else: what an agent may do with it is a separate
 decision, and the default is that a human makes it when the agent actually
@@ -970,8 +980,7 @@ this much, for how long.
 │                                                              │
 │    Once   5 min   1 hour   1 day   Until quit   From now on  │
 │                                                              │
-│      ( ) any request from Claude Code                        │
-│      ( ) → anything on github                                │
+│      ( ) anything on github                                  │
 │      ( ) → POST on github                                    │
 │      (•) → POST /repos/acme/api/issues on github             │
 │                                                              │
@@ -1006,6 +1015,14 @@ that outlives its reason and being asked again in thirty seconds, and both end
 with somebody holding the key down. The deadline lives in the file rather than
 in this process's memory, so a restart does not hand the grant back and nothing
 has to remember to take it away.
+
+Every row names the service the request was for. The widest one used to be
+*any request from Claude Code* — an `allow` on `target = "*"`, which covers the
+services in the file and the ones enrolled after it, so an answer given about
+GitHub in September went on permitting the upstream added in October, without
+anybody being asked and with nothing on the queue to show for it. An answer
+here settles the service it was asked about; what happens to a service nobody
+has seen yet is `acl_default`, which is written down.
 
 The cursor starts on the narrowest row and on `Once`, so the default hands out
 no more than was asked for. `a`/`d` on the queue itself answer once, at that
@@ -2312,7 +2329,9 @@ What this gives you:
   the console, refuses every request without an edit, a reload or a restart,
   and cannot be lifted by anything that rewrites the policy file
   (§ Stopping everything).
-- No command grants anything by default. `acl add` writes `ask`, `agent add`
+- No command grants anything by default, and no grant covers a service it does
+  not name: an `allow` with no `target` would permit every upstream enrolled
+  after it, so nothing writes one. `acl add` writes `ask`, `agent add`
   refuses to enrol an agent until it is told what that agent may reach, and an
   unmatched request falls through to `acl_default` — `ask` in the file
   `agent-iap init` writes and after an `acl reset`, `deny` after `acl reset

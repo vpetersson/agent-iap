@@ -742,6 +742,30 @@ impl App {
         ))
     }
 
+    /// Why the approval queue is going to stay empty, if it is.
+    ///
+    /// Two states produce one screen. Either nothing in this policy can ask, or
+    /// something in it has already said yes — and the second is the one an
+    /// operator cannot see, because the rule that answers for the upstream they
+    /// just added was written about a different service and sits in the file
+    /// looking like every other grant.
+    fn queue_warning(&self) -> Option<String> {
+        self.cannot_ask().or_else(|| self.already_allowed())
+    }
+
+    /// A standing grant that has answered for services nobody has seen yet.
+    ///
+    /// The console's wording of [`verify::blanket_allow_warning`], with the way
+    /// out as the key it is on rather than as a command.
+    fn already_allowed(&self) -> Option<String> {
+        let warning = verify::blanket_allow_warning(&self.policy.config.acl)?;
+        Some(format!(
+            "{warning}\n\n`x` on the rules pane (5) takes it out, and the next call stops \
+             here to be answered. `n` on that pane writes it back for one service, with a \
+             target."
+        ))
+    }
+
     /// Is a modal holding something that will not be on screen again?
     fn showing_a_secret(&self) -> bool {
         matches!(&self.modal, Some(Modal::Show(shown)) if shown.irreplaceable())
@@ -1392,13 +1416,23 @@ impl App {
             // not be the one a slipped finger reaches.
             (Tab::Acl, KeyCode::Char('R')) => {
                 let rules = self.state.acl.rule_count();
+                let standing = self.state.broker.remembered_count();
                 self.modal = Some(Modal::Confirm(Confirm {
                     question: format!("Delete all {rules} rule(s) and set the default to ask?"),
-                    detail: "Starting over: nothing matches, so every request stops here to be \
-                             answered, and a standing answer writes the rule back. This is \
-                             written to the policy file and outlives this process — `L` is the \
-                             one that denies everything, and only while the proxy runs."
-                        .into(),
+                    detail: format!(
+                        "Starting over: nothing matches, so every request stops here to be \
+                         answered, and a standing answer writes the rule back.{} The rules are \
+                         written to the policy file and outlive this process — `L` is the one \
+                         that denies everything, and only while the proxy runs.",
+                        match standing {
+                            0 => String::new(),
+                            n => format!(
+                                " The {n} standing answer(s) held in this process go too, \
+                                 or they would go on deciding after the rules that raised \
+                                 them are gone."
+                            ),
+                        }
+                    ),
                     prune: None,
                     intent: Destructive::ResetAcl,
                 }));
@@ -1790,10 +1824,23 @@ impl App {
             }
             Destructive::ResetAcl => {
                 let reset = crate::enroll::reset_acl(&path, crate::enroll::ResetTo::Ask)?;
+                // The rules were only half of what was deciding. A standing
+                // "until quit" answer lives in this process rather than in the
+                // file, so a reset of the file leaves it answering — and the
+                // sentence below ("every request stops here") would be
+                // disproved by the next call it covers. This is the console,
+                // which is that process: it can take them back, and the CLI's
+                // `acl reset` cannot, which is why that one says so.
+                let standing = self.state.broker.remembered_count();
+                self.state.broker.forget_all();
                 Ok(format!(
-                    "started over — {} rule(s) removed, default was `{}` and is now `ask`; \
+                    "started over — {} rule(s) removed{}, default was `{}` and is now `ask`; \
                      every request stops here until a rule says otherwise",
                     reset.removed.len(),
+                    match standing {
+                        0 => String::new(),
+                        n => format!(" and {n} standing answer(s) forgotten"),
+                    },
                     reset.was_default,
                 ))
             }
@@ -1991,14 +2038,25 @@ impl App {
                 Style::default().fg(Color::Cyan),
             ));
         }
-        spans.push(Span::raw(format!(
-            "  {} agents · {} upstreams · {} mcp · {} rules · default {} ",
+        let mut summary = format!(
+            "  {} agents · {} upstreams · {} mcp · {} rules · default {}",
             self.state.agents.len(),
             self.policy.config.upstreams.len(),
             self.policy.config.mcp_servers.len(),
             self.state.acl.rule_count(),
             self.state.acl.default_action(),
-        )));
+        );
+        // Standing "until quit" answers are held in this process rather than
+        // in the file, so the rule count does not include them and the rules
+        // pane does not show them — and a call one of them covers is decided
+        // without ever reaching the queue. Counted here, where an operator
+        // already reads what the policy is; `f` on the approvals pane is how
+        // they are taken back.
+        match self.state.broker.remembered_count() {
+            0 => summary.push(' '),
+            n => summary.push_str(&format!(" · {n} remembered ")),
+        }
+        spans.push(Span::raw(summary));
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
@@ -2060,7 +2118,7 @@ impl App {
                     split[1],
                     &self.pending,
                     self.cursor[index].selected(),
-                    self.cannot_ask(),
+                    self.queue_warning(),
                 );
                 rows
             }
@@ -2364,17 +2422,18 @@ fn draw_request(
     area: Rect,
     pending: &[PendingView],
     selected: Option<usize>,
-    cannot_ask: Option<String>,
+    stays_empty: Option<String>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" request ");
 
     let Some(view) = selected.and_then(|index| pending.get(index)) else {
         // An empty queue has two meanings and they are not the same news.
         // "Nothing has come in yet" is the one this pane used to give
-        // unconditionally — under a policy that cannot ask it is a promise the
-        // queue will never keep, on the one screen an operator watches while
-        // the audit log fills with `<default>` refusals.
-        let (text, style) = match cannot_ask {
+        // unconditionally — under a policy that cannot ask, or one whose
+        // standing grant has already answered, it is a promise the queue will
+        // never keep, on the one screen an operator watches while the audit log
+        // fills with decisions nobody was asked about.
+        let (text, style) = match stays_empty {
             Some(reason) => (reason, Style::default().fg(Color::Yellow)),
             None => (
                 "Nothing is waiting.\n\nRequests matching an `ask` rule appear here, and the \
@@ -3524,6 +3583,64 @@ action = "deny"
         );
     }
 
+    /// The report, at the console that produced it.
+    ///
+    /// A standing answer is given about the service in front of the operator.
+    /// The dialogue's widest row used to be "any request from <agent>", which
+    /// wrote `allow` on `target = "*"` — so the upstream enrolled a week later
+    /// was permitted by it, the approval queue stayed empty, and the audit log
+    /// filled with `allow … [console-allow-<agent>-*]` for a service nobody
+    /// had ever been asked about.
+    #[tokio::test]
+    async fn a_standing_answer_does_not_cover_an_upstream_enrolled_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        // `ask`, which is what `init` writes: an uncovered call stops here.
+        let mut app = app_with(
+            dir.path(),
+            &format!("{POLICY}\n[acl_default]\naction = \"ask\"\n"),
+        );
+        let view = waiting();
+
+        // The widest answer this dialogue can give, held for good.
+        let widest = approve::reaches(&view).remove(0);
+        app.answer(&view, Verdict::Allow, approve::Duration::Forever, widest);
+        app.settle().await;
+        assert_eq!(
+            app.state.acl.evaluate(&view.request).action,
+            crate::config::Action::Allow,
+            "the service that was asked about is granted"
+        );
+
+        // Now enrol another one, the way the upstreams pane does.
+        crate::enroll::add_upstream(
+            &path,
+            "linear",
+            "https://api.linear.app",
+            &crate::enroll::AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+        app.reread().await;
+
+        let fresh = AccessRequest::http("claude-code", "linear", "POST", "/graphql");
+        let decision = app.state.acl.evaluate(&fresh);
+        assert_eq!(
+            decision.action,
+            crate::config::Action::Ask,
+            "an upstream added after the answer must still stop on a human"
+        );
+        assert_eq!(
+            decision.rule_label(),
+            "<default>",
+            "and no rule written earlier may claim it"
+        );
+
+        // What the answer did write: the service it was given about.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("target = \"github\""), "{written}");
+    }
+
     #[tokio::test]
     async fn the_dialogue_names_the_agent_rather_than_calling_it_an_agent() {
         // One proxy fronts a fleet. "An agent is asking" is the one thing the
@@ -3615,8 +3732,8 @@ action = "deny"
         let mut app = app_for_test(dir.path());
         let view = waiting();
 
-        // The second row: anything on `github`.
-        let reach = approve::reaches(&view)[1].clone();
+        // The widest row there is: anything on `github`.
+        let reach = approve::reaches(&view)[0].clone();
         app.answer(&view, Verdict::Allow, approve::Duration::UntilQuit, reach);
 
         let other = AccessRequest::http("claude-code", "github", "DELETE", "/repos/acme/api");
@@ -5405,6 +5522,46 @@ base_url = "https://api.github.com"
             toml::from_str(&std::fs::read_to_string(dir.path().join("iap.toml")).unwrap()).unwrap();
         assert!(config.acl.is_empty());
         assert_eq!(config.acl_default.action, crate::config::Action::Ask);
+        assert!(!app.flash.as_ref().unwrap().failed);
+    }
+
+    /// The half of the reset that is not in the file.
+    ///
+    /// A standing "until quit" answer is held in this process. Wiping the rules
+    /// left it deciding — so the console said "every request stops here until a
+    /// rule says otherwise" and the next call it covered went straight through,
+    /// with nothing on the queue and no rule in the file to explain it. The same
+    /// shape as the bug the reset exists for.
+    #[tokio::test]
+    async fn resetting_the_rules_also_takes_back_the_standing_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let view = waiting();
+
+        // "anything on github", until quit — the answer that writes nothing.
+        let reach = approve::reaches(&view).remove(0);
+        app.answer(&view, Verdict::Allow, approve::Duration::UntilQuit, reach);
+        app.settle().await;
+        assert_eq!(app.state.broker.remembered_count(), 1);
+
+        // And it is on screen, because nothing else counts it: not the rule
+        // count, not the rules pane, not the queue it keeps requests off.
+        let rendered = render(&mut app, 160, 30);
+        assert!(
+            rendered.contains("1 remembered"),
+            "the header has to say a standing answer is in force:\n{rendered}"
+        );
+
+        app.tab = Tab::Acl;
+        app.handle(KeyEvent::from(KeyCode::Char('R'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        app.settle().await;
+
+        assert_eq!(
+            app.state.broker.remembered_count(),
+            0,
+            "a reset that leaves a standing allow behind is not a reset"
+        );
         assert!(!app.flash.as_ref().unwrap().failed);
     }
 

@@ -500,3 +500,96 @@ fn check_says_when_a_policy_can_never_ask() {
     let stdout = String::from_utf8_lossy(&agent_iap(&path, &["check"]).stdout).into_owned();
     assert!(!stdout.contains("can ask"), "{stdout}");
 }
+
+/// The other half of "a default never widens access": the target.
+///
+/// `--action allow` is one word, and worth typing — but typed against the rest
+/// of the defaults it wrote `allow * ** on *`, a standing grant covering every
+/// service in the file and every one enrolled after it. The console wrote the
+/// same rule from its widest row. Nothing writes it now: a grant has to name
+/// what it grants.
+#[test]
+fn an_allow_that_names_no_target_is_refused() {
+    let (_dir, path) = minimal_policy();
+
+    for flags in [
+        vec!["acl", "add", "--action", "allow"],
+        vec!["acl", "add", "--target", "*", "--action", "allow"],
+    ] {
+        let output = agent_iap(&path, &flags);
+        assert!(
+            !output.status.success(),
+            "`{}` wrote a grant naming no service",
+            flags.join(" ")
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--target"),
+            "and the refusal says how to write it properly:\n{stderr}"
+        );
+        assert!(policy(&path).acl.is_empty(), "nothing was written");
+    }
+
+    // The same rule as a question is the policy this proxy is for.
+    assert!(agent_iap(&path, &["acl", "add", "--action", "ask"])
+        .status
+        .success());
+    assert_eq!(policy(&path).acl[0].action, Action::Ask);
+}
+
+/// The state, not the command that produced it.
+///
+/// A file that already carries a blanket grant — written by a console that
+/// could still write one — permits the next service enrolled into it before
+/// anybody is asked about it. "Nothing is granted to `linear` yet" was true of
+/// the rules naming `linear` and false of the file, on the one line an operator
+/// reads after enrolling.
+#[test]
+fn an_enrolment_onto_a_standing_grant_says_it_is_granted_already() {
+    let (_dir, path) = minimal_policy();
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "\n[[acl]]\nname = \"console-allow-claude-code-*\"\nagent = \"claude-code\"\n\
+         target = \"*\"\naction = \"allow\"\n",
+    );
+    std::fs::write(&path, text).unwrap();
+
+    let output = agent_iap(
+        &path,
+        &[
+            "upstream",
+            "add",
+            "linear",
+            "--base-url",
+            "https://api.linear.app",
+            "--auth",
+            "none",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("granted already"),
+        "the enrolment says what the first call will actually meet:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("console-allow-claude-code-*"),
+        "and which rule is doing it:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Nothing is granted"),
+        "never both:\n{stdout}"
+    );
+
+    // And the same diagnosis from the command whose whole job is the file.
+    let check = agent_iap(&path, &["check"]);
+    let reported = String::from_utf8_lossy(&check.stdout).into_owned()
+        + &String::from_utf8_lossy(&check.stderr);
+    assert!(
+        reported.contains("allows every target"),
+        "`check` names it too:\n{reported}"
+    );
+    assert!(
+        reported.contains("agent-iap acl rm"),
+        "and the way out:\n{reported}"
+    );
+}

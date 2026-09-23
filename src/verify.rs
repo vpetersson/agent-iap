@@ -25,6 +25,7 @@
 //! URL is `upstream edit`, not doing the whole enrolment again.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1141,6 +1142,86 @@ pub const CANNOT_ASK_FIX: &str = "`agent-iap acl reset` makes the fallthrough a 
 /// one line somebody can paste.
 pub const CANNOT_ASK_COMMAND: &str = "  agent-iap acl add --action ask";
 
+/// The rules that permit a service nobody named — live ones, in file order.
+///
+/// An `allow` whose `target` is `*` covers every upstream and MCP server in the
+/// file, and every one enrolled after it was written. That is the state behind
+/// "I added an upstream and the agent was never asked about it": one standing
+/// grant, answered about one service, quietly deciding for all the others.
+///
+/// Expired rules are left out. They are still in the file and still listed —
+/// a grant that ran out is a thing to have a record of — but they decide
+/// nothing, and a warning about a rule that is not in force is one an operator
+/// learns to skip.
+pub fn blanket_allows(rules: &[AclRuleConfig]) -> Vec<usize> {
+    let now = Utc::now();
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.is_blanket_allow() && !rule.expired_at(now))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The first standing grant that names no target, as a warning refers to it.
+///
+/// What every enrolment message needs and none of them could ask: "nothing is
+/// granted to `{name}` yet" is true of the rules that mention it and false of
+/// the file, and the difference is the whole report. A service enrolled into a
+/// policy carrying a blanket `allow` is permitted the moment it is written.
+pub fn blanket_allow_label(rules: &[AclRuleConfig]) -> Option<String> {
+    let index = *blanket_allows(rules).first()?;
+    Some(format!("#{index} `{}`", label(rules, index)))
+}
+
+/// A policy that has already answered for services it has never seen.
+///
+/// The counterpart to [`cannot_ask_warning`], for the other way an approval
+/// queue stays empty while the audit log fills: not "nothing here can ask" but
+/// "something here already said yes to everything". Shared by `check`, `run`'s
+/// banner and the console for the same reason — three wordings of one state is
+/// how an operator ends up believing the most optimistic of them.
+pub fn blanket_allow_warning(rules: &[AclRuleConfig]) -> Option<String> {
+    let blanket = blanket_allows(rules);
+    let first = *blanket.first()?;
+    let rule = &rules[first];
+    let named = match blanket.len() {
+        1 => format!("rule #{first} `{}`", label(rules, first)),
+        count => format!(
+            "{count} rules ({})",
+            blanket
+                .iter()
+                .map(|index| format!("#{index} `{}`", label(rules, *index)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let who = match rule.agent.as_str() {
+        "*" | "**" => "every agent".to_string(),
+        agent => format!("`{agent}`"),
+    };
+    Some(format!(
+        "{named} allows every target. For {who} that is every upstream and MCP server in          this file — and every one enrolled after the rule was written, which is the half          nobody sees coming: a service added today is permitted before anybody is asked          about it, and no call to it will ever stop on a human."
+    ))
+}
+
+/// How a terminal fixes the state [`blanket_allow_warning`] describes.
+pub const BLANKET_ALLOW_FIX: &str = "A grant has to name what it grants. Take the rule out and                                      the next call asks again — or write it back for the one                                      service it was meant for, with `--target <name>`:";
+
+/// The command under [`BLANKET_ALLOW_FIX`], kept off the wrapping so it arrives
+/// as one line somebody can paste. Numbers shift as rules are removed, so it
+/// names the column rather than a position that may already be stale.
+pub const BLANKET_ALLOW_COMMAND: &str = "  agent-iap acl rm <#>";
+
+/// What a rule calls itself in a warning: its name, or the position the audit
+/// log would print for it — the two spellings a reader can search the file for.
+fn label(rules: &[AclRuleConfig], index: usize) -> String {
+    rules[index]
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("acl[{index}]"))
+}
+
 fn session_methods() -> String {
     crate::profiles::MCP_SESSION_METHODS
         .iter()
@@ -1407,6 +1488,63 @@ fn clip(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One rule, spelled the way the policy file spells it.
+    fn written(toml_text: &str) -> Vec<AclRuleConfig> {
+        vec![toml::from_str(toml_text).unwrap()]
+    }
+
+    /// The reported state, as the file holds it: one standing grant, written
+    /// from the console about one service, quietly deciding for the rest.
+    #[test]
+    fn a_grant_that_names_no_target_is_reported() {
+        let rules =
+            written("name = \"console-allow-claude-*\"\nagent = \"claude\"\naction = \"allow\"");
+        let warning = blanket_allow_warning(&rules).expect("this is the reported bug");
+        assert!(warning.contains("rule #0"), "{warning}");
+        assert!(warning.contains("console-allow-claude-*"), "{warning}");
+        assert!(
+            warning.contains("`claude`"),
+            "it names who it grants: {warning}"
+        );
+        assert!(
+            warning.contains("enrolled after"),
+            "and the half nobody sees coming: {warning}"
+        );
+    }
+
+    /// The same rule with a service on it is the ordinary grant this proxy is
+    /// for, and warning about it would teach an operator to skip the warning.
+    #[test]
+    fn a_grant_that_names_its_service_is_not() {
+        assert!(blanket_allow_warning(&[rule(Action::Allow)]).is_none());
+    }
+
+    /// `ask` and `deny` on every target are the two directions that do not
+    /// widen: one is the whole point of the console, the other fails closed.
+    #[test]
+    fn only_allow_is_the_problem() {
+        for action in ["ask", "deny"] {
+            let rules = written(&format!("target = \"*\"\naction = \"{action}\""));
+            assert!(
+                blanket_allow_warning(&rules).is_none(),
+                "a blanket `{action}` grants nothing"
+            );
+        }
+    }
+
+    /// A grant that has run out decides nothing, so it is not what is stopping
+    /// the queue — and a warning about a rule not in force is one to skip.
+    #[test]
+    fn an_expired_grant_is_not_in_force() {
+        let past = (Utc::now() - chrono::TimeDelta::try_hours(1).unwrap())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let rules = written(&format!(
+            "target = \"*\"\naction = \"allow\"\nexpires = \"{past}\""
+        ));
+        assert!(blanket_allows(&rules).is_empty());
+        assert!(blanket_allow_warning(&rules).is_none());
+    }
 
     fn rule(action: Action) -> AclRuleConfig {
         let action = match action {

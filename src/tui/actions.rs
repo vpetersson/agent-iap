@@ -325,6 +325,16 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
 /// next call will be decided against.
 fn ungranted(policy: &Policy) -> String {
     let default = policy.config.acl_default.action;
+    // Before anything about the fallthrough: a standing `allow` that names no
+    // target covers the service written a moment ago, so "nothing grants it
+    // yet" would be false as it was printed — and this is the exact moment an
+    // operator finds out, or does not, that the next call will not stop here.
+    if let Some(&index) = crate::verify::blanket_allows(&policy.config.acl).first() {
+        return format!(
+            "rule #{index} allows every target, so this is granted already and no call to it \
+             will stop here. `x` on the acl pane (5) takes that rule out"
+        );
+    }
     match crate::verify::cannot_ask_warning(&policy.config.acl, default) {
         Some(_) => format!(
             "nothing grants it, and nothing in this policy can ask: a call {}. `a` on the acl              pane writes a rule",

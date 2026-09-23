@@ -885,9 +885,39 @@ pub struct RuleSpec<'a> {
     pub expires: Option<DateTime<Utc>>,
 }
 
+/// An `allow` has to name the service it grants.
+///
+/// A rule that grants and leaves `target` at its default covers every upstream
+/// and MCP server in the file — and every one enrolled afterwards, which is the
+/// half nobody sees coming. That is how a console answer given about one
+/// service in September went on deciding for the upstream added in October:
+/// the operator was never asked, because a rule written weeks earlier had
+/// already said yes on their behalf.
+///
+/// Checked here rather than at each front end, because every write to the rule
+/// list comes through `add_rule` or `insert_rule` — `acl add`, the console's
+/// rule form, the approval dialogue's standing grant, a profile's `--grant` —
+/// and a check on one of them is a rule the others can still write.
+///
+/// Only `allow`. A blanket `ask` is the policy this proxy is for, and a blanket
+/// `deny` fails in the safe direction.
+fn check_grant(spec: &RuleSpec<'_>) -> Result<()> {
+    if spec.action == "allow" && crate::config::covers_every_target(spec.target) {
+        bail!(
+            "an `allow` rule has to name the service it grants: `target` is `{}`, which is \
+             every upstream and MCP server in this file — including the ones enrolled after \
+             this rule, which would be permitted without anybody being asked. Name one \
+             (`--target <name>`), or write the same rule as `ask` to have it stop on a human.",
+            spec.target
+        );
+    }
+    Ok(())
+}
+
 /// Add `[[acl]]`. Appended last, because first match wins and an earlier rule
 /// would silently take precedence over everything already in the file.
 pub fn add_rule(path: &Path, spec: &RuleSpec<'_>) -> Result<usize> {
+    check_grant(spec)?;
     let mut document = read(path)?;
     append(&mut document, "acl", rule_entry(spec));
     let landed = document_config(&document)?.acl.len().saturating_sub(1);
@@ -904,6 +934,7 @@ pub fn add_rule(path: &Path, spec: &RuleSpec<'_>) -> Result<usize> {
 /// the next call. An `index` past the end appends, which is what a decision
 /// taken by the *default* action means.
 pub fn insert_rule(path: &Path, index: usize, spec: &RuleSpec<'_>) -> Result<usize> {
+    check_grant(spec)?;
     let mut document = read(path)?;
     let entry = rule_entry(spec);
 
@@ -2424,6 +2455,47 @@ mod tests {
         let config = document_config(&read(&path).unwrap()).unwrap();
         assert_eq!(config.acl[0].name.as_deref(), Some("console-allow"));
         assert_eq!(config.acl[1].name.as_deref(), Some("writes-need-a-human"));
+    }
+
+    /// Both doors into the rule list, because a check on one of them is a rule
+    /// the other can still write — and the console writes through `insert`.
+    #[test]
+    fn neither_door_writes_a_grant_that_names_no_service() {
+        let (_dir, path) = empty_policy();
+        let methods = ["*".to_string()];
+        let paths = ["**".to_string()];
+        let blanket = |action| RuleSpec {
+            name: Some("console-allow-claude-*"),
+            agent: "claude",
+            kind: "*",
+            target: "*",
+            methods: &methods,
+            paths: &paths,
+            action,
+            expires: None,
+        };
+
+        for error in [
+            add_rule(&path, &blanket("allow")).unwrap_err(),
+            insert_rule(&path, 0, &blanket("allow")).unwrap_err(),
+        ] {
+            let error = format!("{error:#}");
+            assert!(error.contains("has to name the service"), "{error}");
+            assert!(error.contains("--target"), "{error}");
+        }
+        assert!(
+            document_config(&read(&path).unwrap())
+                .unwrap()
+                .acl
+                .is_empty(),
+            "a refused edit leaves the file alone"
+        );
+
+        // The same reach as a question is the whole point of the console, and
+        // a blanket `deny` fails in the safe direction. Both still write.
+        add_rule(&path, &blanket("ask")).unwrap();
+        add_rule(&path, &blanket("deny")).unwrap();
+        assert_eq!(document_config(&read(&path).unwrap()).unwrap().acl.len(), 2);
     }
 
     #[test]

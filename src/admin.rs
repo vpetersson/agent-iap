@@ -268,9 +268,14 @@ async fn authorize(
     record.path = body.path.clone();
     record.detail = body.detail.clone();
 
-    // Same order as the proxy: what the credential covers, then what policy
-    // allows. A bridge asking about a tool its token was not minted for is
-    // refused here, before the ACL and before any credential is resolved.
+    // The same three questions `gate::clear` asks the proxy's and the
+    // gateway's requests — scope, targets, then the ACL, with `ask` parked on
+    // the broker below. Spelled out again rather than delegated because this
+    // surface answers with an `AuthorizeResult` rather than by forwarding, and
+    // it reports the scope check before the targets one; both refuse, so what
+    // differs is only which reason a refused bridge call is given. Any new step
+    // added to the sequence has to be added here too, and that duplication is
+    // worth taking out — see the note on this in the pull request.
     if !caller.permits(&access) {
         record.decision = Some("deny".into());
         record.rule = Some("<workload-scope>".into());

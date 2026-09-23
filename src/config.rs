@@ -674,7 +674,43 @@ impl AclRuleConfig {
     pub fn expired_at(&self, now: DateTime<Utc>) -> bool {
         self.expires.is_some_and(|at| now >= at)
     }
+
+    /// A standing `allow` that names no service.
+    ///
+    /// It grants every upstream and MCP server in the file — and every one
+    /// enrolled after it was written, which is the half nobody sees coming.
+    /// The rule was answered about one service months ago; the service added
+    /// today is permitted by it before anybody is asked, and no call to it ever
+    /// reaches the approval queue. Nothing may write one, and a file that
+    /// already has one is told so wherever somebody is looking.
+    pub fn is_blanket_allow(&self) -> bool {
+        self.action == Action::Allow && covers_every_target(&self.target)
+    }
 }
+
+/// Does this `target` pattern place no constraint on which service is covered?
+///
+/// One spelling, because the diagnosis and the refusal have to mean the same
+/// thing: a rule this says nothing about is one `verify` will not warn on and
+/// `enroll` will happily write.
+///
+/// Asked of the matcher the ACL itself will use, rather than of how the pattern
+/// is spelled. `*` is the one anybody types, but `**`, `?*` and `{*,github}`
+/// are the same rule, and a list of spellings to compare against is a list that
+/// is one spelling short — which here means a grant that covers every service
+/// ever enrolled, written by a check that was looking for an asterisk.
+pub fn covers_every_target(target: &str) -> bool {
+    crate::acl::plain_glob(target.trim())
+        .map(|matcher| matcher.is_match(NO_SERVICE_IS_CALLED_THIS))
+        // An uncompilable pattern is not a blanket grant; it is a rule the
+        // whole file will be rejected for a moment later, by `validate()`.
+        .unwrap_or(false)
+}
+
+/// A name `check_id` would never have let into the file: service names are
+/// alphanumerics, `-`, `_` and `.`, so a pattern that admits this one admits
+/// anything an operator could enrol tomorrow.
+const NO_SERVICE_IS_CALLED_THIS: &str = "\u{1} / \u{1}";
 
 fn star() -> String {
     "*".to_string()
@@ -1359,6 +1395,26 @@ ca = "/root_ca.crt"
         .unwrap();
         let error = format!("{:#}", config.validate().unwrap_err());
         assert!(error.contains("server.tls.ca"), "{error}");
+    }
+
+    /// The refusal and the warning both hang off this, so a spelling it does
+    /// not recognise is a standing grant on every service nobody is told about.
+    #[test]
+    fn a_target_that_admits_anything_is_a_blanket_one_however_it_is_spelled() {
+        for pattern in ["*", "**", " * ", "?*", "{*,github}", "{github,*}"] {
+            assert!(
+                covers_every_target(pattern),
+                "`{pattern}` admits a service that does not exist yet"
+            );
+        }
+        // `*.*` is in the second list on purpose: it needs a dot, so it does
+        // not cover `github`, and refusing it would refuse a rule somebody meant.
+        for pattern in ["github", "gh*", "api.*", "*.*", "", "{github,linear}"] {
+            assert!(
+                !covers_every_target(pattern),
+                "`{pattern}` names what it covers"
+            );
+        }
     }
 
     #[test]

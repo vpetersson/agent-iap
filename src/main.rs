@@ -1554,6 +1554,19 @@ async fn run(
                  --lockdown, or lift it with `L` in the console, to serve the policy again"
             );
         }
+        // A grant that names no target decides for every upstream in the file
+        // and every one added later, so an `ask` rule behind it never runs.
+        // Said before the two lines about the console, because they are both
+        // about a queue this is the reason nothing reaches.
+        if let Some(warning) = verify::blanket_allow_warning(&state.config().acl) {
+            for line in verify::wrap(&warning, 78) {
+                eprintln!("{line}");
+            }
+            for line in verify::wrap(verify::BLANKET_ALLOW_FIX, 78) {
+                eprintln!("{line}");
+            }
+            eprintln!("{}", verify::BLANKET_ALLOW_COMMAND);
+        }
         // Running headless is what silences the `ask` rules: with no console,
         // nothing parks a request unless something is polling the queue. Say
         // so here rather than leaving it to be discovered in the audit log.
@@ -1884,6 +1897,12 @@ fn check(path: &Path) -> Result<()> {
             lines.join("\n")
         })
         .into_iter()
+        .chain(verify::blanket_allow_warning(&config.acl).map(|warning| {
+            let mut lines = verify::wrap(&warning, 66);
+            lines.extend(verify::wrap(verify::BLANKET_ALLOW_FIX, 66));
+            lines.push(verify::BLANKET_ALLOW_COMMAND.to_string());
+            lines.join("\n")
+        }))
         .chain(verify::mcp_handshake_warnings(&config));
     for warning in policy_warnings {
         println!();
@@ -2409,6 +2428,23 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
 /// Ends with a newline when it says anything at all.
 fn first_call_notice(path: &Path, name: &str) -> Result<String> {
     let config = enroll::policy(path)?;
+    // First, because it is the one answer that makes every other sentence here
+    // false: a standing `allow` that names no target covers the service this
+    // command has just written, so the first call to it is forwarded and
+    // nobody is asked. The enrolment did not grant that — a rule written about
+    // some other service did, before this one existed.
+    if let Some(rule) = verify::blanket_allow_label(&config.acl) {
+        let mut lines = verify::wrap(
+            &format!(
+                "WARNING: `{name}` is granted already. Rule {rule} allows every target, so \
+                 the first call to `{name}` is forwarded and nothing stops on a human."
+            ),
+            78,
+        );
+        lines.extend(verify::wrap(verify::BLANKET_ALLOW_FIX, 78));
+        lines.push(verify::BLANKET_ALLOW_COMMAND.to_string());
+        return Ok(format!("\n{}\n", lines.join("\n")));
+    }
     // One diagnosis: the same one `check`, the headless banner and the console
     // show for a policy that can never stop a request on a human.
     if let Some(warning) = verify::cannot_ask_warning(&config.acl, config.acl_default.action) {

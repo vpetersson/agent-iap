@@ -112,23 +112,17 @@ pub fn reaches(view: &PendingView) -> Vec<Reach> {
     let target = request.target.clone();
     let method = request.method.clone();
 
+    // Every row names the target. The row above these used to be "any request
+    // from <agent>" — a standing `allow` on `target = "*"`, which covers the
+    // services in the file and the ones enrolled after it, so the upstream
+    // added a week later was permitted by an answer given about a different
+    // service entirely and never stopped on a human. An answer here settles
+    // the service it was asked about; a policy for services nobody has seen
+    // yet is `acl_default`, and it is written in the file rather than guessed
+    // at in a dialogue.
     let mut reaches = vec![
         Reach {
-            label: format!("any request from {}", view.agent_name),
-            scope: Scope {
-                agent: Some(agent.clone()),
-                ..Scope::default()
-            },
-            rule: RuleShape {
-                agent: agent.clone(),
-                kind: "*".into(),
-                target: "*".into(),
-                methods: vec!["*".into()],
-                paths: vec!["**".into()],
-            },
-        },
-        Reach {
-            label: format!("→ anything on {target}"),
+            label: format!("anything on {target}"),
             scope: Scope {
                 agent: Some(agent.clone()),
                 kind: Some(request.kind),
@@ -163,7 +157,7 @@ pub fn reaches(view: &PendingView) -> Vec<Reach> {
     ];
 
     // `tools/list` names nothing, so "this method" already *is* the narrowest
-    // thing there is to allow. Offering a fourth row identical to the third
+    // thing there is to allow. Offering a row identical to the one above it
     // would be a choice between two spellings of the same grant.
     if !request.path.is_empty() {
         reaches.push(Reach {
@@ -602,17 +596,48 @@ mod tests {
         );
     }
 
+    /// The bug this dialogue was reported for, at the row that caused it.
+    ///
+    /// The widest row used to be "any request from <agent>", which wrote an
+    /// `allow` on `target = "*"`. An operator answering about GitHub in
+    /// September was, without being told so, answering for the upstream
+    /// enrolled in October — it matched a rule written before it existed and
+    /// never stopped on a human. Every row now names the service it was asked
+    /// about, on both halves: the rule that is written and the session answer
+    /// that is remembered.
+    #[test]
+    fn no_row_answers_for_a_service_the_request_never_named() {
+        for request in [
+            AccessRequest::http("claude", "github", "POST", "/repos/acme/api/issues"),
+            AccessRequest::mcp("claude", "sentry", "tools/list", ""),
+        ] {
+            let elsewhere = AccessRequest::http("claude", "an-upstream-added-later", "GET", "/x");
+            for reach in reaches(&view(request.clone())) {
+                assert_eq!(
+                    reach.rule.target, request.target,
+                    "`{}` would grant a service nobody asked about",
+                    reach.label
+                );
+                assert!(
+                    !reach.scope.matches(&elsewhere),
+                    "`{}` would remember an answer for a service nobody asked about",
+                    reach.label
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_call_that_names_nothing_gets_no_path_scoped_row() {
         // `tools/list` has no tool name, so "this method" is already as narrow
-        // as a grant goes and a fourth row would just repeat the third.
+        // as a grant goes and another row would just repeat it.
         let reaches = reaches(&view(AccessRequest::mcp(
             "claude",
             "sentry",
             "tools/list",
             "",
         )));
-        assert_eq!(reaches.len(), 3);
+        assert_eq!(reaches.len(), 2);
         assert!(reaches.last().unwrap().label.contains("tools/list"));
     }
 
