@@ -312,3 +312,38 @@ auth = {{ type = "bearer", secret = "env:AGENT_IAP_NOT_A_VAULT" }}
     assert_eq!(dialogues(&calls), 0);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 }
+
+/// Which build is this?
+///
+/// The question three rounds of SIRI-205 were spent unable to settle. With no
+/// tagged release, every install is a build somebody made, and `2026.9.0` is
+/// the same string for all of them — so "the fix is merged" and "the binary you
+/// are running has it" could not be told apart by anyone, from either side.
+#[test]
+fn the_binary_says_what_it_was_built_from() {
+    let home = tempfile::tempdir().unwrap();
+    let version = out(&iap(home.path(), &["--version"]));
+
+    assert!(version.contains(env!("CARGO_PKG_VERSION")), "{version}");
+    // Built from this repository, so the build script had a git to ask.
+    assert!(
+        version.contains('(') && version.contains("built "),
+        "a version with no commit and no date cannot answer the question it is \
+         there for: {version}"
+    );
+
+    // And `check` says it before anything that can fail, because the run worth
+    // identifying is the one that goes wrong.
+    let path = home.path().join("iap.toml");
+    std::fs::write(&path, "this is not toml {{{").unwrap();
+    let checked = iap(
+        home.path(),
+        &["check", "--config", &path.display().to_string()],
+    );
+    assert!(!checked.status.success());
+    assert!(
+        out(&checked).contains("build       "),
+        "the failing run did not say which build it was: {}",
+        out(&checked)
+    );
+}
