@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::borrow::Cow;
 
 use super::browse::{self, Browser, Pick};
+use super::catalogue::{self, Catalogue};
 use super::choose::{Candidate, Chooser};
 use crate::config::AuthConfig;
 use crate::enroll::{AuthInput, AUTH_SCHEMES};
@@ -59,6 +60,11 @@ pub struct Field {
     pub offers: Vec<Candidate>,
     /// What the `offers` list is a list of, for the picker's title.
     what: &'static str,
+    /// The service catalog, for the one field that picks a profile. Its own
+    /// list rather than `offers` because it opens a different picker: a name
+    /// off the policy file is a box over the form, and a profile is the whole
+    /// screen — see `catalogue`.
+    pub catalogue: Vec<catalogue::Entry>,
     /// Has the operator put anything in this field? A prefilled default is
     /// not an answer — the `*` on an ACL rule is the form talking, not the
     /// operator — so an offer of the names it could hold stays up over one,
@@ -81,6 +87,7 @@ impl Field {
             browses: false,
             offers: Vec::new(),
             what: "",
+            catalogue: Vec::new(),
             touched: false,
         }
     }
@@ -181,6 +188,15 @@ impl Field {
         self
     }
 
+    /// Say that this field names a profile, so `ctrl-o` on it opens the
+    /// catalog on the whole screen. The field stays a `Choice` over the same
+    /// ids, so `←`/`→` still steps through them for anyone who was used to it
+    /// — the picker is the way in, not the only way.
+    pub fn picking(mut self, entries: Vec<catalogue::Entry>) -> Self {
+        self.catalogue = entries;
+        self
+    }
+
     /// Is this field holding a credential somebody typed instead of a
     /// reference to one?
     ///
@@ -200,11 +216,13 @@ impl Field {
     /// Which picker `ctrl-o` opens here, or nothing for a field with none
     /// behind it.
     fn opens(&self) -> Option<Opens> {
-        match (self.browses, self.offers.is_empty()) {
-            (true, _) => Some(Opens::Files),
-            (false, false) => Some(Opens::Names),
-            (false, true) => None,
+        if self.browses {
+            return Some(Opens::Files);
         }
+        if !self.catalogue.is_empty() {
+            return Some(Opens::Profiles);
+        }
+        (!self.offers.is_empty()).then_some(Opens::Names)
     }
 
     fn rendered(&self) -> String {
@@ -283,6 +301,8 @@ pub struct Form {
 enum Overlay {
     Files(Browser),
     Names(Chooser),
+    /// The service catalog, over the whole terminal. See `catalogue`.
+    Profiles(Box<Catalogue>),
 }
 
 impl Overlay {
@@ -291,6 +311,7 @@ impl Overlay {
         match self {
             Overlay::Files(browser) => browser.field,
             Overlay::Names(chooser) => chooser.field,
+            Overlay::Profiles(catalogue) => catalogue.field,
         }
     }
 
@@ -298,6 +319,7 @@ impl Overlay {
         match self {
             Overlay::Files(browser) => browser.handle(key),
             Overlay::Names(chooser) => chooser.handle(key),
+            Overlay::Profiles(catalogue) => catalogue.handle(key),
         }
     }
 
@@ -305,6 +327,7 @@ impl Overlay {
         match self {
             Overlay::Files(browser) => browser.click(at, double),
             Overlay::Names(chooser) => chooser.click(at, double),
+            Overlay::Profiles(catalogue) => catalogue.click(at, double),
         }
     }
 
@@ -312,6 +335,7 @@ impl Overlay {
         match self {
             Overlay::Files(browser) => browser.scroll(up),
             Overlay::Names(chooser) => chooser.scroll(up),
+            Overlay::Profiles(catalogue) => catalogue.scroll(up),
         }
     }
 
@@ -319,6 +343,7 @@ impl Overlay {
         match self {
             Overlay::Files(browser) => browser.render(frame, area),
             Overlay::Names(chooser) => chooser.render(frame, area),
+            Overlay::Profiles(catalogue) => catalogue.render(frame, area),
         }
     }
 }
@@ -593,11 +618,20 @@ impl Form {
         let Some(field) = self.fields.get(self.focus) else {
             return;
         };
-        let Value::Text(text) = &field.value else {
-            return;
+        // What the field holds, whatever shape it holds it in: the profile
+        // picker sits on a `Choice`, and every other picker on a text field.
+        let held = field.rendered();
+        let text = match &field.value {
+            Value::Text(text) => text.as_str(),
+            _ => "",
         };
         self.overlay = match field.opens() {
             Some(Opens::Files) => Some(Overlay::Files(Browser::open(self.focus, text))),
+            Some(Opens::Profiles) => Some(Overlay::Profiles(Box::new(Catalogue::open(
+                self.focus,
+                field.catalogue.clone(),
+                &held,
+            )))),
             Some(Opens::Names) => {
                 // Only the candidates this form's own choices leave standing:
                 // a rule already narrowed to `kind = mcp` should not be
@@ -657,9 +691,24 @@ impl Form {
                 };
                 let at = overlay.field();
                 if let Some(field) = self.fields.get_mut(at) {
-                    if let Value::Text(text) = &mut field.value {
-                        *text = value;
-                        field.touched = true;
+                    match &mut field.value {
+                        Value::Text(text) => {
+                            *text = value;
+                            field.touched = true;
+                        }
+                        // The profile picker's field. Moved to the option the
+                        // pick names rather than left where it was: a picker
+                        // that answered with something the field cannot hold
+                        // would close silently and change nothing, which is the
+                        // shape of bug this console is built to avoid.
+                        Value::Choice { options, selected } => {
+                            if let Some(index) = options.iter().position(|option| *option == value)
+                            {
+                                *selected = index;
+                                field.touched = true;
+                            }
+                        }
+                        Value::Flag(_) => {}
                     }
                 }
                 at
@@ -828,9 +877,17 @@ impl Form {
                 // said, and a field nobody has answered yet is exactly where
                 // the offer belongs. `ctrl-u` empties it and the offer comes
                 // back, as it does for a path.
+                // The profile field's offer never comes off. The other two
+                // fill in a value you could also have typed, so the offer has
+                // done its job once there is one; this one is the only way to
+                // read the catalog at all, and the field it sits on always
+                // holds something — `— none —` at worst. Taken away on the
+                // same rule as the others it would be an affordance that
+                // vanished before it was ever needed.
                 let offer = field.opens().filter(|opens| match opens {
                     Opens::Files => blank,
                     Opens::Names => blank || !field.touched,
+                    Opens::Profiles => true,
                 });
                 if let (true, Some(opens)) = (focused, offer) {
                     let before = 4 + label_width + shown.chars().count();
@@ -956,6 +1013,7 @@ fn keep_width() -> usize {
 enum Opens {
     Files,
     Names,
+    Profiles,
 }
 
 impl Opens {
@@ -964,6 +1022,7 @@ impl Opens {
         match self {
             Opens::Files => " browse",
             Opens::Names => " choose",
+            Opens::Profiles => " catalog",
         }
     }
 
@@ -972,6 +1031,7 @@ impl Opens {
         match self {
             Opens::Files => "to pick the file",
             Opens::Names => "to choose from what the policy file holds",
+            Opens::Profiles => "for the whole catalog, searchable",
         }
     }
 

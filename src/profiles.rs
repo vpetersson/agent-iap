@@ -66,6 +66,19 @@ pub enum AuthTemplate {
     Query {
         param: String,
     },
+    /// The vendor mints the token: the proxy trades a client id and secret for
+    /// a short-lived access token at `token_url` and injects that instead.
+    ///
+    /// For an API whose only credential is an OAuth app — Spotify's — where a
+    /// `Bearer` profile would enrol a token that stops working within the hour
+    /// and a profile that expired by design is worse than no profile. The
+    /// client id is the caller's rather than the vendor's, so it arrives as a
+    /// `Var` and goes in the file in the clear; only the secret is a reference.
+    Oauth2ClientCredentials {
+        token_url: String,
+        /// Name of the `Var` holding the client id.
+        client_id_var: String,
+    },
     /// Google and anything else doing RFC 7523. Scopes come from the access
     /// level, because "read" and "write" are different scopes, not just
     /// different paths.
@@ -702,6 +715,23 @@ fn build_auth(
         AuthTemplate::Query { param } => AuthSpec::Query {
             param,
             secret: secret.to_string(),
+        },
+        AuthTemplate::Oauth2ClientCredentials {
+            token_url,
+            client_id_var,
+        } => AuthSpec::Oauth2ClientCredentials {
+            token_url,
+            client_id: vars
+                .get(&client_id_var)
+                .cloned()
+                .with_context(|| format!("this profile needs `--var {client_id_var}=…`"))?,
+            client_secret: secret.to_string(),
+            // Joined the way RFC 6749 spells a scope list, and `None` rather
+            // than an empty string for a level that asks for none: a vendor
+            // that reads `scope=` as "no scopes at all" and one that reads it
+            // as a malformed request are both waiting for this.
+            scope: Some(scopes.join(" ")).filter(|scope| !scope.is_empty()),
+            audience: None,
         },
         AuthTemplate::ServiceAccountJwt => AuthSpec::ServiceAccountJwt {
             key_file: Some(secret.to_string()),
@@ -2136,6 +2166,100 @@ pub fn catalog() -> Vec<Profile> {
             read_paths: &["/v1/**"],
             write_paths: &["/v1/**"],
         }),
+        // Spotify issues no long-lived API key at all: every call carries an
+        // OAuth access token that expires in an hour. So the credential the
+        // proxy holds is the app's client secret, and the token is minted here
+        // per request cycle and cached — a `bearer` profile would have enrolled
+        // something that worked once and then 401'd for good.
+        Profile {
+            id: "spotify".into(),
+            title: "Spotify Web API".into(),
+            vendor: "Spotify".into(),
+            summary: "Search, artists, albums, tracks, shows and episodes — the public catalogue."
+                .into(),
+            default_name: "spotify".into(),
+            credential: Credential {
+                about: "an app's Client Secret — the Client ID goes beside it as `--var client_id=…`"
+                    .into(),
+                url: "https://developer.spotify.com/dashboard".into(),
+            },
+            vars: vec![v(
+                "client_id",
+                "the app's Client ID, off the same dashboard page as the secret. Public by \
+                 design — it identifies the app rather than authenticating it, so it goes in \
+                 the file in the clear.",
+                None,
+            )],
+            service: Service::Http {
+                base_url: "https://api.spotify.com".into(),
+                auth: AuthTemplate::Oauth2ClientCredentials {
+                    // Spotify documents the Basic-header spelling of RFC 6749
+                    // §2.3.1 and accepts the form-body one, which is what
+                    // `credentials::fetch_client_credentials` sends for every
+                    // provider. Written down because the docs read as if only
+                    // the header works.
+                    token_url: "https://accounts.spotify.com/api/token".into(),
+                    client_id_var: "client_id".into(),
+                },
+            },
+            access: vec![
+                access(
+                    "catalogue",
+                    "the catalogue an app-only token can actually read",
+                    &[],
+                    vec![rule(
+                        "reads",
+                        &["GET"],
+                        &[
+                            "/v1/search",
+                            "/v1/artists/**",
+                            "/v1/albums/**",
+                            "/v1/tracks/**",
+                            "/v1/shows/**",
+                            "/v1/episodes/**",
+                            "/v1/audiobooks/**",
+                            "/v1/chapters/**",
+                            // The two browse endpoints that survived the 2024
+                            // restrictions; `featured-playlists` and
+                            // `categories/*/playlists` did not, so `/v1/browse/**`
+                            // here would be a level that grants what the vendor
+                            // refuses.
+                            "/v1/browse/categories",
+                            "/v1/browse/categories/*",
+                            "/v1/markets",
+                        ],
+                        "allow",
+                    )],
+                ),
+                access(
+                    "read",
+                    "every GET, including the endpoints Spotify has since retired",
+                    &[],
+                    vec![rule("reads", &["GET"], &["/v1/**"], "allow")],
+                ),
+            ],
+            // No write level, and that is the scheme rather than caution: a
+            // client-credentials token belongs to the app and to no listener,
+            // so there is nothing it may write. Saying so here is the only
+            // place an operator finds out before an agent does.
+            note: Some(
+                "App-only. The client-credentials grant reaches the public catalogue and \
+                 nothing belonging to a person: `/v1/me/**`, playlists, the library and \
+                 playback need a listener's authorization-code grant with a refresh token, \
+                 which this proxy does not perform — those calls come back 401 from Spotify, \
+                 not denied by the ACL. Spotify also retired several catalogue endpoints for \
+                 apps created after 27 November 2024 — audio features, audio analysis, \
+                 recommendations, related artists and the featured/category playlist lists — \
+                 and refuses them for a perfectly good token, which is why they are outside \
+                 the `catalogue` level rather than inside it."
+                    .into(),
+            ),
+            // A GET, free, on every plan, and one an app-only token is entitled
+            // to — which rules out anything under `/v1/me`. It answers 401 for
+            // a bad credential rather than an empty 200, so it can tell the two
+            // apart.
+            probe: Some("/v1/markets".into()),
+        },
     ];
 
     // Cloudflare ships a remote MCP server per product area, and "full coverage"
@@ -2281,6 +2405,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Spotify issues no long-lived API key: every call carries an OAuth
+    /// access token that expires within the hour. So the profile has to enrol
+    /// the scheme that *mints* one — a `bearer` profile would have written a
+    /// credential that worked when it was added and 401'd for good by the time
+    /// an agent used it, which is the failure a profile exists to prevent.
+    #[test]
+    fn spotify_enrols_the_grant_that_mints_its_token() {
+        let spotify = get("spotify").unwrap();
+        let vars = BTreeMap::from([("client_id".to_string(), "1a2b3c".to_string())]);
+        let auth = build_auth(
+            &spotify.service,
+            "op://Private/Spotify/secret",
+            &vars,
+            &spotify.default_access().scopes,
+        )
+        .unwrap();
+        let AuthSpec::Oauth2ClientCredentials {
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+            ..
+        } = auth
+        else {
+            panic!("spotify must enrol as the client-credentials grant");
+        };
+        assert_eq!(token_url, "https://accounts.spotify.com/api/token");
+        // The client id identifies the app rather than authenticating it, so
+        // it is a `--var` in the clear and only the secret is a reference.
+        assert_eq!(client_id, "1a2b3c");
+        assert_eq!(client_secret, "op://Private/Spotify/secret");
+        assert_eq!(scope, None, "the app-only grant asks for no scopes");
+    }
+
+    /// What the grant can reach, written down as the ACL rather than found out
+    /// as a 401 or a 403.
+    ///
+    /// A client-credentials token belongs to the app and to no listener, so
+    /// there is nothing it may write and no user data it may read — and
+    /// Spotify refuses several catalogue endpoints outright for apps
+    /// registered after November 2024. The default level names what survived
+    /// both, so the policy does not grant what the vendor will not serve.
+    #[test]
+    fn spotifys_default_level_is_what_an_app_only_token_can_actually_read() {
+        let spotify = get("spotify").unwrap();
+        let default = spotify.default_access();
+        assert_eq!(default.name, "catalogue");
+
+        let paths: Vec<&str> = default
+            .rules
+            .iter()
+            .flat_map(|rule| rule.paths.iter().map(String::as_str))
+            .collect();
+        assert!(paths.contains(&"/v1/search"));
+        for wider in ["/v1/**", "/v1/browse/**"] {
+            assert!(
+                !paths.contains(&wider),
+                "`{wider}` would grant the endpoints Spotify itself refuses"
+            );
+        }
+        assert!(
+            default.rules.iter().all(|rule| rule.methods == ["GET"]),
+            "an app-only token may write nothing, so no rule here names a write"
+        );
+        assert!(
+            spotify.access.iter().all(|level| level.name != "write"),
+            "a `write` level would be a level that cannot work"
+        );
+
+        // The two things an operator would otherwise find out from a 401: the
+        // limit, and a probe that can tell a bad credential from a bad plan.
+        assert_eq!(spotify.probe.as_deref(), Some("/v1/markets"));
+        let note = spotify.note.as_deref().expect("the limit is written down");
+        assert!(note.contains("/v1/me/**"), "{note}");
     }
 
     #[test]

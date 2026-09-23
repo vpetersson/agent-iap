@@ -606,6 +606,67 @@ async fn every_mcp_profile_admits_the_handshake_it_would_otherwise_deny() {
     }
 }
 
+/// What a Spotify app-only grant may and may not do, decided by the ACL the
+/// profile writes rather than discovered as a status code.
+///
+/// The client-credentials token belongs to the app and to no listener, and
+/// Spotify refuses several catalogue endpoints outright for apps registered
+/// after November 2024. Neither is visible in a base URL, so the default level
+/// names the endpoints that work — and a rule that granted `/v1/**` would be a
+/// policy promising what the vendor will not serve.
+#[test]
+fn spotifys_default_grant_covers_the_catalogue_and_nothing_personal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iap.toml");
+    agent_iap::init::init(&agent_iap::init::InitOptions {
+        path: path.clone(),
+        agent: "a".into(),
+        secret: None,
+        template: agent_iap::init::Template::Minimal,
+        force: true,
+    })
+    .unwrap();
+
+    let profile = profiles::get("spotify").unwrap();
+    let mut opts = options("op://Private/Spotify/secret");
+    opts.vars = vec!["client_id=1a2b3c".into()];
+    profiles::add(&path, &profile, &opts).unwrap();
+
+    let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config.validate().unwrap();
+    let acl = agent_iap::acl::Acl::compile(&config).unwrap();
+    let allowed = |method: &str, request_path: &str| {
+        acl.evaluate(&agent_iap::acl::AccessRequest {
+            agent: "a".into(),
+            kind: agent_iap::acl::Kind::Http,
+            target: "spotify".into(),
+            method: method.into(),
+            path: request_path.into(),
+        })
+        .action
+            == agent_iap::config::Action::Allow
+    };
+
+    assert!(allowed("GET", "/v1/search"));
+    assert!(allowed("GET", "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF"));
+    assert!(
+        allowed("GET", "/v1/markets"),
+        "the probe has to be callable"
+    );
+
+    // A listener's own account, which this grant simply does not reach.
+    assert!(!allowed("GET", "/v1/me"));
+    assert!(!allowed("GET", "/v1/me/player"));
+    // Restricted by Spotify for apps registered after November 2024, so the
+    // level leaves them out rather than granting a 403.
+    assert!(!allowed("GET", "/v1/audio-features/0OdUWJ0sBjDrqHygGUXeCF"));
+    assert!(!allowed("GET", "/v1/recommendations"));
+    assert!(!allowed("GET", "/v1/browse/featured-playlists"));
+    // And nothing writes: there is no method on this token that could.
+    assert!(!allowed("POST", "/v1/search"));
+    assert!(!allowed("PUT", "/v1/me/player/play"));
+}
+
 #[test]
 fn every_profile_produces_a_policy_file_the_proxy_would_load() {
     // A profile is only useful if what it writes survives the same `validate()`
