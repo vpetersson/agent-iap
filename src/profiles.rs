@@ -2187,7 +2187,12 @@ pub fn catalog() -> Vec<Profile> {
                  and whether it has been blocked or disabled. Read the verdict carefully: \
                  xAI answers a wrong key with `400 invalid-argument` rather than a 401, so \
                  a rejected credential is reported as `http error` and not as `rejected`. \
-                 It is still not a pass, and the status is in the detail line. Image and \
+                 It is still not a pass, and the status is in the detail line. A \
+                 Zero Data Retention team cannot use the two paths the `results` rule \
+                 allows: `deferred` is refused with a 400 naming ZDR, `store` comes back \
+                 `false` however it was sent, and reading a response by id is a 404. The \
+                 rule stays because ZDR is a property of the team rather than of the API, \
+                 but on one of those teams it is a rule that never matches. Image and \
                  video generation bill per asset and are reachable only at `--access all`. \
                  The base URL is the global endpoint; `https://us.api.x.ai` pins request \
                  handling and inference to the United States, and is an edit to `base_url` \
@@ -2612,12 +2617,13 @@ mod tests {
         assert_eq!(xai.probe.as_deref(), Some("/v1/api-key"));
         assert!(paths.contains(&"/v1/api-key"));
 
-        // The two limits no rule here can fix, written down rather than met
-        // as a 403 on a call the ACL said yes to, or read off a `verify`
-        // verdict that is milder than what happened.
+        // The limits no rule here can fix, written down rather than met as a
+        // 403 on a call the ACL said yes to, a `verify` verdict milder than
+        // what happened, or a `results` rule that silently never matches.
         let note = xai.note.as_deref().expect("the limits are written down");
         assert!(note.contains("403"), "{note}");
         assert!(note.contains("400"), "{note}");
+        assert!(note.contains("Zero Data Retention"), "{note}");
     }
 
     #[test]
