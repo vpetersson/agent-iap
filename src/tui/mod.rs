@@ -1990,6 +1990,15 @@ impl App {
             Span::raw(format!("  proxy {}  ", self.state.config().server.listen)),
             Span::styled(format!("  {waiting} waiting  "), pending_style),
         ];
+        // Dim, and one field wide: nobody needs it until a fix is reported to
+        // have landed, and then it is the first thing to establish (SIRI-205).
+        // `?` carries the whole version string.
+        if let Some(commit) = crate::short_commit() {
+            spans.insert(
+                1,
+                Span::styled(format!(" {commit} "), Style::default().fg(Color::DarkGray)),
+            );
+        }
         // Loud, and for as long as it is on: a flash fades after eight
         // seconds and lockdown does not, so without this the state in which
         // every request is being refused looks exactly like the state in
@@ -2695,6 +2704,13 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
             Span::raw(what),
         ]));
     }
+    lines.push(Line::raw(""));
+    // The whole string rather than the header's seven characters: this is the
+    // line somebody copies into a bug report (SIRI-205).
+    lines.push(Line::from(Span::styled(
+        format!("  agent-iap {}", crate::version()),
+        Style::default().fg(Color::DarkGray),
+    )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Everything written here is in force before you look away — rules, agents, \

@@ -27,7 +27,10 @@ use agent_iap::verify;
 #[derive(Parser)]
 #[command(
     name = "agent-iap",
-    version,
+    // The commit and the build date, not just the version: with no tagged
+    // release, every install is somebody's own build, and `2026.9.0` cannot
+    // tell two of them apart. See `agent_iap::version`.
+    version = agent_iap::version(),
     about = "Identity-aware proxy for LLM agents — authenticated, ACL-gated, audited access to APIs and MCP servers without handing over the credential."
 )]
 struct Cli {
@@ -1782,6 +1785,10 @@ async fn run(
     };
 
     if !console.draws() {
+        // First line, before anything about the policy: when a fix is reported
+        // to have landed, "which build is this?" is the first question and it
+        // used to have no answer (SIRI-205).
+        eprintln!("agent-iap {}", agent_iap::version());
         eprintln!(
             "agent-iap listening on {}://{listen} — {} agents, {} rules, default {}",
             proxy_scheme,
@@ -2026,6 +2033,11 @@ fn list_config(path: &Path, options: &ListOptions, output: OutputArg) -> Result<
 }
 
 fn check(path: &Path) -> Result<()> {
+    // Before anything that can fail. This is the command an operator runs when
+    // they are working out why something behaves the way it does, and "which
+    // build is this?" is most worth answering on the run that goes wrong
+    // (SIRI-205).
+    println!("build       {}", agent_iap::version());
     let config = Config::load(path)?;
     println!("config      {}", path.display());
     println!(
@@ -2207,6 +2219,9 @@ fn check(path: &Path) -> Result<()> {
         );
     }
 
+    // Said by the command an operator runs when they are trying to work out
+    // why something behaves the way it does — which is exactly when the build
+    // they are running matters.
     println!("\nconfig is valid.");
     Ok(())
 }

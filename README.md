@@ -1606,6 +1606,21 @@ the binary changed between runs: the app authorizes the calling program, and a
 rebuilt `./target/debug/agent-iap` is not the program it was asked about last
 time.
 
+#### Which build am I running?
+
+```shell
+agent-iap --version
+# agent-iap 2026.9.0 (aabbe24c6bf4, built 2026-09-23)
+```
+
+The commit, and a `-modified` suffix when the tree it was built from had
+uncommitted edits. There is no tagged release yet, so every install is a build
+somebody made, and the version number alone is the same string for all of them
+— which makes "this is fixed on master" and "the binary in front of me has the
+fix" two different claims that used to be indistinguishable. `check` prints it
+before anything that can fail, the headless banner prints it at startup, and the
+console shows the short commit in its header and the whole string under `?`.
+
 ### TLS
 
 `[server.tls]` puts the proxy on HTTPS. Absent, it speaks plain HTTP exactly as
