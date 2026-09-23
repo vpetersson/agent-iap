@@ -119,7 +119,18 @@ fn preload_secrets(config: &Config, resolver: &SecretResolver, fresh: bool) -> R
     // actually failed. Blaming 1Password for an unset environment variable
     // sends the operator to sign into a vault this config never mentions —
     // and `op` is never even invoked unless a reference asks for it.
+    //
+    // And when 1Password declined to answer at all, say that instead of asking
+    // whether `op` is signed in: it may well be, and the operator who has just
+    // dismissed an authorization dialogue is owed the connection between the
+    // two. One dialogue is all this read raises however many references failed,
+    // so "try again and approve it" is a complete instruction (SIRI-205).
     let hint = if failures
+        .iter()
+        .any(|(_, error)| crate::secrets::is_authorization_failure(error))
+    {
+        " — 1Password did not authorize the read. Unlock it, try again, and approve the prompt"
+    } else if failures
         .iter()
         .any(|(reference, _)| matches!(SecretRef::parse(reference), Ok(SecretRef::OnePassword(_))))
     {
@@ -837,6 +848,37 @@ stderr = false
 
         assert!(!error.contains("op"), "{error}");
         assert!(error.contains("is not set"), "{error}");
+    }
+
+    /// "Is `op` signed in?" is the wrong question to ask somebody who has just
+    /// dismissed an authorization dialogue. It usually is signed in; what
+    /// happened is that they said no, and nothing connected the two for them.
+    #[cfg(unix)]
+    #[test]
+    fn a_dismissed_prompt_is_reported_as_one_rather_than_as_a_sign_in_problem() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let op = dir.path().join("op");
+        std::fs::write(
+            &op,
+            "#!/bin/sh\n\
+             echo 'error initializing client: authorization prompt dismissed' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = config_with(&["op://Private/one/password", "op://Private/two/password"]);
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+        let error = preload_secrets(&config, &resolver, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("did not authorize"), "{error}");
+        assert!(
+            !error.contains("is `op` signed in?"),
+            "it very likely is: {error}"
+        );
     }
 
     #[test]

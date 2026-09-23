@@ -449,13 +449,34 @@ fn mcp_row(server: &McpServerConfig, scope: Option<&Scope>) -> McpRow {
 /// Every credential reference in the file, in the order an operator would
 /// look for them: the proxy's own, then the agents, then the services.
 fn credential_rows(config: &Config, scope: Option<&Scope>) -> Vec<CredentialRow> {
+    credential_sites_scoped(config, scope)
+        .into_iter()
+        .map(|(owner, field, reference)| CredentialRow {
+            owner,
+            field,
+            reference: display_ref(&reference),
+        })
+        .collect()
+}
+
+/// Every place the policy file names a credential: what holds it, the field it
+/// fills, and the reference *as written*.
+///
+/// The same walk `list credentials` prints, without the masking — `display_ref`
+/// hides a `literal:` value, which is right for a terminal and wrong for
+/// anything that has to act on the reference. `secret import` is the caller
+/// that has to act on it.
+pub fn credential_sites(config: &Config) -> Vec<(String, String, String)> {
+    credential_sites_scoped(config, None)
+}
+
+fn credential_sites_scoped(
+    config: &Config,
+    scope: Option<&Scope>,
+) -> Vec<(String, String, String)> {
     let mut rows = Vec::new();
     let mut push = |owner: String, field: &str, reference: &str| {
-        rows.push(CredentialRow {
-            owner,
-            field: field.to_string(),
-            reference: display_ref(reference),
-        });
+        rows.push((owner, field.to_string(), reference.to_string()));
     };
 
     // The proxy's own credentials are credentials too, and the ones most

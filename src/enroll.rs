@@ -1589,6 +1589,78 @@ fn append(document: &mut DocumentMut, key: &str, entry: Table) {
     }
 }
 
+/// Point every reference named on the left at the spelling on the right,
+/// wherever the policy file holds it — and keep the file otherwise as written.
+///
+/// What `secret import` does after it has read the values: a policy full of
+/// `op://` becomes a policy full of `iap://`, with the comments, the ordering
+/// and the formatting it had before, because this is somebody's committed file
+/// and a rewrite through `toml::to_string` would hand it back unrecognisable.
+///
+/// Every *string value* in the document that matches gets repointed, rather
+/// than a list of the fields a credential is allowed to appear in. Those two
+/// are the same set today, and the second one goes stale the first time a
+/// scheme grows a field — a credential left pointing at a vault the operator
+/// has finished with is exactly the failure this command exists to end.
+/// Nothing but a credential reference is ever an `op://` string in this file.
+pub fn repoint_references(path: &Path, moves: &[(String, String)]) -> Result<usize> {
+    let mut document = read(path)?;
+    let mut moved = 0;
+    repoint_item(document.as_item_mut(), moves, &mut moved);
+    save(path, document)?;
+    Ok(moved)
+}
+
+fn repoint_item(item: &mut Item, moves: &[(String, String)], moved: &mut usize) {
+    match item {
+        Item::Value(value) => repoint_value(value, moves, moved),
+        Item::Table(table) => {
+            for (_, item) in table.iter_mut() {
+                repoint_item(item, moves, moved);
+            }
+        }
+        Item::ArrayOfTables(tables) => {
+            for table in tables.iter_mut() {
+                for (_, item) in table.iter_mut() {
+                    repoint_item(item, moves, moved);
+                }
+            }
+        }
+        Item::None => {}
+    }
+}
+
+fn repoint_value(value: &mut Value, moves: &[(String, String)], moved: &mut usize) {
+    match value {
+        Value::String(text) => {
+            // Trimmed on both sides of the comparison for the same reason the
+            // resolver trims: the space around a reference is a typo, and a
+            // file written with one still names the credential being moved.
+            let Some((_, to)) = moves
+                .iter()
+                .find(|(from, _)| from.trim() == text.value().trim())
+            else {
+                return;
+            };
+            let decor = text.decor().clone();
+            *value = Value::from(to.as_str());
+            *value.decor_mut() = decor;
+            *moved += 1;
+        }
+        Value::Array(array) => {
+            for value in array.iter_mut() {
+                repoint_value(value, moves, moved);
+            }
+        }
+        Value::InlineTable(table) => {
+            for (_, value) in table.iter_mut() {
+                repoint_value(value, moves, moved);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Validate before writing, and write whole: a half-written policy file is a
 /// proxy that will not restart.
 fn save(path: &Path, document: DocumentMut) -> Result<()> {
