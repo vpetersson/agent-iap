@@ -4,8 +4,13 @@
 //!
 //! So these tests do not assert on TOML. They build a policy the way an
 //! operator would, run a real proxy in front of a mock upstream, revoke, and
-//! ask the proxy. They also pin the caveat every one of those commands prints:
-//! the proxy already running is not the one that read the edit.
+//! ask the proxy.
+//!
+//! What they deliberately do *not* start is the watcher, so the proxy here is
+//! one that read the file once and will never read it again — the worst case,
+//! and the one that isolates the load path from the reload path. That a real
+//! daemon picks the same edit up in about a second, without the restart, is
+//! `live_reload_e2e.rs`.
 
 use agent_iap::config::Config;
 use agent_iap::enroll::{self, AuthSpec};
@@ -83,8 +88,8 @@ fn policy(dir: &Path, upstream: SocketAddr) -> (PathBuf, String) {
     (path, agent.token)
 }
 
-/// Start a proxy from the file as it stands. Calling this twice is the restart
-/// the removal commands tell the operator they are waiting for.
+/// Start a proxy from the file as it stands, with nothing watching it. Calling
+/// this twice is a restart.
 async fn serve(path: &Path, audit: PathBuf) -> SocketAddr {
     let mut config: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     config.audit.path = audit;
@@ -145,10 +150,13 @@ async fn a_revoked_agent_is_a_stranger_after_the_restart() {
     );
 }
 
-/// The other half of the same claim, and the reason every one of these commands
-/// prints a restart notice: the process already running read the file once.
+/// The other half of the same claim, against a proxy with nothing watching its
+/// policy file: revocation is an edit to a file, and an edit to a file is worth
+/// nothing to a process that is not going to read it again. A real daemon is —
+/// see `live_reload_e2e::an_agent_removed_from_the_file_stops_immediately_mid_session`
+/// — which is why the commands that write this edit no longer say "restart".
 #[tokio::test]
-async fn the_proxy_already_running_keeps_honouring_the_revoked_token() {
+async fn a_proxy_that_never_re_reads_keeps_honouring_the_revoked_token() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = spawn_upstream().await;
     let (path, token) = policy(dir.path(), upstream);
@@ -161,8 +169,8 @@ async fn the_proxy_already_running_keeps_honouring_the_revoked_token() {
     assert_eq!(
         call(running, &token).await,
         (200, "allow".into()),
-        "if this ever fails there is a reload, and the notice these commands \
-         print is the thing to update"
+        "this proxy has no watcher, so the only thing that could have applied \
+         the edit is something reading the file behind the load path"
     );
 }
 

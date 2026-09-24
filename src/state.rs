@@ -72,6 +72,22 @@ pub struct Reloaded {
     pub why: crate::reload::Trigger,
 }
 
+/// The shape of a policy in numbers, for the audit log.
+///
+/// Both halves of a reload are measured off a `Config` rather than one off the
+/// file and the other off the live registries, so that `before` and `after` are
+/// the same measurement taken twice and any difference between them is a
+/// difference in the policy.
+fn census(config: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "agents": config.agents.len(),
+        "upstreams": config.upstreams.len(),
+        "mcp_servers": config.mcp_servers.len(),
+        "acl_rules": config.acl.len(),
+        "acl_default": config.acl_default.action.to_string(),
+    })
+}
+
 fn timeouts_changed(current: &Config, edited: &Config) -> bool {
     current.server.upstream_timeout_secs != edited.server.upstream_timeout_secs
         || current.server.upstream_connect_timeout_secs
@@ -289,6 +305,12 @@ impl AppState {
         };
 
         // 2. Nothing below here can fail.
+        //
+        // Counted before anything is installed, because the audit record below
+        // is the only place the *size* of a policy change is ever written down
+        // and "4 agents" on its own does not say whether one was added or
+        // sixteen were removed.
+        let before = census(&current);
         self.acl.install(rules);
         self.agents.install(roster);
         if let Some(http) = http {
@@ -328,12 +350,13 @@ impl AppState {
         let mut record = AuditRecord::new("proxy", "reload");
         record.target = self.config.read().server.listen.to_string();
         record.decision = Some(why.as_str().to_string());
+        // Where it is knowable. A signal and an edited file arrive with no
+        // identity attached; a control-plane reload arrives from an address.
+        record.client = why.by();
         record.detail = Some(serde_json::json!({
-            "agents": config.agents.len(),
-            "upstreams": config.upstreams.len(),
-            "mcp_servers": config.mcp_servers.len(),
-            "acl_rules": config.acl.len(),
-            "acl_default": config.acl_default.action.to_string(),
+            "trigger": why.as_str(),
+            "before": before,
+            "after": census(&config),
         }));
         self.audit.write_best_effort(record);
 

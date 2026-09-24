@@ -1767,7 +1767,7 @@ async fn run(
         Some(addr) => {
             let listener = Listener::bind(
                 addr,
-                agent_iap::admin::router(Arc::clone(&state)),
+                agent_iap::admin::router_with_reload(Arc::clone(&state), Arc::clone(&watcher)),
                 tls.admin,
             )
             .context("binding the control plane")?;
@@ -1838,7 +1838,8 @@ async fn run(
 
     if !console.draws() {
         eprintln!(
-            "watching {} — edit it, or send SIGHUP, and this picks it up without a restart",
+            "watching {} — edit it, send SIGHUP, or POST /reload to the control plane, \
+             and this picks it up without a restart",
             watcher.path().display()
         );
     }
@@ -1864,7 +1865,7 @@ async fn run(
             result = drawn(&mut drawing) => return result,
             _ = tokio::signal::ctrl_c() => return Ok(()),
             Ok(reloaded) = reloads.recv() => {
-                if let Err(error) = adopt(&state, &reloaded, &mut proxy, &mut admin).await {
+                if let Err(error) = adopt(&state, &watcher, &reloaded, &mut proxy, &mut admin).await {
                     // The policy itself is already in force; only the sockets
                     // did not follow. Loud, and not fatal — killing a proxy
                     // that is serving correctly because it could not move to a
@@ -1899,6 +1900,7 @@ async fn drawn(drawing: &mut Option<tokio::task::JoinHandle<Result<()>>>) -> Res
 /// leaving the proxy listening on nothing at all.
 async fn adopt(
     state: &Arc<AppState>,
+    watcher: &Arc<Watcher>,
     reloaded: &agent_iap::state::Reloaded,
     proxy: &mut Listener,
     admin: &mut Option<Listener>,
@@ -1931,7 +1933,7 @@ async fn adopt(
                 &mut listening,
                 addr,
                 tls.admin,
-                || agent_iap::admin::router(Arc::clone(state)),
+                || agent_iap::admin::router_with_reload(Arc::clone(state), Arc::clone(watcher)),
                 "control plane",
             )
             .await?;
@@ -1940,8 +1942,12 @@ async fn adopt(
         // Turned on while running.
         (Some(addr), None) => {
             *admin = Some(
-                Listener::bind(addr, agent_iap::admin::router(Arc::clone(state)), tls.admin)
-                    .context("binding the control plane")?,
+                Listener::bind(
+                    addr,
+                    agent_iap::admin::router_with_reload(Arc::clone(state), Arc::clone(watcher)),
+                    tls.admin,
+                )
+                .context("binding the control plane")?,
             );
             tracing::info!(%addr, "control plane opened");
         }
@@ -2578,14 +2584,22 @@ fn report_removal(removal: &enroll::Removal, subject: &str) {
 
 /// What an edit made from a shell costs before it is in force.
 ///
-/// A console attached to the running proxy watches the policy file and adopts
-/// the whole of it — rules, agents, services, credentials, the listeners. With
-/// no console there is nothing reading the file, and an operator who has just
-/// revoked a leaked token is exactly the person who must not assume otherwise.
+/// Any running proxy watches its own policy file — the daemon does it whether
+/// or not a console is attached — and adopts the whole of it: rules, agents,
+/// services, credentials, the listeners. So the honest answer is "about a
+/// second", not "at the next restart", and saying otherwise sends the operator
+/// who has just revoked a leaked token to restart a proxy twenty other agents
+/// are using, for nothing.
+///
+/// The second sentence is for the operator who needs to *know*, rather than
+/// expect: an edit is picked up once the file has held still, and there are two
+/// ways to stop waiting and be told.
 fn reload_notice(consequence: &str) {
+    println!("\nThe running proxy picks this up within a second; until then {consequence}.");
     println!(
-        "\nA console on the running proxy picks this up within a second. Without one, it \
-         takes effect at the next restart — until then {consequence}."
+        "To apply it now: `systemctl reload agent-iap` (or `kill -HUP`), or \
+         `curl -X POST -H \"Authorization: Bearer $(cat <state-dir>/admin-token)\" \
+         <admin_listen>/reload`, which answers with the policy now in force."
     );
 }
 

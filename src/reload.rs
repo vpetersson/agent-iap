@@ -7,12 +7,18 @@
 //! attached, and a reload that only worked where somebody was watching would be
 //! a reload for the case that needed it least.
 //!
-//! Two triggers, and they are the same code path:
+//! Three triggers, and they are the same code path:
 //!
 //! - the file changing on disk, which is what `agent-iap acl add` and an editor
 //!   both do, and what a human expects to be enough;
 //! - `SIGHUP`, which is what every other daemon on the box answers to, and the
-//!   one thing a config-management tool knows how to send after it writes.
+//!   one thing a config-management tool knows how to send after it writes;
+//! - `POST /reload` on the control plane, which is the one that works where a
+//!   signal does not: a container whose PID 1 is not this process, a proxy on
+//!   another host, a deploy script that already holds the admin token and has
+//!   no shell on the box to `kill -HUP` from. It also, unlike the other two,
+//!   answers — a script learns whether the policy it just wrote was accepted
+//!   instead of having to go and read the log.
 //!
 //! They differ in one thing, and `Trigger::rereads_credentials` is where that
 //! is argued: `SIGHUP` says *read it all again*, and a file that merely changed
@@ -24,6 +30,7 @@
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -79,6 +86,11 @@ pub enum Trigger {
     /// A write the console just made, which reloads itself so that a rule
     /// granted from the approval dialogue governs the next call.
     Wrote,
+    /// `POST /reload`, from the address that asked. The address is as much of
+    /// "who" as this process can honestly know — the caller proved it holds the
+    /// admin token and nothing more — and it is worth more in the audit log
+    /// than knowing only that somebody did.
+    ControlPlane(Option<SocketAddr>),
 }
 
 impl Trigger {
@@ -88,6 +100,15 @@ impl Trigger {
             Trigger::Signal => "sighup",
             Trigger::Asked => "asked",
             Trigger::Wrote => "wrote",
+            Trigger::ControlPlane(_) => "control_plane",
+        }
+    }
+
+    /// Who asked, where that is known at all. Only the control plane can say.
+    pub fn by(self) -> Option<String> {
+        match self {
+            Trigger::ControlPlane(from) => from.map(|addr| addr.to_string()),
+            _ => None,
         }
     }
 
@@ -98,8 +119,10 @@ impl Trigger {
     /// file — nothing about the bytes says the value moved — so the only honest
     /// answer is to read it again, and the only honest moment to do that is
     /// when somebody said so. `SIGHUP` is what a config-management tool sends
-    /// after writing a renewed certificate or a rotated key, and `r` is an
-    /// operator asking for exactly this; both re-read everything.
+    /// after writing a renewed certificate or a rotated key, `POST /reload` is
+    /// the same instruction from the same tool where signals are awkward, and
+    /// `r` is an operator asking for exactly this; all three re-read
+    /// everything.
     ///
     /// The other two did not ask. A watched file that changed and a rule the
     /// console just wrote are both usually `[[acl]]` edits, which say nothing
@@ -109,7 +132,7 @@ impl Trigger {
     /// ones this process has never resolved.
     pub fn rereads_credentials(self) -> bool {
         match self {
-            Trigger::Signal | Trigger::Asked => true,
+            Trigger::Signal | Trigger::Asked | Trigger::ControlPlane(_) => true,
             Trigger::Edited | Trigger::Wrote => false,
         }
     }
