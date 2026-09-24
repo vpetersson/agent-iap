@@ -1313,7 +1313,17 @@ agent-iap acl add --name migration-window …   # the file changed; picked up
 $EDITOR /etc/agent-iap/iap.toml               # same
 systemctl reload agent-iap                    # SIGHUP, for the impatient
 kill -HUP "$MAINPID"                          # and what that actually sends
+curl -sf -X POST -H "Authorization: Bearer $TOKEN" \
+     localhost:8081/reload                    # the same thing, over the network
 ```
+
+`POST /reload` on the control plane (§ Control plane) is the one that works
+where a signal does not — a container whose PID 1 is not the proxy, a host you
+are deploying to rather than sitting on, a script that already holds the admin
+token. It is also the only trigger that *answers*: it returns what the policy
+became, or `422` and the reason it was refused, so a deploy learns on the spot
+whether the file it just wrote was accepted instead of finding out from the
+first agent that gets a 401.
 
 A changed file has to hold still for 250ms before it is read: a rewrite is a
 truncate and then a write, and in between the file is half a policy. `SIGHUP`
@@ -1339,9 +1349,12 @@ So: rotate a credential in place, then `systemctl reload agent-iap` (or press
 `r`). Repoint a reference at something else and the edit alone is enough.
 
 Every reload is written to the audit log as a `reload` record naming which of
-the four caused it — `edited`, `sighup`, `asked`, `wrote` — and what the policy
-became; a rule appearing ten seconds before a call it allowed is something the
-log should be able to show you.
+the five caused it — `edited`, `sighup`, `asked`, `wrote`, `control_plane`, the
+last with the address it came from — and carrying `before` and `after` counts of
+agents, upstreams, MCP servers and rules. A rule appearing ten seconds before a
+call it allowed is something the log should be able to show you, and so is an
+agent count dropping by six. A refused reload writes no record, because nothing
+changed.
 
 One thing this does not do: the signing key behind § Workload identity is not
 rotated, because that would invalidate every token already handed out — a
@@ -2397,7 +2410,19 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/status
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/pending
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/decide \
      -d '{"verdict":"allow","remember":true}' -H 'content-type: application/json'
+curl -s -X POST -H "Authorization: Bearer $TOKEN" localhost:8081/reload
 ```
+
+`POST /reload` re-reads the policy file — the scriptable half of § Reloading. It
+answers `200` with the policy now in force:
+
+```json
+{"ok":true,"serving":{"agents":4,"upstreams":3,"mcp_servers":1,"acl_rules":11,"acl_default":"deny"}}
+```
+
+and `422` with the reason, and the policy *still* in force, when the file on
+disk cannot be served. Nothing is swapped in that case, so a deploy script can
+treat a non-2xx as "my edit did not land" and leave a working proxy alone.
 
 Polling `/pending` counts as watching the queue for 30 seconds, so `curl` alone
 can answer an `ask` without the TUI. With nobody watching, `ask` denies
@@ -2476,8 +2501,9 @@ Two things worth knowing before the first restart:
 
 There is no console: `--no-tui` logs to the journal and an `ask` is answered over
 the control plane (§ Control plane) or denied. The daemon watches its own policy
-file and answers `SIGHUP` either way, so `systemctl reload` is a reload and not
-a restart (§ Reloading). A rule set that is entirely `allow`/`deny` needs no
+file, answers `SIGHUP`, and takes a `POST /reload` either way, so `systemctl
+reload` — or a deploy that only has the control plane to talk to — is a reload
+and not a restart (§ Reloading). A rule set that is entirely `allow`/`deny` needs no
 answerer; one that uses `ask` needs something watching, or those calls fail
 closed.
 

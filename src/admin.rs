@@ -7,13 +7,14 @@
 //! authority, whether a JSON-RPC call may proceed, so policy and audit never
 //! fork across processes.
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::acl::{AccessRequest, Kind};
@@ -21,24 +22,69 @@ use crate::approval::{AskingRule, PendingView, Verdict};
 use crate::audit::AuditRecord;
 use crate::config::Action;
 use crate::identity::agent_may_address;
+use crate::reload::{Trigger, Watcher};
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    build(state, None)
+}
+
+/// The daemon's control plane: everything `router` has, and `POST /reload`.
+///
+/// The reload route is the one thing here that needs something outside
+/// `AppState` — the watcher owns the policy file's path, the command-line
+/// overrides to re-apply on top of it, and the mark that stops the file poller
+/// reloading the same edit a second time. Anything holding one can offer the
+/// route; anything that is not the daemon (a test, an embedder) gets a control
+/// plane without it rather than one that 500s.
+pub fn router_with_reload(state: Arc<AppState>, watcher: Arc<Watcher>) -> Router {
+    build(state, Some(watcher))
+}
+
+fn build(state: Arc<AppState>, watcher: Option<Arc<Watcher>>) -> Router {
     // Operator routes authenticate in a `route_layer`, not in the handlers.
     // Handler-body checks run *after* axum has already run the extractors, so
     // `POST /decide` with a bad body used to answer an anonymous caller with a
     // deserialization error naming the fields it expected — the body was parsed
     // before anyone asked who was calling. A layer runs first, so an unproven
     // caller gets 401 and nothing else.
-    let operator = Router::new()
+    let mut operator = Router::new()
         .route("/status", get(status))
         .route("/pending", get(pending))
         .route("/decide", post(decide))
-        .route("/events", get(events))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_admin,
-        ));
+        .route("/events", get(events));
+
+    if let Some(watcher) = watcher {
+        operator = operator.route(
+            "/reload",
+            // A closure rather than a plain handler, because this is the one
+            // route whose dependency is not in `AppState`; the watcher is
+            // captured instead of extracted.
+            post(
+                move |state: State<Arc<AppState>>, request: axum::extract::Request| {
+                    let watcher = Arc::clone(&watcher);
+                    async move {
+                        // Read from the extensions rather than extracted: a
+                        // control plane served without `ConnectInfo` — a test, a
+                        // unix socket — should still reload, and just not be able
+                        // to say from where.
+                        let from = request
+                            .extensions()
+                            .get::<ConnectInfo<SocketAddr>>()
+                            .map(|info| info.0);
+                        reload(state.0, watcher, from).await
+                    }
+                },
+            ),
+        );
+    }
+
+    // Applied after the routes are added, so `/reload` is behind the same gate
+    // as the rest: re-reading the policy file is an operator's business.
+    let operator = operator.route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        require_admin,
+    ));
 
     // These two are the MCP bridge's, and authenticate as an *agent*; they do
     // their own check because the credential is a different one.
@@ -166,6 +212,88 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         workload_tokens: state.workload.active_count(),
     })
     .into_response()
+}
+
+/// What a policy looks like from outside, which is what `POST /reload` answers
+/// with — before and after, so a deploy script can see what its edit did
+/// without going and reading the audit log.
+#[derive(Serialize)]
+struct Census {
+    agents: usize,
+    upstreams: usize,
+    mcp_servers: usize,
+    acl_rules: usize,
+    acl_default: String,
+}
+
+fn census(state: &AppState) -> Census {
+    let config = state.config();
+    Census {
+        agents: state.agents.len(),
+        upstreams: config.upstreams.len(),
+        mcp_servers: config.mcp_servers.len(),
+        acl_rules: state.acl.rule_count(),
+        acl_default: state.acl.default_action().to_string(),
+    }
+}
+
+/// Re-read the policy file, and say what happened.
+///
+/// The scriptable trigger. `SIGHUP` needs a shell on the box and a PID; this
+/// needs the admin token the deploy already has, works across a network and a
+/// container boundary, and — the part a signal cannot do — *answers*. A script
+/// that writes a policy file and posts here learns on the spot whether the
+/// proxy took it, instead of writing it, hoping, and finding out from the first
+/// agent that gets a 401.
+///
+/// A refusal is a 422 and not a 5xx: nothing here is broken. The file on disk is
+/// not servable, the proxy is still serving the policy it had — which is in the
+/// body, so the caller can see exactly what is still in force — and the fix is
+/// to the file the caller sent, which is what 4xx means.
+async fn reload(state: Arc<AppState>, watcher: Arc<Watcher>, from: Option<SocketAddr>) -> Response {
+    // Off the runtime: this reads the policy file and, because an operator
+    // asking counts as `rereads_credentials`, every secret reference behind it
+    // — which for an `op://` reference is a subprocess and a vault round trip.
+    // Blocking a worker thread on that would stall requests the reload is
+    // supposed to be invisible to.
+    let outcome = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || watcher.reload(&state, Trigger::ControlPlane(from))
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(_)) => Json(serde_json::json!({
+            "ok": true,
+            "serving": census(&state),
+        }))
+        .into_response(),
+        // Said out loud as well as answered: the operator who posted this sees
+        // the reason, and the log of the process that refused it should not be
+        // the one place the refusal is missing.
+        Ok(Err(error)) => {
+            tracing::error!(
+                ?error,
+                path = %state.config().server.listen,
+                "refused a policy reload asked for on the control plane; still serving the previous one"
+            );
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("{error:#}"),
+                    "serving": census(&state),
+                })),
+            )
+                .into_response()
+        }
+        // The blocking task itself died — a panic in the load path. The policy
+        // in force is untouched, but this is a bug rather than a bad file.
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("the reload did not complete: {join}"),
+        ),
+    }
 }
 
 async fn pending(State(state): State<Arc<AppState>>) -> Response {
