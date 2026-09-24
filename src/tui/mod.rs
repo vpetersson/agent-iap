@@ -1616,7 +1616,11 @@ impl App {
             Verdict::Allow => "allowed",
             Verdict::Deny => "denied",
         };
-        self.say(format!("{what} once: {}", view.summary));
+        self.say(format!(
+            "{what} once: {}{}",
+            view.summary,
+            repeats(view.waiting)
+        ));
     }
 
     fn handle_modal(&mut self, key: KeyEvent) {
@@ -1833,7 +1837,11 @@ impl App {
         match duration {
             approve::Duration::Once => {
                 self.state.broker.decide_scoped(&view.id, verdict, None);
-                self.say(format!("{word}ed once: {}", view.summary));
+                self.say(format!(
+                    "{word}ed once: {}{}",
+                    view.summary,
+                    repeats(view.waiting)
+                ));
             }
             approve::Duration::UntilQuit => {
                 self.state
@@ -1970,7 +1978,17 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let waiting = self.pending.len();
-        let pending_style = if waiting > 0 {
+        // Questions first, because that is what there is to answer, and the
+        // requests behind them second, because that is what is being held up.
+        // One number cannot say both, and the pair is the whole state of the
+        // queue under an agent that is retrying.
+        let requests: usize = self.pending.iter().map(|view| view.waiting).sum();
+        let waiting = if requests > waiting {
+            format!("{waiting} waiting · {requests} requests")
+        } else {
+            format!("{waiting} waiting")
+        };
+        let pending_style = if !self.pending.is_empty() {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -1988,7 +2006,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  proxy {}  ", self.state.config().server.listen)),
-            Span::styled(format!("  {waiting} waiting  "), pending_style),
+            Span::styled(format!("  {waiting}  "), pending_style),
         ];
         // Dim, and one field wide: nobody needs it until a fix is reported to
         // have landed, and then it is the first thing to establish (SIRI-205).
@@ -2351,17 +2369,27 @@ fn draw_pending(
     let items: Vec<ListItem> = pending
         .iter()
         .map(|view| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:>4}s ", view.waited_ms / 1000),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{} ", view.agent_name),
-                    Style::default().fg(Color::Magenta),
-                ),
-                Span::raw(view.summary.clone()),
-            ]))
+            let mut spans = vec![Span::styled(
+                format!("{:>4}s ", view.waited_ms / 1000),
+                Style::default().fg(Color::DarkGray),
+            )];
+            // How many requests this one answer frees. Loud, because it is the
+            // difference between a call an agent made and a loop it is stuck
+            // in, and the operator is about to decide about all of them at once.
+            if view.waiting > 1 {
+                spans.push(Span::styled(
+                    format!("×{} ", view.waiting),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{} ", view.agent_name),
+                Style::default().fg(Color::Magenta),
+            ));
+            spans.push(Span::raw(view.summary.clone()));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -2382,6 +2410,15 @@ fn draw_pending(
         state,
     );
     (!pending.is_empty()).then(|| block_inner(area))
+}
+
+/// What a confirmation line adds when one answer covered a retry loop rather
+/// than a single call. Empty for the ordinary case, so nothing says `×1`.
+fn repeats(waiting: usize) -> String {
+    match waiting {
+        0 | 1 => String::new(),
+        n => format!(" — and the {} identical requests behind it", n - 1),
+    }
 }
 
 /// The area inside a single-line border.
@@ -2437,9 +2474,29 @@ fn draw_request(
     if let Some(rule) = &view.asked_by {
         lines.push(field("rule", &format!("#{} {}", rule.index, rule.label)));
     }
+    // Spelled out rather than left as the `×6` on the row: an operator is
+    // about to answer for all of them, and how long ago the last one arrived
+    // is what says whether the agent is still going.
+    if view.waiting > 1 {
+        lines.push(field(
+            "repeats",
+            &format!(
+                "{} identical requests, newest {}s ago",
+                view.waiting,
+                view.newest_ms / 1000,
+            ),
+        ));
+    }
     lines.push(Line::raw(""));
+    let answers = match view.waiting {
+        0 | 1 => String::new(),
+        n => format!("One answer releases all {n}. "),
+    };
     lines.push(Line::from(Span::styled(
-        "Enter opens the dialogue: how long the answer holds, and how far it reaches.",
+        format!(
+            "{answers}Enter opens the dialogue: how long the answer holds, and how far it \
+             reaches."
+        ),
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -3347,11 +3404,75 @@ action = "ask"
             request: AccessRequest::http("claude-code", "github", "POST", "/repos/acme/api/issues"),
             summary: "github POST /repos/acme/api/issues".into(),
             waited_ms: 4_000,
+            newest_ms: 4_000,
+            waiting: 1,
             agent_name: "Claude Code".into(),
             asked_by: Some(AskingRule {
                 index: 0,
                 label: "github-writes-need-a-human".into(),
             }),
+        }
+    }
+
+    /// An agent retrying a parked call is one row, and the row says so — on
+    /// the queue, in the request pane, and in the header count. A console that
+    /// prints the same line six times is one an operator scrolls past.
+    #[tokio::test]
+    async fn a_retried_request_is_one_row_that_says_how_many_it_speaks_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.pending = vec![PendingView {
+            waiting: 6,
+            newest_ms: 2_000,
+            ..waiting()
+        }];
+        app.cursor[Tab::Approvals.index()].select(Some(0));
+
+        let rendered = render(&mut app, 120, 34);
+        println!("{rendered}");
+
+        for expected in [
+            "×6",
+            "1 waiting · 6 requests",
+            "6 identical requests, newest 2s ago",
+            "One answer releases all 6.",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "console did not render `{expected}`:\n{rendered}"
+            );
+        }
+        assert_eq!(
+            rendered.matches("Claude Code").count(),
+            2,
+            "one row on the queue and one request pane, not a row per retry:\n{rendered}"
+        );
+    }
+
+    /// And the dialogue says it too, because that is the screen the answer is
+    /// given on — "answers this one request" is a lie when it answers six.
+    #[tokio::test]
+    async fn the_dialogue_says_how_many_requests_one_answer_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let view = PendingView {
+            waiting: 6,
+            ..waiting()
+        };
+        app.pending = vec![view.clone()];
+        app.modal = Some(Modal::Approve(Box::new(approve::Dialogue::new(view))));
+
+        let rendered = render(&mut app, 120, 34);
+        println!("{rendered}");
+
+        for expected in [
+            "6 identical requests are waiting",
+            "answers the 6 identical requests waiting",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "dialogue did not render `{expected}`:\n{rendered}"
+            );
         }
     }
 

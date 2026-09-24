@@ -136,7 +136,11 @@ struct StatusBody {
     /// monitor asks, which is why a proxy with rules in it is refusing
     /// everything.
     lockdown: bool,
+    /// Questions waiting for a human — rows in `/pending`.
     pending: usize,
+    /// Requests waiting, which is the larger number when an agent is retrying
+    /// a parked call. One answer per row releases every one of them.
+    waiting: usize,
     remembered: usize,
     has_approver: bool,
     workload_identity: &'static str,
@@ -155,6 +159,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         acl_default: state.acl.default_action().to_string(),
         lockdown: state.acl.locked_down(),
         pending: state.broker.pending_count(),
+        waiting: state.broker.waiting_count(),
         remembered: state.broker.remembered_count(),
         has_approver: state.broker.has_approver(),
         workload_identity: state.workload.mode().as_str(),
@@ -172,7 +177,9 @@ async fn pending(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Deserialize)]
 struct DecideBody {
-    /// Omit to answer whichever request has been waiting longest.
+    /// Omit to answer whichever question has been waiting longest. Either way
+    /// the answer releases every request parked under that one entry — its
+    /// `waiting` count says how many that is.
     #[serde(default)]
     id: Option<String>,
     verdict: Verdict,
