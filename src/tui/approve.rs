@@ -281,6 +281,12 @@ impl Dialogue {
         let reach = &self.reaches[self.reach];
         let duration = Duration::ALL[self.duration];
         match duration {
+            // "This one request" is a lie whenever an agent has retried: the
+            // row is several of them and they are all about to be answered.
+            Duration::Once if self.view.waiting > 1 => format!(
+                "answers the {} identical requests waiting; the next call asks again",
+                self.view.waiting
+            ),
             Duration::Once => "answers this one request; the next identical call asks again".into(),
             Duration::UntilQuit => format!(
                 "remembered for `{}` until agent-iap exits — nothing is written to disk",
@@ -315,7 +321,11 @@ impl Dialogue {
 
     pub fn render(&self, frame: &mut Frame, area: Rect) -> Hits {
         let width = 76.min(area.width.saturating_sub(4));
-        let height = (self.reaches.len() as u16 + 15).min(area.height);
+        // The headline grows a line when it has to say how many requests this
+        // one answer covers, and the box grows with it rather than pushing the
+        // reassurance about the credential off the bottom.
+        let repeated = u16::from(self.view.waiting > 1);
+        let height = (self.reaches.len() as u16 + 15 + repeated).min(area.height);
         let popup = centred(area, width, height);
 
         frame.render_widget(Clear, popup);
@@ -337,7 +347,7 @@ impl Dialogue {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
+                Constraint::Length(4 + repeated),
                 Constraint::Length(2),
                 Constraint::Min(1),
                 Constraint::Length(3),
@@ -442,7 +452,20 @@ impl Dialogue {
             Kind::Mcp => format!("{} {}", request.method, request.path),
         };
 
-        vec![
+        // Said in the headline, not left to the consequence line: what is on
+        // screen is one question, and an operator who reads it as one request
+        // is being asked to answer for six without being told.
+        let repeats = (self.view.waiting > 1).then(|| {
+            Line::from(Span::styled(
+                format!(
+                    "{} identical requests are waiting — this answers all of them",
+                    self.view.waiting
+                ),
+                Style::default().fg(Color::Yellow),
+            ))
+        });
+
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled(
                     self.view.agent_name.clone(),
@@ -464,12 +487,14 @@ impl Dialogue {
                 Span::raw(" on "),
                 Span::styled(request.target.clone(), Style::default().fg(Color::Cyan)),
             ]),
-            Line::from(Span::styled(
-                "agent-iap holds the credential and attaches it on the way out — allowing this \
-                 does not hand it over.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
+        ];
+        lines.extend(repeats);
+        lines.push(Line::from(Span::styled(
+            "agent-iap holds the credential and attaches it on the way out — allowing this \
+             does not hand it over.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines
     }
 
     fn durations(&self) -> Vec<Line<'_>> {
@@ -558,6 +583,8 @@ mod tests {
             summary: request.summary(),
             request,
             waited_ms: 0,
+            newest_ms: 0,
+            waiting: 1,
             agent_name: "Claude Code".into(),
             asked_by: None,
         }

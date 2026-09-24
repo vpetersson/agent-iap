@@ -1004,7 +1004,9 @@ still hear. What your terminal does with `BEL` is your setting rather than this
 program's: a sound, a flashing window, a dock badge, a tmux window flagged with
 `#{?window_bell_flag}`, a desktop notification from a terminal wired up that
 way. A burst of parked requests is one ring rather than a dozen, since a dozen
-beeps is a sound people turn off. Three ways to say no:
+beeps is a sound people turn off — and an agent retrying a call that is already
+in the queue does not ring at all, because it is not a new question. Three ways
+to say no:
 
 ```bash
 agent-iap run --no-bell         # this run
@@ -1022,6 +1024,41 @@ no business beeping at whoever started it.
 The console owns the terminal, so diagnostics go to `agent-iap.log` beside the
 audit log instead of to stdout, and the bottom pane is a live tail of the audit
 log — what the agent has been doing while you decide what to allow next.
+
+#### The queue holds questions, not requests
+
+An agent whose call is parked does not sit and wait for you: it retries, and
+each retry is another request held on the same question. Those wait together.
+
+```
+┌ waiting for you ───────────────────────────────┐
+│▶    21s ×6 Claude Code xai POST /v1/tts        │
+└────────────────────────────────────────────────┘
+```
+
+One row, `×6` for the six calls behind it, and **one answer releases all of
+them**. Six rows would be the same question asked six times, with five calls
+timing out denied in the gaps between the answers — and a queue that scrolls,
+on the screen whose whole job is to be readable at a glance.
+
+Two requests are the same question when the ACL cannot tell them apart: same
+agent, same kind, same target, same method, same path. That is everything a
+rule matches on and everything a `Scope` can be narrowed to, so there is nothing
+you could say about one of them that would not be equally true of the next.
+**It is not the body.** Nothing in this proxy decides on a body, so two
+`POST /v1/tts` calls carrying different text are one question here, exactly as
+they are one rule, one scope and one remembered answer everywhere else. If you
+need them told apart, they have to differ in the path.
+
+A standing answer — "until quit", or a rule written by "5 min" / "from now on" —
+also settles anything *else* already in the queue that it covers. Those requests
+would have been waved through on arrival had they come in a second later;
+leaving them parked would deny calls you just allowed, and nothing would raise
+them again for you to notice.
+
+A request whose agent hangs up leaves the queue with it, so the count is what is
+actually waiting rather than what has ever arrived. `1 waiting · 6 requests` in
+the header is the pair of numbers: questions to answer, calls held up by them.
 
 #### The dialogue
 
@@ -1056,7 +1093,8 @@ this much, for how long.
 says what the pair of them will do. All of it is clickable. The durations are
 four different mechanisms:
 
-- **Once** answers this request. The next identical call asks again.
+- **Once** answers this request — and the identical ones waiting behind it, if
+  the agent retried. The next call after that asks again.
 - **5 min / 1 hour / 1 day** write an ACL rule that carries its own deadline.
   Past it the rule matches nothing and the request falls through to whatever is
   behind it — which, for a rule written in front of an `ask`, is the `ask`
@@ -2364,6 +2402,12 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/decide \
 Polling `/pending` counts as watching the queue for 30 seconds, so `curl` alone
 can answer an `ask` without the TUI. With nobody watching, `ask` denies
 immediately rather than parking the request for the full timeout.
+
+`/pending` lists questions rather than requests — see § The queue holds
+questions, not requests. Each entry carries `waiting`, the number of identical
+calls one `/decide` on it releases, and `newest_ms` alongside `waited_ms` for
+how long ago the most recent of them arrived. `/status` reports the same pair as
+`pending` (questions) and `waiting` (requests held up by them).
 
 ## Deployment
 

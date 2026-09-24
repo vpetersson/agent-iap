@@ -492,6 +492,115 @@ action = "ask"
     assert_eq!(seen["x-api-key"], UPSTREAM_KEY);
 }
 
+/// An agent whose call is parked does not sit and wait: it retries, and every
+/// retry used to arrive as a queue entry of its own. The operator was then
+/// asked the same question six times over, and each answer released exactly
+/// one of the six calls while the rest sat out the timeout and were denied.
+///
+/// One question in the queue, one answer, every call behind it released.
+#[tokio::test]
+async fn a_retried_call_is_one_question_in_the_queue() {
+    let harness = spawn_proxy(
+        r#"
+[[acl]]
+name = "confirm-deletes"
+target = "echo"
+methods = ["DELETE"]
+paths = ["/v1/**"]
+action = "ask"
+"#,
+    )
+    .await;
+    harness.state.broker.set_has_approver(true);
+
+    // The same call six times, as an agent retrying a request that has not
+    // come back yet would make it.
+    let calls: Vec<_> = (0..6)
+        .map(|_| {
+            let url = format!("http://{}/echo/v1/models/opus", harness.proxy);
+            tokio::spawn(async move {
+                client()
+                    .delete(url)
+                    .bearer_auth(AGENT_TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+
+    let pending_url = format!("http://{}/pending", harness.admin);
+    let mut queue = Vec::new();
+    for _ in 0..500 {
+        queue = client()
+            .get(&pending_url)
+            .bearer_auth(&harness.admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if queue
+            .first()
+            .is_some_and(|first: &Value| first["waiting"] == 6)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        queue.len(),
+        1,
+        "six identical calls are one question, not six: {queue:#?}"
+    );
+    assert_eq!(queue[0]["waiting"], 6, "and it says how many it speaks for");
+    assert_eq!(queue[0]["request"]["method"], "DELETE");
+
+    let status: Value = client()
+        .get(format!("http://{}/status", harness.admin))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["pending"], 1, "one question to answer");
+    assert_eq!(status["waiting"], 6, "six requests held up by it");
+
+    let decided = client()
+        .post(format!("http://{}/decide", harness.admin))
+        .bearer_auth(&harness.admin_token)
+        .json(&serde_json::json!({ "id": queue[0]["id"], "verdict": "allow" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(decided.status(), 200);
+
+    for call in calls {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("one answer releases every call behind it")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    // One question does not mean one record: each call went out on its own and
+    // is audited on its own, with the answer that let it through.
+    let allowed = std::fs::read_to_string(&harness.audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["decision"] == "ask:allowed")
+        .count();
+    assert_eq!(
+        allowed, 6,
+        "every call is recorded, not just the one asked about"
+    );
+}
+
 #[tokio::test]
 async fn the_control_plane_refuses_an_unauthenticated_operator() {
     let harness = spawn_proxy("").await;
