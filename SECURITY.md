@@ -47,7 +47,8 @@ unreported one costs more.
 
 ## Supported versions
 
-Versions are CalVer, `YYYY.MM.PATCH` (README § Versioning). Cargo reads the year
+Versions are CalVer, `YYYY.MM.PATCH` (`docs/development.md` § Versioning).
+Cargo reads the year
 as the major, so every new month looks like a breaking change to a `^`
 constraint — which means the usual "supported major versions" table would list
 one row per month and say nothing.

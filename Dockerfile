@@ -29,7 +29,7 @@ RUN chmod 0755 /rootfs/usr/local/bin/agent-iap \
 # a compromised proxy from being a place to run anything else. The binary is
 # static and its TLS roots are compiled in, so it needs nothing from the image.
 #
-# The cost is in README.md § Deployment: `op://` secret references shell out to
+# The cost is in docs/deployment.md: `op://` secret references shell out to
 # the 1Password CLI, and stdio MCP servers are child processes — neither exists
 # in here. Use `env:`/`file:` references and MCP servers over HTTP, or build on
 # a base that carries the tools.
@@ -41,7 +41,7 @@ LABEL org.opencontainers.image.title="agent-iap" \
       org.opencontainers.image.source="https://github.com/vpetersson/agent-iap" \
       org.opencontainers.image.licenses="MIT"
 
-# `--config` still overrides it; this is the path README.md § Deployment uses,
+# `--config` still overrides it; this is the path docs/deployment.md uses,
 # applied to every subcommand rather than just to `run`.
 ENV IAP_CONFIG=/etc/agent-iap/iap.toml
 

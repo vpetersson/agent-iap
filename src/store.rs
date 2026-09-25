@@ -26,7 +26,8 @@
 //! anything that can read the file as its owner can read the credentials, which
 //! is exactly as true of `~/.aws/credentials` and of a `.env`, and is the trade
 //! the operator is making when they choose this over `op://`. It is written
-//! down here, in `secret set`'s own output, and in the README, because a
+//! down here, in `secret set`'s own output, and in `docs/policy-file.md`,
+//! because a
 //! capability whose limits are not written down will be relied on past them.
 
 use anyhow::{bail, Context, Result};

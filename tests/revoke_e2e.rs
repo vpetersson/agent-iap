@@ -129,7 +129,8 @@ async fn call(proxy: SocketAddr, token: &str) -> (u16, String) {
     (status, decision)
 }
 
-/// The README's claim, asserted rather than described: one command, and the
+/// The claim in `docs/enrolling.md`, asserted rather than described: one
+/// command, and the
 /// token buys nothing — while no upstream credential changed.
 #[tokio::test]
 async fn a_revoked_agent_is_a_stranger_after_the_restart() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce the CalVer scheme described in README.md § Versioning.
+# Enforce the CalVer scheme described in docs/development.md § Versioning.
 #
 # CalVer is a convention until something rejects a version that is not one.
 # This runs in CI on every push and pull request, and additionally proves that

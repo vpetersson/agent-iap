@@ -137,7 +137,7 @@ pub fn audit_file() -> PathBuf {
 ///
 /// A policy file in the current directory still wins, for two reasons: it is
 /// what every existing checkout has, and a directory that keeps its own policy
-/// — a repository, a demo, one of the walkthroughs in the README — is a thing
+/// — a repository, a demo, one of the walkthroughs in the docs — is a thing
 /// people deliberately do. What changed is that nothing *writes* there unless
 /// the file is already sitting there.
 pub fn default_config_file() -> PathBuf {

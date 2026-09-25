@@ -4,7 +4,7 @@ A profile is not a shortcut for typing an upstream. It is the place the things
 somebody had to find out the hard way get written down, so the next enrolment
 does not find them out again. Everything a profile writes is ordinary TOML that
 a person could have written by hand — the value is entirely in knowing *what* to
-write (`src/profiles.rs`, README § Profiles).
+write (`src/profiles.rs`, `docs/profiles.md`).
 
 ## What a profile has to know that a hand-written upstream would not
 
