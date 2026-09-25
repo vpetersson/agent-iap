@@ -112,8 +112,9 @@ amber `VERIFIED` column (#49): a state that renders as the healthy one teaches
 its reader to stop looking.
 
 **9. State the limits in the same change that ships the capability.** README
-§ Security model has a "what it does not give you" list, § Multiple agents names
-what does not scale with what it costs, § Not built yet is honest, and a profile
+§ Security model has a "what it does not give you" list, `docs/agents.md`
+§ Multiple agents names what does not scale with what it costs, README § Not
+built yet is honest, and a profile
 note says which endpoints are unreachable through the proxy rather than letting
 an agent discover it as a 404 (#13, #28, #41). A capability whose limits are not
 written down will be relied on past them.
@@ -173,8 +174,10 @@ Beyond green:
 - **Release notes are generated from PR titles.** A change that stops an
   existing `iap.toml` loading has to say so in its title.
 - Close the issue from the body (`Closes SIRI-123`).
-- Update the README in the same PR as the behaviour. Docs that lag are how the
-  short form of `audit tail` came to be documented before it worked (#24).
+- Update the docs in the same PR as the behaviour — the README is the landing
+  page and `docs/` is the reference, so most behaviour changes land in `docs/`.
+  Docs that lag are how the short form of `audit tail` came to be documented
+  before it worked (#24).
 - Sign every commit (SSH), keep PII out of messages and PRs, branch off and back
   onto `master`, and watch the PR for Copilot review comments — fix them and
   resolve the threads.

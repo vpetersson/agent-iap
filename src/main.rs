@@ -1246,7 +1246,7 @@ fn set_secret(name: &str, config_path: &Path) -> Result<()> {
     println!("\n  iap://{name}\n");
     println!("Use it wherever a credential reference goes:");
     println!("  agent-iap upstream add <name> --base-url … --auth bearer --secret iap://{name}");
-    // Said here rather than only in the README, because this is the command
+    // Said here rather than only in the docs, because this is the command
     // that makes the trade and the operator is standing in front of it. The
     // store is a place to keep a credential, not a way to protect one.
     println!(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Write today's CalVer into Cargo.toml and Cargo.lock.
 #
-# The scheme is YYYY.MM.PATCH (README.md § Versioning). Deriving the next
+# The scheme is YYYY.MM.PATCH (docs/development.md § Versioning). Deriving the next
 # version by hand is where the mistakes are: the patch resets when the month
 # rolls over, and the month is not zero-padded. Pass a version explicitly to
 # override, for a backport or to correct a bad bump.

@@ -1,4 +1,4 @@
-# agent-iap as a daemon. README.md § Deployment has the install steps this
+# agent-iap as a daemon. docs/deployment.md has the install steps this
 # assumes: the binary at /usr/local/bin, an `agent-iap` system user, the policy
 # file at /etc/agent-iap/iap.toml owned by that user and mode 0600.
 #
@@ -30,7 +30,7 @@ EnvironmentFile=-/etc/agent-iap/env
 # The proxy resolves every credential at startup and would fail there anyway;
 # failing here says which reference did not resolve, before anything binds.
 ExecStartPre=/usr/local/bin/agent-iap check
-# No console: an `ask` is answered over the control plane (README.md § Control
+# No console: an `ask` is answered over the control plane (docs/deployment.md § Control
 # plane) or it denies. A rule set that is all `allow`/`deny` needs no answerer.
 ExecStart=/usr/local/bin/agent-iap run --no-tui
 

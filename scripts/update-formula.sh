@@ -208,7 +208,7 @@ EOF
 
   # The daemon, as launchd or systemd sees it — the same shape as
   # packaging/agent-iap.service: no console, so an `ask` rule is answered over
-  # the control plane or denied (README.md § Control plane). The environment is
+  # the control plane or denied (docs/deployment.md § Control plane). The environment is
   # spelled out because a service has no working directory worth defaulting
   # from: without `IAP_CONFIG` the proxy would look for an `iap.toml` next to
   # wherever it was started.
