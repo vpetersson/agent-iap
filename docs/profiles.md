@@ -63,7 +63,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Five levels exist for reasons that are not about permissions:
+Six levels exist for reasons that are not about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
   parks everything else for a human. The ACL cannot tell a reasonable POST from
@@ -84,6 +84,12 @@ Five levels exist for reasons that are not about permissions:
   watching errors needs, without `write` also letting it edit projects, alert
   rules and members. DELETE is denied rather than prompted. All four Sentry
   profiles offer the same three levels.
+- **`asana --access triage`** is the same shape for a task queue: every read,
+  plus the POSTs and PUTs that comment on, create, complete and re-file a
+  *task*, with DELETE denied and everything else — projects, teams,
+  memberships, webhooks, exports — left to prompt. The question an operator is
+  answering is not "may it write" but "may it write to tasks", and `write` is
+  the level that cannot tell the two apart.
 
 ## What is in the catalog
 
@@ -94,6 +100,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | --- | --- |
 | Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets`, `google-cloud-logging`, `google-cloud-storage` — all one service account, all `service_account_jwt` |
 | Cloudflare | `cloudflare` (the whole `client/v4` surface, `--var account_id=…`), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
+| Asana | `asana` (REST), `asana-mcp` (the V2 MCP server, over `mcp-remote`) |
 | PostHog | `posthog` (REST), `posthog-mcp` |
 | DataForSEO | `dataforseo`, `dataforseo-mcp` |
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
@@ -121,6 +128,37 @@ file in the clear, while the token stays a reference.
   JSON-RPC message, but the credential lives in the child's cache rather than in
   the proxy. The `cloudflare` REST profile covers the same services with a
   credential the proxy holds.
+- **An Asana token has no scopes, and one endpoint carries every other one.**
+  A personal access token is the whole of what its owner can see, in every
+  workspace they belong to, and the ACL cannot cut that down by workspace or
+  project: this API addresses objects by gid — `/tasks/<gid>` is the entire
+  path — so there is nothing in the path for a rule to match a workspace
+  against. Where "which projects" has to be a real limit, it belongs in Asana:
+  a service account, or a bot user invited only to the projects you mean, whose
+  token is then what the proxy holds. `POST /batch` follows from the same
+  shape: it carries up to ten sub-requests, each naming its own method and
+  relative path, so one allowed POST is every call the token can make and the
+  audit log keeps a single row reading `POST /batch`. `read` and `triage` deny
+  it by name — the refusal names a rule rather than `<default>` — and `write`
+  allows it, where it grants nothing new but does cost you the detail in the
+  log. `write` also reaches `POST /webhooks`, which registers a durable push of
+  workspace changes to any URL and does not stop when the agent's token is
+  revoked, and the three export endpoints, which dump the domain rather than
+  read a record.
+- **Asana's MCP server will not take the credential the proxy holds.** It
+  issues its own tokens and answers a personal access token with `Invalid token
+  signature - token was not issued by Asana OAuth`; its authorization server
+  offers only the authorization-code and refresh-token grants, so there is no
+  exchange the proxy could perform. `asana-mcp` therefore runs the V2 endpoint
+  through `npx mcp-remote`, which does the browser flow, caches the grant in
+  `~/.mcp-auth` and reads the app's client id and secret from the file
+  `--var client_file=…` names — a file outside the credential inventory, since
+  the child reads it rather than the proxy. Every JSON-RPC message is still
+  ruled on and logged here. A session is pinned to the one workspace chosen at
+  sign-in and carries whatever the authorizing user can see, because MCP apps
+  take no scopes either, so the tool rules are the only narrowing. Asana's beta
+  server at `mcp.asana.com/sse` shuts down on 11 May 2026 and this profile does
+  not use it; Command by Asana has a server of its own that no profile fronts.
 - **Tool catalogs move.** PostHog exposes well over a thousand tools, so its
   `read` level allows the read verbs and sends everything else to `ask` rather
   than denying it. Watch the audit log for `ask` rows and promote the ones you
