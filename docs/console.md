@@ -203,7 +203,7 @@ from a shell is a form here, over the same functions with the same validation:
 | Pane | What it shows | Keys |
 | --- | --- | --- |
 | approvals | the queue, and the request in full | `enter` `a` `d` `f` |
-| agents | id, name, targets, where its token comes from | `n` enrol · `t` new token · `x` revoke |
+| agents | id, name, targets, where its token comes from | `n` enrol · `e` edit · `t` new token · `x` revoke |
 | upstreams | base URL, scheme, credential reference, last verification | `n` add, from a profile or spelled out · `e` edit · `v` verify · `x` remove |
 | mcp | transport, command or URL, credential references, last verification | `n` add · `v` verify · `x` remove |
 | acl | every rule in match order, with its number and what is left of any deadline | `n` add · `x` remove · `R` reset to asking |
@@ -265,6 +265,22 @@ aimed at it and the agents scoped to it go on naming the same thing — which `x
 and `n` could not have managed between them, and why the name is not on the
 form. No credential *value* is shown, because the file holds none: what is
 prefilled is the reference.
+
+`n` on the agents pane opens with `any target` on, so an id is all it needs:
+which upstreams an agent may address is the coarse gate in front of the ACL,
+and every call it makes is still decided by a rule or by `acl_default`. The
+`targets` field lists what is enrolled, and names typed into it win over the
+switch — narrowing an agent is one field, not two. Turn the switch off with
+nothing typed and the form refuses, as `agent add` does: an empty `targets` in
+the file means every target, and that is not something to arrive at by
+omission.
+
+`e` on an agent — or `enter`, or a double-click — opens its name and targets
+filled in from the file. Saving rewrites them in place; the id and the token are
+not on the form, because the audit log and the rules name the one and `t` is
+how the other changes, so the token the agent already holds goes on working.
+Clearing `targets` with the switch off is refused, and a name that is not an
+enrolled upstream or MCP server is refused, as on enrolment.
 
 Every field that takes a credential *reference* — `secret`, `username ref`,
 `client secret`, `key file`, `private key` — will also go and find the file for

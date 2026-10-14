@@ -339,7 +339,7 @@ What this gives you:
   it is about, `--any-target` being the blanket grant asked for by name, and
   `agent-iap check` lists the ones already written. `acl add` writes `ask`,
   `agent add` refuses to enrol an agent until it is told what that agent may
-  reach, and an unmatched request falls through to `acl_default` — `ask` in the file
+  reach (the console's enrol form opens on `any target`, on screen), and an unmatched request falls through to `acl_default` — `ask` in the file
   `agent-iap init` writes and after an `acl reset`, `deny` after `acl reset
   --deny`, and never `allow` unless somebody wrote it there. An `ask` with
   nobody to ask denies, so nothing is waved through by a default either way;

@@ -111,6 +111,14 @@ reads as "any", so every policy already written goes on meaning what it meant,
 and `agent-iap check` names the agents that hold one so an existing blanket
 grant is something you are told about rather than something to go looking for.
 
+The console's enrol form is the one place it is pre-selected: it opens with
+`any target` switched on, on screen beside a `targets` field that lists what is
+enrolled, and says what the agent may reach after it writes. A form that opened
+on neither answer could not be submitted as it stood and gave no cue why. Names
+typed into `targets` win over the switch, and the switch turned off with
+nothing typed is refused exactly as above. The ACL behind it is unchanged: a new
+agent's calls still stop on a rule or on `acl_default`.
+
 Rules are **appended**, never inserted, because first match wins — a new rule can
 never silently shadow one already in the file, and `acl add` prints the position
 it landed in. `agent add --target` refuses a target that names no upstream or MCP
