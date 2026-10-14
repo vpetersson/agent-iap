@@ -4257,8 +4257,9 @@ action = "allow"
         app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
 
         type_in(&mut app, "s");
-        let rendered = render(&mut app, 120, 34);
-        for filed_under_s in ["semrush", "sentry", "slack", "spotify", "stripe"] {
+        // Tall enough for every `s` profile, `s3` and `s3-compatible` included.
+        let rendered = render(&mut app, 120, 44);
+        for filed_under_s in ["s3", "semrush", "sentry", "slack", "spotify", "stripe"] {
             assert!(
                 rendered.contains(filed_under_s),
                 "`s` should bring up `{filed_under_s}`: {rendered}"
@@ -4272,7 +4273,7 @@ action = "allow"
         // And `esc` puts back what was typed rather than the form, so a
         // mistyped letter does not cost the catalogue.
         app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
-        let rendered = render(&mut app, 120, 34);
+        let rendered = render(&mut app, 120, 44);
         assert!(rendered.contains("anthropic"), "{rendered}");
         assert!(rendered.contains("pick a profile"), "{rendered}");
     }

@@ -225,6 +225,18 @@ async fn proxy(
         .with_record(record)
     })?;
 
+    // A request the upstream's scheme cannot carry safely is refused before
+    // anybody is asked about it — see `sigv4::refusal`.
+    if let Some(reason) = crate::sigv4::refusal_for(&upstream.auth, &parts.headers) {
+        let mut record = record.clone();
+        record.decision = Some("deny".into());
+        record.rule = Some("<unsignable>".into());
+        return Err(Box::new(
+            Rejection::new(StatusCode::BAD_REQUEST, "unsignable_request", reason)
+                .with_record(record),
+        ));
+    }
+
     // 3. May this agent address this target, does the credential presented
     // cover the request, and what does the policy say — including stopping on a
     // human when a rule says `ask`. The MCP gateway asks the same question of
@@ -333,7 +345,7 @@ async fn proxy(
         ))
     })?;
 
-    Ok(build_response(response))
+    Ok(build_response(response, &method))
 }
 
 /// What to say to an agent that guessed at a name, or sent none.
@@ -502,13 +514,17 @@ pub(crate) fn forwarded_user_agent(incoming: Option<&http::HeaderValue>) -> http
         .unwrap_or_else(|_| http::HeaderValue::from_static(crate::USER_AGENT))
 }
 
-fn build_response(response: reqwest::Response) -> Response {
+fn build_response(response: reqwest::Response, method: &http::Method) -> Response {
     let status = response.status();
     let mut builder = Response::builder().status(status);
     for (name, value) in response.headers() {
         let key = name.as_str().to_ascii_lowercase();
-        // Re-chunked downstream, so the upstream framing headers no longer apply.
-        if HOP_BY_HOP.contains(&key.as_str()) || key == "content-length" {
+        // Re-chunked downstream, so the upstream framing headers no longer
+        // apply — except on a HEAD, where there is no body to frame and
+        // `content-length` is the answer: S3's HeadObject reports an object's
+        // size in nothing else, and an SDK sizing a download reads it there.
+        let framing = key == "content-length" && method != http::Method::HEAD;
+        if HOP_BY_HOP.contains(&key.as_str()) || framing {
             continue;
         }
         builder = builder.header(name, value);

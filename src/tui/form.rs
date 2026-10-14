@@ -514,6 +514,9 @@ impl Form {
             lifetime_secs: self.opt("lifetime-secs").and_then(|v| v.parse().ok()),
             client_id: self.opt("client-id"),
             client_secret: self.opt("client-secret"),
+            access_key_id: self.opt("access-key-id"),
+            region: self.opt("region"),
+            service: self.opt("service"),
         }
     }
 
@@ -1172,6 +1175,12 @@ fn wording(key: &'static str) -> (&'static str, &'static str) {
             "lifetime",
             "assertion lifetime in seconds; clamped to an hour",
         ),
+        "access-key-id" => (
+            "access key id",
+            "the key id itself (AKIA…) — not secret; the secret access key goes in `secret`",
+        ),
+        "region" => ("region", "signing region, e.g. us-east-1; `auto` for Cloudflare R2"),
+        "service" => ("service", "signing service; leave blank for s3"),
         // A scheme `enroll` grew and nobody came back here to word. Shown
         // under its own flag name rather than dropped: an unpolished label
         // beats a credential the form cannot be told about at all.

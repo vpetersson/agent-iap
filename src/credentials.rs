@@ -121,6 +121,24 @@ impl CredentialInjector {
                     .query_pairs_mut()
                     .append_pair(param, value.expose());
             }
+            AuthConfig::AwsSigv4 {
+                access_key_id,
+                secret,
+                region,
+                service,
+            } => {
+                // Last, by construction: the signature covers the headers and
+                // the body, so nothing may touch the request after this.
+                let value = self.resolve(secret)?;
+                crate::sigv4::sign(
+                    request,
+                    access_key_id,
+                    value.expose(),
+                    region,
+                    service.as_deref().unwrap_or(crate::sigv4::S3),
+                    chrono::Utc::now(),
+                )?;
+            }
             AuthConfig::Oauth2ClientCredentials { .. } | AuthConfig::ServiceAccountJwt { .. } => {
                 let token = self.minted_token(target, auth).await?;
                 set_header(

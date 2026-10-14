@@ -107,12 +107,23 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
+| Object storage | `s3` (`--var region=…`), `r2` (`--var account_id=…`), `s3-compatible` (`--var host=…` — MinIO, B2, Wasabi, Spaces, Ceph, …) — all `aws_sigv4`, all needing `--var access_key_id=…` and `--var bucket=…` |
 | Others | `anthropic`, `openai`, `xai`, `github`, `linear`, `slack`, `stripe` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
 
 The honest limits, all printed by `profile show`:
+
+- **An object-store grant is for one bucket unless you type `*`.** An access
+  key routinely reaches every bucket in the account, so `s3`, `r2` and
+  `s3-compatible` take `--var bucket=…` with no default, and their rules cover
+  `/<bucket>` and `/<bucket>/**`. `read` is GET and HEAD; `write` adds PUT and
+  POST on objects — never on the bucket itself, where they are CreateBucket, a
+  bucket policy or DeleteObjects — and asks before a DELETE; `full` is every
+  method on both. The agent sends its token as `X-IAP-Token`, server-side copy
+  is refused, and [§ S3, R2](policy-file.md#s3-r2-and-anything-else-speaking-the-s3-api)
+  has the rest.
 
 - **A Cloudflare token is half an address.** Most of `client/v4` lives under
 `/accounts/<id>/…`, and an account-owned token (`cfat_`, the durable

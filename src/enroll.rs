@@ -113,6 +113,14 @@ pub enum AuthSpec {
         subject: Option<String>,
         lifetime_secs: Option<u64>,
     },
+    /// S3 and everything that speaks its API. The key id is plain, like an
+    /// OAuth client id; only the secret access key is a reference.
+    AwsSigv4 {
+        access_key_id: String,
+        secret: String,
+        region: String,
+        service: Option<String>,
+    },
 }
 
 /// Every credential scheme there is, spelled as the CLI's `--auth` takes them.
@@ -128,6 +136,7 @@ pub const AUTH_SCHEMES: &[&str] = &[
     "query",
     "oauth2-client-credentials",
     "service-account-jwt",
+    "aws-sigv4",
 ];
 
 /// Everything the credential schemes take, in the shape a human supplies it —
@@ -158,6 +167,9 @@ pub struct AuthInput {
     pub lifetime_secs: Option<u64>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    pub access_key_id: Option<String>,
+    pub region: Option<String>,
+    pub service: Option<String>,
 }
 
 impl AuthInput {
@@ -188,6 +200,7 @@ impl AuthInput {
                 "subject",
                 "lifetime-secs",
             ],
+            "aws-sigv4" => &["access-key-id", "secret", "region", "service"],
             _ => &[],
         }
     }
@@ -293,6 +306,18 @@ impl AuthInput {
                 lifetime_secs: *lifetime_secs,
                 ..scheme("service-account-jwt")
             },
+            AuthConfig::AwsSigv4 {
+                access_key_id,
+                secret,
+                region,
+                service,
+            } => AuthInput {
+                access_key_id: Some(access_key_id.clone()),
+                secret: Some(secret.clone()),
+                region: Some(region.clone()),
+                service: service.clone(),
+                ..scheme("aws-sigv4")
+            },
         }
     }
 
@@ -318,6 +343,9 @@ impl AuthInput {
             "lifetime-secs" => self.lifetime_secs.map(|secs| secs.to_string()),
             "client-id" => self.client_id.clone(),
             "client-secret" => self.client_secret.clone(),
+            "access-key-id" => self.access_key_id.clone(),
+            "region" => self.region.clone(),
+            "service" => self.service.clone(),
             _ => None,
         }
     }
@@ -406,6 +434,18 @@ impl AuthInput {
                     lifetime_secs: self.lifetime_secs,
                 }
             }
+            "aws-sigv4" => AuthSpec::AwsSigv4 {
+                access_key_id: self.access_key_id.clone().context(
+                    "`--auth aws-sigv4` needs `--access-key-id <ID>` — the key id itself, which \
+                     is not secret; the secret access key goes in `--secret <REF>`",
+                )?,
+                secret: need_secret()?,
+                region: self.region.clone().context(
+                    "`--auth aws-sigv4` needs `--region <REGION>`, e.g. `us-east-1`, or `auto` \
+                     for Cloudflare R2",
+                )?,
+                service: self.service.clone(),
+            },
             other => bail!(
                 "`{other}` is not a credential scheme — it is one of {}",
                 AUTH_SCHEMES.join(", ")
@@ -425,6 +465,7 @@ fn normalise_scheme(scheme: &str) -> &str {
     match scheme.trim() {
         "oauth2_client_credentials" => "oauth2-client-credentials",
         "service_account_jwt" => "service-account-jwt",
+        "aws_sigv4" => "aws-sigv4",
         "" => "none",
         other => other,
     }
@@ -1681,7 +1722,8 @@ fn auth_secrets(auth: &AuthSpec) -> Vec<&str> {
         AuthSpec::None => vec![],
         AuthSpec::Bearer { secret }
         | AuthSpec::Header { secret, .. }
-        | AuthSpec::Query { secret, .. } => vec![secret.as_str()],
+        | AuthSpec::Query { secret, .. }
+        | AuthSpec::AwsSigv4 { secret, .. } => vec![secret.as_str()],
         AuthSpec::Basic {
             username_secret,
             secret,
@@ -1852,6 +1894,20 @@ fn auth_value(auth: &AuthSpec) -> Value {
                 table.insert("lifetime_secs", Value::from(*value as i64));
             }
         }
+        AuthSpec::AwsSigv4 {
+            access_key_id,
+            secret,
+            region,
+            service,
+        } => {
+            table.insert("type", "aws_sigv4".into());
+            table.insert("access_key_id", access_key_id.as_str().into());
+            table.insert("secret", secret.as_str().into());
+            table.insert("region", region.as_str().into());
+            if let Some(service) = service {
+                table.insert("service", service.as_str().into());
+            }
+        }
     }
     Value::InlineTable(table)
 }
@@ -1974,6 +2030,12 @@ mod tests {
                 scopes: vec!["https://example.com/auth".into()],
                 subject: Some("person@example.com".into()),
                 lifetime_secs: Some(600),
+            },
+            AuthConfig::AwsSigv4 {
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+                secret: "env:I".into(),
+                region: "auto".into(),
+                service: Some("s3".into()),
             },
         ] {
             let input = AuthInput::of(&auth);

@@ -488,6 +488,21 @@ pub enum AuthConfig {
         #[serde(default)]
         lifetime_secs: Option<u64>,
     },
+    /// AWS Signature Version 4: S3, Cloudflare R2, and every other store that
+    /// speaks the S3 API. Nothing is attached — each request is *signed*, over
+    /// its method, path, query, headers and body, after the ACL has said yes.
+    AwsSigv4 {
+        /// The access key id. It names the key rather than proving anything,
+        /// the way an OAuth client id does, so it goes in the file in the clear.
+        access_key_id: String,
+        /// Secret reference to the secret access key.
+        secret: String,
+        /// The region the signature is scoped to: `us-east-1`, or `auto` for R2.
+        region: String,
+        /// The service it is scoped to. Defaults to `s3`.
+        #[serde(default)]
+        service: Option<String>,
+    },
 }
 
 impl AuthConfig {
@@ -509,7 +524,8 @@ impl AuthConfig {
             AuthConfig::None => vec![],
             AuthConfig::Bearer { secret }
             | AuthConfig::Header { secret, .. }
-            | AuthConfig::Query { secret, .. } => vec![("auth.secret", secret.as_str())],
+            | AuthConfig::Query { secret, .. }
+            | AuthConfig::AwsSigv4 { secret, .. } => vec![("auth.secret", secret.as_str())],
             AuthConfig::Basic {
                 username_secret,
                 secret,
@@ -548,6 +564,7 @@ impl AuthConfig {
             AuthConfig::Query { .. } => "query",
             AuthConfig::Oauth2ClientCredentials { .. } => "oauth2_client_credentials",
             AuthConfig::ServiceAccountJwt { .. } => "service_account_jwt",
+            AuthConfig::AwsSigv4 { .. } => "aws_sigv4",
         }
     }
 
@@ -569,6 +586,12 @@ impl AuthConfig {
                 (None, None) => "basic".to_string(),
             },
             AuthConfig::Query { param, .. } => format!("query {param}"),
+            AuthConfig::AwsSigv4 {
+                region, service, ..
+            } => format!(
+                "aws_sigv4 {}/{region}",
+                service.as_deref().unwrap_or(crate::sigv4::S3)
+            ),
             other => other.scheme().to_string(),
         }
     }
@@ -1029,6 +1052,43 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     }
     if let AuthConfig::Oauth2ClientCredentials { token_url, .. } = auth {
         url::Url::parse(token_url).with_context(|| format!("{label}: token_url"))?;
+    }
+
+    if let AuthConfig::AwsSigv4 {
+        access_key_id,
+        region,
+        service,
+        ..
+    } = auth
+    {
+        // Each of these goes into the signature verbatim, so a wrong one is a
+        // `SignatureDoesNotMatch` on every call with nothing naming the field.
+        // A reference here would be sent as the literal string `op://…`.
+        if access_key_id.trim().is_empty() {
+            bail!("{label}: `access_key_id` is empty");
+        }
+        if SecretRef::parse(access_key_id).is_ok() || access_key_id.contains("://") {
+            bail!(
+                "{label}: `access_key_id` is the key id itself, not a reference — it is sent \
+                 as written. Only `secret` is resolved"
+            );
+        }
+        if access_key_id.trim() != access_key_id {
+            bail!("{label}: `access_key_id` has leading or trailing whitespace");
+        }
+        for (field, value) in [("region", Some(region)), ("service", service.as_ref())] {
+            let Some(value) = value else { continue };
+            if value.is_empty()
+                || !value
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                bail!(
+                    "{label}: `{field}` = {value:?} is not a signing {field} — lower case, \
+                     digits and `-`, e.g. `us-east-1`, or `auto` for Cloudflare R2"
+                );
+            }
+        }
     }
 
     if let AuthConfig::Basic {
@@ -1499,6 +1559,49 @@ type = "service_account_jwt"
             .expect("a bare key_file is the Google case");
         assert_eq!(config.secret_refs(), vec!["env:SA"]);
         assert!(config.upstreams[0].auth.mints_tokens());
+    }
+
+    /// Every one of these goes into the signature verbatim, so getting one
+    /// wrong is a `SignatureDoesNotMatch` on every call naming no field.
+    #[test]
+    fn a_sigv4_credential_is_checked_where_it_is_typed() {
+        let with = |fields: &str| {
+            toml::from_str::<Config>(&format!(
+                "[[upstreams]]\nname = \"r2\"\nbase_url = \"https://a.r2.cloudflarestorage.com\"\n\
+                 [upstreams.auth]\ntype = \"aws_sigv4\"\nsecret = \"env:R2\"\n{fields}"
+            ))
+            .unwrap()
+            .validate()
+        };
+        with("access_key_id = \"AKID\"\nregion = \"auto\"\n").expect("the R2 shape");
+
+        // A reference here would be sent as the string `op://…`.
+        let error = with("access_key_id = \"op://Vault/R2/id\"\nregion = \"auto\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a reference"), "{error}");
+
+        let error = with("access_key_id = \"AKID\"\nregion = \"EU West 1\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`region`"), "{error}");
+
+        let error = with("access_key_id = \"AKID\"\nregion = \"auto\"\nservice = \"\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`service`"), "{error}");
+
+        let config = toml::from_str::<Config>(
+            "[[upstreams]]\nname = \"s3\"\nbase_url = \"https://s3.amazonaws.com\"\n\
+             auth = { type = \"aws_sigv4\", access_key_id = \"AKID\", secret = \"env:S3\", region = \"us-east-1\" }\n",
+        )
+        .unwrap();
+        assert_eq!(config.secret_refs(), vec!["env:S3"]);
+        assert_eq!(
+            config.upstreams[0].auth.describe(),
+            "aws_sigv4 s3/us-east-1"
+        );
+        assert!(!config.upstreams[0].auth.mints_tokens());
     }
 
     #[test]

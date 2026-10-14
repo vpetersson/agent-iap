@@ -390,6 +390,14 @@ async fn probe_upstream(
 
     let started = Instant::now();
     match http.execute(request).await {
+        Ok(response) if matches!(upstream.auth, AuthConfig::AwsSigv4 { .. }) => {
+            let status = response.status();
+            let elapsed = started.elapsed();
+            let fallback = classify(&response, elapsed, aim);
+            let body = response.text().await.unwrap_or_default();
+            let (outcome, brief, detail) = classify_s3(status, &body, elapsed).unwrap_or(fallback);
+            report.noted(REACH, outcome, brief, detail);
+        }
         Ok(response) => {
             let (outcome, brief, detail) = classify(&response, started.elapsed(), aim);
             report.noted(REACH, outcome, brief, detail);
@@ -399,6 +407,79 @@ async fn probe_upstream(
 
     http_policy(config, &upstream.name, &mut report);
     report
+}
+
+/// What an S3-compatible store's answer says about a signed request.
+///
+/// The status alone cannot tell: S3 answers 403 for a key it has never heard
+/// of, for a secret that does not match the key, and for a perfectly good key
+/// that may not list buckets — which is every key scoped to one bucket, so a
+/// probe of `/` (ListBuckets) that went by the status would fail half the
+/// healthy fleet or pass every broken one. The `<Code>` in the body is the
+/// part that differs, and a store checks the signature before it checks
+/// permissions, so `AccessDenied` is itself proof the credential is right.
+///
+/// `None` hands the response back to `classify`.
+fn classify_s3(
+    status: http::StatusCode,
+    body: &str,
+    elapsed: Duration,
+) -> Option<(Outcome, &'static str, String)> {
+    let took = format!("in {}ms", elapsed.as_millis());
+    if status.is_success() {
+        return Some((
+            Outcome::Passed,
+            "credential ok",
+            format!("answered {status} {took} — the signature was accepted"),
+        ));
+    }
+    let code = body
+        .split_once("<Code>")
+        .and_then(|(_, rest)| rest.split_once("</Code>"))
+        .map(|(code, _)| code.trim())?;
+    let verdict = match code {
+        "AccessDenied" => (
+            Outcome::Passed,
+            "credential ok",
+            format!(
+                "answered {status} AccessDenied {took} — the signature was accepted; this key \
+                 may not list buckets, which a key scoped to one bucket may not"
+            ),
+        ),
+        "InvalidAccessKeyId" => (
+            Outcome::Failed,
+            "rejected",
+            format!("the store does not know this access key id — {status} {took}"),
+        ),
+        "SignatureDoesNotMatch" => (
+            Outcome::Failed,
+            "rejected",
+            format!(
+                "the secret does not belong to this access key id — {status} \
+                 SignatureDoesNotMatch {took}"
+            ),
+        ),
+        "AuthorizationHeaderMalformed" | "InvalidRegion" => (
+            Outcome::Failed,
+            "wrong region",
+            format!("the store wants a different signing `region` — {status} {code} {took}"),
+        ),
+        "RequestTimeTooSkewed" => (
+            Outcome::Failed,
+            "clock skew",
+            format!(
+                "this machine's clock is more than 15 minutes from the store's, and every \
+                 signature carries the time — {status} {code} {took}"
+            ),
+        ),
+        "ExpiredToken" | "InvalidToken" => (
+            Outcome::Failed,
+            "rejected",
+            format!("the store refused the signature — {status} {code} {took}"),
+        ),
+        _ => return None,
+    };
+    Some(verdict)
 }
 
 /// What the status code says about the two things being verified: that the host
@@ -1306,6 +1387,16 @@ fn describe_auth(auth: &AuthConfig) -> String {
         AuthConfig::ServiceAccountJwt { .. } => {
             "signed an assertion and exchanged it for an access token".to_string()
         }
+        AuthConfig::AwsSigv4 {
+            access_key_id,
+            secret,
+            region,
+            service,
+        } => format!(
+            "signed (SigV4, {}/{region}) as `{access_key_id}` with the key resolved from {}",
+            service.as_deref().unwrap_or(crate::sigv4::S3),
+            display_ref(secret)
+        ),
     }
 }
 
@@ -1557,6 +1648,38 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         reqwest::Response::from(builder.body("").unwrap())
+    }
+
+    /// The same 403, three different answers. A bucket-scoped key that may not
+    /// list buckets is the common healthy case and must not read as broken.
+    #[test]
+    fn an_s3_403_is_read_by_its_code_not_its_status() {
+        let forbidden = http::StatusCode::FORBIDDEN;
+        let verdict = |code: &str| {
+            classify_s3(
+                forbidden,
+                &format!("<?xml version=\"1.0\"?><Error><Code>{code}</Code></Error>"),
+                Duration::from_millis(1),
+            )
+            .map(|(outcome, brief, _)| (outcome, brief))
+        };
+        assert_eq!(
+            verdict("AccessDenied"),
+            Some((Outcome::Passed, "credential ok"))
+        );
+        assert_eq!(
+            verdict("InvalidAccessKeyId"),
+            Some((Outcome::Failed, "rejected"))
+        );
+        assert_eq!(
+            verdict("SignatureDoesNotMatch"),
+            Some((Outcome::Failed, "rejected"))
+        );
+        assert_eq!(verdict("SlowDown"), None, "anything else is `classify`'s");
+        assert_eq!(
+            classify_s3(forbidden, "not xml", Duration::from_millis(1)).map(|v| v.0),
+            None
+        );
     }
 
     fn verdict_of(status: u16, aim: Aim) -> Outcome {
