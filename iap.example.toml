@@ -150,6 +150,8 @@ scopes = ["https://www.googleapis.com/auth/devstorage.read_only"]
 #   auth = { type = "oauth2_client_credentials", token_url = "https://issuer/oauth/token",
 #            client_id = "abc", client_secret = "op://Private/IdP/client_secret",
 #            scope = "read:data" }
+#   auth = { type = "aws_sigv4", access_key_id = "AKIA…", secret = "op://Private/S3/secret",
+#            region = "us-east-1" }   # S3, R2 (`region = "auto"`), MinIO, B2 …
 #   auth = { type = "none" }
 #
 # Any other RFC 7523 provider, with the pieces spelled out instead of a Google

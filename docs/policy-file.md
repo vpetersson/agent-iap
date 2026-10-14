@@ -47,9 +47,10 @@ hard error — a typo must never quietly widen access.
 | `query` | appends `?param=<secret>` |
 | `oauth2_client_credentials` | fetches and caches an access token, refreshed a minute before expiry |
 | `service_account_jwt` | signs a JWT with a service-account key and exchanges it for a short-lived token — see below |
+| `aws_sigv4` | signs each request with AWS Signature Version 4 — S3, Cloudflare R2, and every S3-compatible store; see below |
 | `none` | pass through |
 
-The last two mint a token rather than forwarding a secret. Minted tokens are
+`oauth2_client_credentials` and `service_account_jwt` mint a token rather than forwarding a secret. Minted tokens are
 cached until a minute before they expire, and a burst of requests on a cold
 cache mints one token, not one each.
 
@@ -103,6 +104,80 @@ the process with a message naming the problem rather than turning into a 502 on
 the first call. PKCS#1 keys (`BEGIN RSA PRIVATE KEY`) are rejected with the
 `openssl` command that converts them. Every mint is logged with the issuer,
 scopes and expiry — never the token.
+
+## S3, R2 and anything else speaking the S3 API
+
+An S3 credential is never sent. It is an HMAC key, and what goes on the wire is
+a signature over the method, the path, the query, the `x-amz-*` headers and a
+hash of the body — so the proxy computes it, per request, after the ACL has
+said yes. Cloudflare R2, Backblaze B2, MinIO, Wasabi, DigitalOcean Spaces, Ceph,
+SeaweedFS and Google Cloud Storage's interoperability endpoint all verify the
+same signature, which is why this is one scheme rather than one per vendor.
+
+```toml
+[[upstreams]]
+name = "r2"
+base_url = "https://<account_id>.r2.cloudflarestorage.com"
+
+[upstreams.auth]
+type = "aws_sigv4"
+access_key_id = "0123456789abcdef0123456789abcdef"   # the id itself, in the clear
+secret = "op://Private/R2 token/secret access key"
+region = "auto"            # R2's; AWS wants the bucket's region, e.g. "eu-west-1"
+# service = "s3"           # the default; any other AWS service signs the same way
+```
+
+`access_key_id` names the key rather than proving anything, the way an OAuth
+client id does, so it is a plain value; a reference there is refused, because
+it would be signed as the literal string `op://…`. Only `secret` is resolved.
+`region` and `service` are checked for shape at load: each goes into the
+signature verbatim, and a wrong one is otherwise a `SignatureDoesNotMatch` on
+every call that names no field.
+
+The `s3`, `r2` and `s3-compatible` profiles write this block for you
+([profiles](profiles.md#what-is-in-the-catalog)). Use path-style addressing —
+`/<bucket>/<key>` under the base URL — which is what every one of these stores
+accepts and what lets a rule name a bucket.
+
+What the agent sends, and what it does not get:
+
+- **The agent token goes in `X-IAP-Token`.** An S3 client puts its own
+  signature in `Authorization`. The proxy discards that, and `x-amz-date`,
+  `x-amz-content-sha256` and `x-amz-security-token` with it, and signs the
+  request afresh — so an SDK can be configured with any dummy key it likes.
+  boto3 takes the header from an event hook:
+
+  ```python
+  s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:8080/r2",
+                    aws_access_key_id="unused", aws_secret_access_key="unused",
+                    region_name="auto", config=Config(s3={"addressing_style": "path"}))
+  s3.meta.events.register("before-send.s3.*",
+      lambda request, **_: request.headers.__setitem__("X-IAP-Token", token))
+  ```
+
+- **A server-side copy is refused** (`400 unsignable_request`). CopyObject and
+  UploadPartCopy name the source in `x-amz-copy-source`, which no rule ever
+  sees: a grant to write `/scratch/**` would read any object the key reaches.
+  GET the source and PUT it, so both halves go through the ACL.
+- **Chunks signed by the client are refused** (`STREAMING-AWS4-HMAC-SHA256-…`):
+  each chunk's signature chains from the client's key, and re-signing the first
+  would leave the rest wrong. Unsigned chunks with a trailing checksum — what
+  current SDKs send by default — pass through, as does a plain body.
+- **Rules match the path, and S3 picks a sub-resource with the query.** A rule
+  over `/<bucket>/**` covers `?tagging`, `?acl` and `?retention` on those keys as
+  well as the objects; `/<bucket>` itself is ListObjects, the bucket's
+  configuration, and DeleteObjects, which carries its keys in the body. Keep
+  writes off `/<bucket>`, as the profiles do.
+- **Long-lived keys only.** There is no `session_token`: a temporary STS
+  credential expires under a running proxy. Use an IAM user's key, an R2 API
+  token, or the store's own equivalent.
+
+`verify` reads the store's error code rather than its status, because S3
+answers 403 for an unknown key, for a wrong secret, and for a good key that may
+not list buckets: `InvalidAccessKeyId` and `SignatureDoesNotMatch` fail,
+`AuthorizationHeaderMalformed` names the region, and `AccessDenied` passes —
+a store checks the signature before the permission, so it is proof the
+credential is right.
 
 ## Timeouts
 

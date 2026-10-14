@@ -109,6 +109,7 @@ pub mod proxy;
 pub mod reload;
 pub mod secrets;
 pub mod service_account;
+pub mod sigv4;
 pub mod skills;
 pub mod state;
 pub mod stdio;

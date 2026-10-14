@@ -525,6 +525,15 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
         ));
     };
 
+    let headers = supplied_headers(arguments.get("headers"), &upstream);
+    if let Some(reason) = crate::sigv4::refusal_for(&upstream.auth, &headers) {
+        record.event = "denied".into();
+        record.decision = Some("deny".into());
+        record.rule = Some("<unsignable>".into());
+        state.audit.write_best_effort(record);
+        return Err(format!("unsignable_request: {reason}"));
+    }
+
     let access = AccessRequest::http(&agent.id, &upstream.name, method.as_str(), &path);
     match gate::clear(state, caller, &access).await {
         Ok(cleared) => {
@@ -554,7 +563,7 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
         .map_err(|error| error.to_string())?;
 
     let mut outbound = reqwest::Request::new(method.clone(), url);
-    *outbound.headers_mut() = supplied_headers(arguments.get("headers"), &upstream);
+    *outbound.headers_mut() = headers;
     if let Some((content_type, bytes)) = body {
         // Only when the agent did not name one itself: a caller that knows it
         // is sending `application/x-ndjson` should not be overridden.

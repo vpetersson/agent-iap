@@ -676,6 +676,16 @@ struct AuthFlags {
     /// Client secret *reference* for `--auth oauth2-client-credentials`.
     #[arg(long, value_name = "REF")]
     client_secret: Option<String>,
+    /// Access key id for `--auth aws-sigv4` — the id itself, not a reference;
+    /// the secret access key is `--secret`.
+    #[arg(long, value_name = "ID")]
+    access_key_id: Option<String>,
+    /// Signing region for `--auth aws-sigv4`: `us-east-1`, or `auto` for R2.
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
+    /// Signing service for `--auth aws-sigv4`. Defaults to `s3`.
+    #[arg(long, value_name = "SERVICE")]
+    service: Option<String>,
 }
 
 impl AuthFlags {
@@ -705,6 +715,9 @@ impl AuthFlags {
             && self.lifetime_secs.is_none()
             && self.client_id.is_none()
             && self.client_secret.is_none()
+            && self.access_key_id.is_none()
+            && self.region.is_none()
+            && self.service.is_none()
     }
 
     /// Hand the flags to `enroll`, which owns the rule about which scheme needs
@@ -730,6 +743,9 @@ impl AuthFlags {
             lifetime_secs: self.lifetime_secs,
             client_id: self.client_id.clone(),
             client_secret: self.client_secret.clone(),
+            access_key_id: self.access_key_id.clone(),
+            region: self.region.clone(),
+            service: self.service.clone(),
         }
         .to_spec()
     }
@@ -834,6 +850,7 @@ enum AuthArg {
     Query,
     Oauth2ClientCredentials,
     ServiceAccountJwt,
+    AwsSigv4,
 }
 
 impl AuthArg {
@@ -846,6 +863,7 @@ impl AuthArg {
             AuthArg::Query => "query",
             AuthArg::Oauth2ClientCredentials => "oauth2-client-credentials",
             AuthArg::ServiceAccountJwt => "service-account-jwt",
+            AuthArg::AwsSigv4 => "aws-sigv4",
         }
     }
 }

@@ -83,6 +83,14 @@ pub enum AuthTemplate {
     /// level, because "read" and "write" are different scopes, not just
     /// different paths.
     ServiceAccountJwt,
+    /// S3 and its imitators: the request is signed, not decorated. The key id
+    /// is the caller's and not secret, so it is a `Var`, like an OAuth client
+    /// id; `region` may name a var too (`{region}`), because AWS's is the
+    /// caller's and R2's is the constant `auto`.
+    AwsSigv4 {
+        access_key_id_var: String,
+        region: String,
+    },
 }
 
 /// What the profile adds to the policy file.
@@ -408,7 +416,7 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
     // scopes above either way — what it no longer decides on its own is
     // whether an agent may call.
     let rules = match options.grant {
-        true => planned_rules(&name, &service, access),
+        true => planned_rules(&name, &service, access, &vars)?,
         false => Vec::new(),
     };
 
@@ -509,7 +517,12 @@ fn render_plan(
 ///
 /// Only ever called for a `--grant`: these are standing `allow` rules, and
 /// nothing but a human asking writes one.
-fn planned_rules(name: &str, service: &Service, access: &Access) -> Vec<PlannedRule> {
+fn planned_rules(
+    name: &str,
+    service: &Service,
+    access: &Access,
+    vars: &BTreeMap<String, String>,
+) -> Result<Vec<PlannedRule>> {
     let mut rules: Vec<PlannedRule> = Vec::new();
     if service.kind() == "mcp" {
         // First, so it is matched before any tool-scoped rule can shadow it.
@@ -528,11 +541,21 @@ fn planned_rules(name: &str, service: &Service, access: &Access) -> Vec<PlannedR
             name: format!("{name}-{}", rule.suffix),
             kind: service.kind().to_string(),
             methods: rule.methods.clone(),
-            paths: rule.paths.clone(),
+            // A path may name a var — the object stores' `/{bucket}/**` — so a
+            // level can be about the caller's bucket rather than every bucket
+            // the key reaches. `{secret}` has no business in a rule.
+            paths: rule
+                .paths
+                .iter()
+                .map(|path| match path.contains("{secret}") {
+                    true => bail!("rule path `{path}` names the secret"),
+                    false => expand(path, vars, ""),
+                })
+                .collect::<Result<_>>()?,
             action: rule.action.clone(),
         });
     }
-    rules
+    Ok(rules)
 }
 
 /// A profile's rule, in the shape `enroll` writes. Profiles grant standing
@@ -748,6 +771,18 @@ fn build_auth(
             subject: None,
             lifetime_secs: None,
         },
+        AuthTemplate::AwsSigv4 {
+            access_key_id_var,
+            region,
+        } => AuthSpec::AwsSigv4 {
+            access_key_id: vars
+                .get(&access_key_id_var)
+                .cloned()
+                .with_context(|| format!("this profile needs `--var {access_key_id_var}=…`"))?,
+            secret: secret.to_string(),
+            region: expand(&region, vars, "")?,
+            service: None,
+        },
     })
 }
 
@@ -778,6 +813,102 @@ fn access(name: &str, about: &str, scopes: &[&str], rules: Vec<RuleTemplate>) ->
         about: about.into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
         rules,
+    }
+}
+
+/// A store that speaks the S3 API. Every one of them takes the same paths, so
+/// the access levels are shared; what differs is the endpoint, the signing
+/// region, and what the vendor's own console calls the key.
+///
+/// `bucket` is a var with no default, so a grant is written for one bucket
+/// unless somebody types `*` — an access key routinely reaches every bucket in
+/// the account, and "every bucket" is not a default this proxy may pick.
+#[allow(clippy::too_many_arguments)]
+fn object_store(
+    id: &str,
+    title: &str,
+    vendor: &str,
+    summary: &str,
+    credential: Credential,
+    mut vars: Vec<Var>,
+    base_url: &str,
+    region: &str,
+    extra_note: &str,
+) -> Profile {
+    vars.push(v(
+        "access_key_id",
+        "the access key id that pairs with the secret — it names the key rather than \
+         proving anything, so it goes in the file in the clear",
+        None,
+    ));
+    vars.push(v(
+        "bucket",
+        "the bucket the access level's rules cover. `*` covers every bucket the key can \
+         reach, and has to be typed",
+        None,
+    ));
+    // Bucket-level calls are on `/<bucket>` and object calls on
+    // `/<bucket>/<key>`, and the two are kept apart on purpose: a PUT or POST
+    // on the bucket itself is CreateBucket, PutBucketPolicy, DeleteObjects —
+    // administration, not writing data.
+    let bucket = ["/{bucket}", "/{bucket}/"];
+    let objects = ["/{bucket}/**"];
+    let both = ["/{bucket}", "/{bucket}/", "/{bucket}/**"];
+    Profile {
+        id: id.into(),
+        title: title.into(),
+        vendor: vendor.into(),
+        summary: summary.into(),
+        default_name: id.into(),
+        credential,
+        vars,
+        service: Service::Http {
+            base_url: base_url.into(),
+            auth: AuthTemplate::AwsSigv4 {
+                access_key_id_var: "access_key_id".into(),
+                region: region.into(),
+            },
+        },
+        access: vec![
+            access(
+                "read",
+                "list the bucket, and GET or HEAD its objects",
+                &[],
+                vec![rule("reads", &["GET", "HEAD"], &both, "allow")],
+            ),
+            access(
+                "write",
+                "also PUT and POST objects (multipart included); deleting one asks",
+                &[],
+                vec![
+                    rule("reads", &["GET", "HEAD"], &both, "allow"),
+                    rule("writes", &["PUT", "POST"], &objects, "allow"),
+                    rule("deletes", &["DELETE"], &objects, "ask"),
+                ],
+            ),
+            access(
+                "full",
+                "every method on the bucket and its objects, bucket configuration included",
+                &[],
+                vec![
+                    rule("objects", &["*"], &objects, "allow"),
+                    rule("bucket", &["*"], &bucket, "allow"),
+                ],
+            ),
+        ],
+        note: Some(format!(
+            "Signed with AWS SigV4 — send the agent token as `X-IAP-Token`, since \
+             `Authorization` is where an S3 client puts its own signature, which the proxy \
+             discards. Server-side copy (`x-amz-copy-source`) is refused: it reads an object \
+             the ACL never saw. Rules match the path, and S3 selects a sub-resource with the \
+             query string, so `write` on `/<bucket>/**` also covers `?tagging` and `?acl` on \
+             those keys; an object ACL can only make one public where the bucket allows ACLs. \
+             {extra_note}"
+        )),
+        // `verify` reads S3's own error code instead: `InvalidAccessKeyId` and
+        // `SignatureDoesNotMatch` are a bad credential, `AccessDenied` is a good
+        // one without ListBuckets — which is most keys scoped to one bucket.
+        probe: None,
     }
 }
 
@@ -1518,6 +1649,91 @@ pub fn catalog() -> Vec<Profile> {
             ),
             probe: None,
         },
+        // ---------------- Object storage (S3 API) ----------------
+        object_store(
+            "s3",
+            "Amazon S3",
+            "Amazon Web Services",
+            "Buckets and objects, path-style, signed with an IAM access key.",
+            Credential {
+                about: "an IAM access key's Secret Access Key — the Access Key ID goes beside \
+                        it as `--var access_key_id=…`"
+                    .into(),
+                url: "https://console.aws.amazon.com/iam/home#/security_credentials".into(),
+            },
+            vec![v(
+                "region",
+                "the bucket's AWS region, e.g. `eu-west-1`. A request signed for another \
+                 region is refused by S3 with `AuthorizationHeaderMalformed`",
+                Some("us-east-1"),
+            )],
+            "https://s3.{region}.amazonaws.com",
+            "{region}",
+            "Path-style (`/<bucket>/<key>`) on the regional endpoint, which every bucket \
+             answers; a bucket name containing a `.` needs it, too. Short-lived STS \
+             credentials (a session token) are not supported — use a long-lived IAM user key.",
+        ),
+        object_store(
+            "r2",
+            "Cloudflare R2",
+            "Cloudflare",
+            "R2 buckets and objects over R2's S3-compatible API.",
+            Credential {
+                about: "an R2 API token's Secret Access Key — its Access Key ID goes beside it \
+                        as `--var access_key_id=…`. Not the Cloudflare API token the same page \
+                        also shows"
+                    .into(),
+                url: "https://dash.cloudflare.com/?to=/:account/r2/api-tokens".into(),
+            },
+            vec![v(
+                "account_id",
+                "the Cloudflare account id — the hex string in the dashboard URL, and the \
+                 first label of `<account_id>.r2.cloudflarestorage.com`",
+                None,
+            )],
+            "https://{account_id}.r2.cloudflarestorage.com",
+            "auto",
+            "Region is `auto`, which R2 requires. Buckets in an EU or FedRAMP \
+             jurisdiction live on `<account_id>.eu.r2.cloudflarestorage.com` (or `.fedramp.`) \
+             — enrol those with `s3-compatible` and that host. R2 has no object ACLs, so \
+             `x-amz-acl` cannot make an object public there.",
+        ),
+        object_store(
+            "s3-compatible",
+            "S3-compatible storage",
+            "Any",
+            "MinIO, Backblaze B2, Wasabi, DigitalOcean Spaces, Ceph, SeaweedFS, GCS \
+             interoperability — anything that verifies AWS SigV4.",
+            Credential {
+                about: "the store's secret key (the S3 \"secret access key\") — the key id goes \
+                        beside it as `--var access_key_id=…`"
+                    .into(),
+                url: "the store's own console".into(),
+            },
+            vec![
+                v(
+                    "host",
+                    "the S3 endpoint's host, and port if it is not the scheme's — \
+                     `s3.us-west-004.backblazeb2.com`, `minio.internal:9000`",
+                    None,
+                ),
+                v(
+                    "scheme",
+                    "`https`, or `http` for an endpoint with no TLS. The request is signed \
+                     either way, so the key never crosses the wire — but the objects do",
+                    Some("https"),
+                ),
+                v(
+                    "region",
+                    "the signing region the store expects. `us-east-1` is what MinIO, Ceph and \
+                     SeaweedFS accept by default; B2 and Wasabi want the region in their host",
+                    Some("us-east-1"),
+                ),
+            ],
+            "{scheme}://{host}",
+            "{region}",
+            "Path-style (`/<bucket>/<key>`), which every one of these accepts.",
+        ),
         // ---------------- PostHog ----------------
         Profile {
             id: "posthog".into(),
@@ -2960,6 +3176,82 @@ mod tests {
                 assert_eq!(secret, "literal:token");
             }
             other => panic!("expected basic, got {other:?}"),
+        }
+    }
+
+    /// The object stores sign rather than attach, take the key id as a plain
+    /// var, and write their grant for one bucket — never every bucket the key
+    /// can reach unless somebody typed `*`.
+    #[test]
+    fn object_stores_sign_and_grant_one_bucket() {
+        for (id, vars, base_url, region) in [
+            (
+                "s3",
+                vec!["region=eu-west-1"],
+                "https://s3.eu-west-1.amazonaws.com",
+                "eu-west-1",
+            ),
+            (
+                "r2",
+                vec!["account_id=0123abcd"],
+                "https://0123abcd.r2.cloudflarestorage.com",
+                "auto",
+            ),
+            (
+                "s3-compatible",
+                vec!["host=minio.internal:9000", "scheme=http"],
+                "http://minio.internal:9000",
+                "us-east-1",
+            ),
+        ] {
+            let profile = get(id).unwrap();
+            let mut given: Vec<String> = vars.iter().map(|v| v.to_string()).collect();
+            given.push("access_key_id=AKIDEXAMPLE".into());
+
+            // No bucket, no profile: the wide grant is not what silence means.
+            let error = resolve_vars(&profile, &given).unwrap_err().to_string();
+            assert!(error.contains("--var bucket="), "{id}: {error}");
+
+            given.push("bucket=reports".into());
+            let vars = resolve_vars(&profile, &given).unwrap();
+            let service = substitute_service(&profile.service, &vars, "env:KEY").unwrap();
+            assert_eq!(service.endpoint(), base_url, "{id}");
+            match build_auth(&service, "env:KEY", &vars, &[]).unwrap() {
+                AuthSpec::AwsSigv4 {
+                    access_key_id,
+                    secret,
+                    region: signed_for,
+                    service,
+                } => {
+                    assert_eq!(access_key_id, "AKIDEXAMPLE");
+                    assert_eq!(secret, "env:KEY");
+                    assert_eq!(signed_for, region, "{id}");
+                    assert_eq!(service, None, "s3 is the default");
+                }
+                other => panic!("{id}: expected aws_sigv4, got {other:?}"),
+            }
+
+            // `read` is the default and reads one bucket.
+            assert_eq!(profile.default_access().name, "read");
+            let rules = planned_rules(id, &service, profile.default_access(), &vars).unwrap();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].methods, ["GET", "HEAD"]);
+            assert_eq!(rules[0].paths, ["/reports", "/reports/", "/reports/**"]);
+
+            // `write` writes objects, never the bucket itself — a PUT or POST
+            // there is CreateBucket, a bucket policy, or DeleteObjects — and
+            // deleting an object asks.
+            let write = profile.find_access("write").unwrap();
+            let rules = planned_rules(id, &service, write, &vars).unwrap();
+            for rule in &rules {
+                if rule.methods.iter().any(|m| m != "GET" && m != "HEAD") {
+                    assert_eq!(rule.paths, ["/reports/**"], "{id}: {}", rule.name);
+                }
+                if rule.methods == ["DELETE"] {
+                    assert_eq!(rule.action, "ask");
+                }
+            }
+            assert!(profile.note.as_deref().unwrap().contains("X-IAP-Token"));
         }
     }
 

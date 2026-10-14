@@ -399,7 +399,9 @@ one holding it; per-workload ACL rules, so policy could name a workload label
 and not just an agent; native 1Password Connect (the CLI is shelled out to
 today). On service accounts specifically: only RSA keys are supported (Google
 issues RS256 keys, so this covers Google), and the GCP metadata server and
-workload identity federation are not wired up.
+workload identity federation are not wired up. On S3 and its imitators:
+temporary STS credentials (a session token), presigned URLs, and server-side
+copy, which is refused rather than checked.
 
 ## License
 
