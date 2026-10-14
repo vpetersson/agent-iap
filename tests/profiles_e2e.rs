@@ -1241,3 +1241,178 @@ fn the_probe_shows_up_in_a_dry_run_before_anything_is_written() {
     );
     drop(dir);
 }
+
+/// Denied by the named rule, not parked for a human or let through to Google.
+fn refused_by(body: &Value, rule: &str) {
+    assert!(body["path"].is_null(), "the call reached Google: {body}");
+    assert_eq!(body["error"]["type"], "policy_denied", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("`{rule}`")),
+        "refused by something other than `{rule}`: {message}"
+    );
+}
+
+/// `read` is every GET Drive has — search and export included — and nothing
+/// that outlives the call: a push channel only needs `drive.readonly`, so the
+/// scope does not keep it out and the ACL has to.
+#[tokio::test]
+async fn the_drive_read_level_reads_and_opens_no_channel() {
+    let upstream = spawn_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = service_account_key(dir.path(), &format!("http://{upstream}/token"));
+    let harness = harness_from_profiles(&[("google-drive", options(&key))], upstream).await;
+
+    for path in [
+        "/google-drive/drive/v3/about?fields=user",
+        "/google-drive/drive/v3/files?q=name%20contains%20%27plan%27",
+        "/google-drive/drive/v3/files/abc?alt=media",
+        "/google-drive/drive/v3/files/abc/export?mimeType=text/plain",
+    ] {
+        let (status, seen) = call(&harness, "GET", path).await;
+        assert_eq!(status, 200, "`GET {path}` is not readable at `read`");
+        assert_eq!(seen["authorization"], "Bearer ya29.minted-by-the-proxy");
+    }
+
+    let (status, body) = call(&harness, "POST", "/google-drive/drive/v3/changes/watch").await;
+    assert_eq!(status, 403);
+    refused_by(&body, "google-drive-watch");
+    let (status, body) = call(&harness, "POST", "/google-drive/batch/drive/v3").await;
+    assert_eq!(status, 403);
+    refused_by(&body, "google-drive-batch");
+
+    for (method, path) in [
+        (
+            "POST",
+            "/google-drive/upload/drive/v3/files?uploadType=multipart",
+        ),
+        ("PATCH", "/google-drive/drive/v3/files/abc"),
+        ("DELETE", "/google-drive/drive/v3/files/abc"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `read`");
+        assert!(
+            body["path"].is_null(),
+            "`{method} {path}` reached Google: {body}"
+        );
+    }
+}
+
+/// `edit` is the level an agent that writes documents actually wants, and
+/// the two things it must not do are refused by name: share a file, which
+/// hands its content to somebody this proxy never sees, and delete one.
+#[tokio::test]
+async fn the_drive_edit_level_writes_files_and_cannot_share_or_delete_them() {
+    let upstream = spawn_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = service_account_key(dir.path(), &format!("http://{upstream}/token"));
+    let mut opts = options(&key);
+    opts.access = Some("edit".into());
+    let harness = harness_from_profiles(&[("google-drive", opts)], upstream).await;
+
+    for (method, path) in [
+        ("GET", "/google-drive/drive/v3/files/abc/permissions"),
+        ("POST", "/google-drive/drive/v3/files"),
+        (
+            "POST",
+            "/google-drive/upload/drive/v3/files?uploadType=multipart",
+        ),
+        (
+            "PUT",
+            "/google-drive/upload/drive/v3/files?uploadType=resumable&upload_id=x",
+        ),
+        (
+            "PATCH",
+            "/google-drive/upload/drive/v3/files/abc?uploadType=media",
+        ),
+        (
+            "PATCH",
+            "/google-drive/drive/v3/files/abc?addParents=f1&removeParents=f0",
+        ),
+        ("POST", "/google-drive/drive/v3/files/abc/copy"),
+        ("POST", "/google-drive/drive/v3/files/abc/comments"),
+        (
+            "POST",
+            "/google-drive/drive/v3/files/abc/comments/c1/replies",
+        ),
+    ] {
+        let (status, seen) = call(&harness, method, path).await;
+        assert_eq!(status, 200, "`{method} {path}` is not allowed at `edit`");
+        assert_eq!(seen["method"], method);
+    }
+
+    for (method, path, rule) in [
+        (
+            "POST",
+            "/google-drive/drive/v3/files/abc/permissions",
+            "google-drive-sharing",
+        ),
+        (
+            "PATCH",
+            "/google-drive/drive/v3/files/abc/permissions/p1",
+            "google-drive-sharing",
+        ),
+        (
+            "DELETE",
+            "/google-drive/drive/v3/files/abc/permissions/p1",
+            "google-drive-sharing",
+        ),
+        (
+            "DELETE",
+            "/google-drive/drive/v3/files/abc",
+            "google-drive-deletes",
+        ),
+        (
+            "DELETE",
+            "/google-drive/drive/v3/files/trash",
+            "google-drive-deletes",
+        ),
+        (
+            "POST",
+            "/google-drive/drive/v3/files/abc/watch",
+            "google-drive-watch",
+        ),
+        ("POST", "/google-drive/batch/drive/v3", "google-drive-batch"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `edit`");
+        refused_by(&body, rule);
+    }
+
+    // Publishing a revision puts a Doc on the web. Not denied — a person may
+    // well mean it — but not allowed unasked either, and with nobody at the
+    // console that is a refusal.
+    let (status, body) = call(
+        &harness,
+        "PATCH",
+        "/google-drive/drive/v3/files/abc/revisions/r1",
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a revision change reached Google: {body}"
+    );
+}
+
+/// Domain-wide delegation through the profile rather than around it: the
+/// address is a variable, and leaving it empty is no delegation at all.
+#[test]
+fn a_google_profile_takes_the_user_to_act_as_as_a_variable() {
+    let (dir, path) = minimal_policy();
+    let profile = profiles::get("google-drive").unwrap();
+    let mut opts = options("op://Private/GCP/credential");
+    opts.vars = vec!["subject=person@example.com".into()];
+    profiles::add(&path, &profile, &opts).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("subject = \"person@example.com\""),
+        "{written}"
+    );
+
+    let (_other, path) = minimal_policy();
+    profiles::add(&path, &profile, &options("op://Private/GCP/credential")).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("subject"), "{written}");
+    drop(dir);
+}

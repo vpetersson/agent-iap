@@ -98,7 +98,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 
 | Vendor | Profiles |
 | --- | --- |
-| Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets`, `google-cloud-logging`, `google-cloud-storage` — all one service account, all `service_account_jwt` |
+| Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets`, `google-cloud-logging`, `google-cloud-storage` — all one service account, all `service_account_jwt`, each taking an optional `--var subject=<email>` for domain-wide delegation |
 | Cloudflare | `cloudflare` (the whole `client/v4` surface, `--var account_id=…`), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
 | Asana | `asana` (REST), `asana-mcp` (the V2 MCP server, over `mcp-remote`) |
 | PostHog | `posthog` (REST), `posthog-mcp` |
@@ -156,6 +156,32 @@ file in the clear, while the token stays a reference.
   workspace changes to any URL and does not stop when the agent's token is
   revoked, and the three export endpoints, which dump the domain rather than
   read a record.
+- **A Google service account sees only what has been shared with it.** Its
+  own Drive is empty, so `google-drive` answers a perfectly good key with an
+  empty `files.list` until you share folders with the service-account email or
+  add it to a shared drive. The other way in is domain-wide delegation:
+  `--var subject=person@example.com` writes `subject` into the upstream's
+  `auth`, and the token then sees everything that user can — granted in the
+  Workspace Admin console for the client id and the level's scopes first, or
+  every token request comes back `unauthorized_client`. It is a variable rather
+  than `--subject` because a profile reads no credential flag but `--secret`;
+  empty, the default, is no delegation.
+- **Drive's one write that leaves the building is sharing.** `google-drive`
+  has three levels. `read` is every GET — search (`files?q=`) and export
+  included — under `drive.readonly`. `edit` adds creating, uploading, copying,
+  renaming, moving and commenting under `drive`, denies DELETE and every
+  change to `/files/<id>/permissions` by name, and sends anything else (shared
+  drives, revisions, whose `published: true` puts a Doc on the web) to `ask`.
+  `write` is all of Drive v3. Below `write`, `/files/<id>/watch` and
+  `/changes/watch` are denied — `drive.readonly` is enough to open a push
+  channel to any URL, and it outlives the agent's token — and no level allows
+  `POST /batch/drive/v3`, whose sub-requests the ACL cannot see. What `edit`
+  cannot stop: moving a file into a folder that is already shared more widely,
+  and `trashed: true` in a PATCH, which is a delete Google keeps for 30 days.
+  Google Docs, Sheets and Slides have no bytes for `?alt=media`;
+  `/files/<id>/export` is the read. Shared-drive files need
+  `supportsAllDrives=true` (and `includeItemsFromAllDrives=true` on a list) or
+  they are silently left out.
 - **Asana's MCP server will not take the credential the proxy holds.** It
   issues its own tokens and answers a personal access token with `Invalid token
   signature - token was not issued by Asana OAuth`; its authorization server
