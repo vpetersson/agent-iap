@@ -82,7 +82,12 @@ pub enum AuthTemplate {
     /// Google and anything else doing RFC 7523. Scopes come from the access
     /// level, because "read" and "write" are different scopes, not just
     /// different paths.
-    ServiceAccountJwt,
+    ServiceAccountJwt {
+        /// Name of the `Var` holding the user to impersonate through
+        /// domain-wide delegation. Empty means the service account acts as
+        /// itself — the narrower of the two, so it is the default.
+        subject_var: Option<String>,
+    },
     /// S3 and its imitators: the request is signed, not decorated. The key id
     /// is the caller's and not secret, so it is a `Var`, like an OAuth client
     /// id; `region` may name a var too (`{region}`), because AWS's is the
@@ -180,6 +185,13 @@ impl Profile {
     /// shared constructor, which has no literal to put it in.
     fn probing(mut self, probe: &str) -> Self {
         self.probe = Some(probe.to_string());
+        self
+    }
+
+    /// Replace the note a shared constructor wrote — `google`'s is about
+    /// Search Console and GA4, which is the wrong advice for Drive.
+    fn noting(mut self, note: &str) -> Self {
+        self.note = Some(note.to_string());
         self
     }
 
@@ -760,7 +772,7 @@ fn build_auth(
             scope: Some(scopes.join(" ")).filter(|scope| !scope.is_empty()),
             audience: None,
         },
-        AuthTemplate::ServiceAccountJwt => AuthSpec::ServiceAccountJwt {
+        AuthTemplate::ServiceAccountJwt { subject_var } => AuthSpec::ServiceAccountJwt {
             key_file: Some(secret.to_string()),
             issuer: None,
             private_key: None,
@@ -768,7 +780,12 @@ fn build_auth(
             token_url: None,
             audience: None,
             scopes: scopes.to_vec(),
-            subject: None,
+            // Blank is "no delegation", not a `sub` of "" that Google answers
+            // with `invalid_grant` on the first call.
+            subject: subject_var
+                .and_then(|name| vars.get(&name).cloned())
+                .map(|subject| subject.trim().to_string())
+                .filter(|subject| !subject.is_empty()),
             lifetime_secs: None,
         },
         AuthTemplate::AwsSigv4 {
@@ -925,22 +942,38 @@ fn google(id: &str, title: &str, summary: &str, base_url: &str, levels: Vec<Acce
             about: "the service-account JSON key, exactly as Google issues it".into(),
             url: "https://console.cloud.google.com/iam-admin/serviceaccounts".into(),
         },
-        vars: vec![],
+        vars: vec![google_subject()],
         service: Service::Http {
             base_url: base_url.into(),
-            auth: AuthTemplate::ServiceAccountJwt,
+            auth: AuthTemplate::ServiceAccountJwt {
+                subject_var: Some("subject".into()),
+            },
         },
         access: levels,
         note: Some(
             "Grant the service account access to the property itself — a key with no \
              binding authenticates fine and then 403s. For Search Console add the \
              service-account email as a user on the site; for GA4 add it to the property. \
-             `--subject` on the upstream turns on domain-wide delegation if you need to \
-             act as a person instead."
+             `--var subject=<email>` turns on domain-wide delegation if you need to act \
+             as a person instead."
                 .into(),
         ),
         probe: None,
     }
+}
+
+/// The user a Google service account impersonates, if any. A variable rather
+/// than `--subject`, because a profile reads no credential flag but `--secret`
+/// — and the address only names who to act as; the key is still the credential.
+fn google_subject() -> Var {
+    v(
+        "subject",
+        "a Workspace user to act as through domain-wide delegation — leave empty for \
+         the service account to act as itself. Delegation has to be granted for this \
+         client id and these scopes in the Admin console first, or every token request \
+         is refused with `unauthorized_client`.",
+        Some(""),
+    )
 }
 
 fn cloudflare_mcp(slug: &str, host: &str, title: &str, summary: &str) -> Profile {
@@ -1179,6 +1212,84 @@ fn sentry_mcp_access() -> Vec<Access> {
 /// "may it write *to tasks*": an agent working a queue needs to comment,
 /// complete and assign, and needs none of the project, team, membership,
 /// webhook or export endpoints that `write` also hands over.
+fn google_drive_access() -> Vec<Access> {
+    // Google's batch endpoint, a sibling of `/drive/v3` on the same host. One
+    // POST carrying a multipart body of sub-requests, each with its own method
+    // and path — the same hole as Asana's `/batch`, denied by name so the
+    // refusal names a rule rather than `<default>`.
+    const BATCH: &[&str] = &["/batch/**"];
+    // Push channels. `drive.readonly` is enough to open one, so the scope does
+    // not keep them out of `read`; the ACL has to.
+    const WATCH: &[&str] = &["/drive/v3/files/*/watch", "/drive/v3/changes/watch"];
+    const SHARING: &[&str] = &[
+        "/drive/v3/files/*/permissions",
+        "/drive/v3/files/*/permissions/*",
+    ];
+    const CREATES: &[&str] = &[
+        "/drive/v3/files",
+        "/drive/v3/files/*/copy",
+        "/drive/v3/files/*/comments",
+        "/drive/v3/files/*/comments/*/replies",
+        "/upload/drive/v3/files",
+    ];
+    const EDITS: &[&str] = &[
+        "/drive/v3/files/*",
+        "/drive/v3/files/*/comments/*",
+        "/drive/v3/files/*/comments/*/replies/*",
+        "/upload/drive/v3/files/*",
+    ];
+    // A resumable upload's chunks are PUTs to the session it opened, on the
+    // create path or the update path.
+    const UPLOADS: &[&str] = &["/upload/drive/v3/files", "/upload/drive/v3/files/*"];
+    vec![
+        access(
+            "read",
+            "list, search, get, download and export; push channels and batch denied",
+            &["https://www.googleapis.com/auth/drive.readonly"],
+            vec![
+                rule("batch", &["*"], BATCH, "deny"),
+                rule("watch", &["*"], WATCH, "deny"),
+                // Every read in Drive v3 is a GET, search (`files?q=`) and
+                // export included.
+                rule("reads", &["GET"], &["/drive/v3/**"], "allow"),
+            ],
+        ),
+        access(
+            "edit",
+            "reads, plus create, upload, copy, rename, move and comment; DELETE and \
+             sharing denied, anything else prompts",
+            &["https://www.googleapis.com/auth/drive"],
+            vec![
+                rule("batch", &["*"], BATCH, "deny"),
+                rule("watch", &["*"], WATCH, "deny"),
+                rule("reads", &["GET"], &["/drive/v3/**"], "allow"),
+                // After `reads`, so listing who a file is shared with is still
+                // a read; what is denied is changing it.
+                rule("sharing", &["*"], SHARING, "deny"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("creates", &["POST"], CREATES, "allow"),
+                rule("edits", &["PATCH"], EDITS, "allow"),
+                rule("uploads", &["PUT"], UPLOADS, "allow"),
+                // Shared drives and revisions prompt — `published: true` on a
+                // revision puts a Doc on the web. `emptyTrash` is a DELETE and
+                // already refused above.
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "everything under Drive v3, sharing and DELETE included",
+            &["https://www.googleapis.com/auth/drive"],
+            vec![rule(
+                "all",
+                &["*"],
+                &["/drive/v3/**", "/upload/drive/v3/**"],
+                "allow",
+            )],
+        ),
+    ]
+}
+
 fn asana_rest_access() -> Vec<Access> {
     // `POST /batch` takes up to ten sub-requests, each with its own `method`
     // and `relative_path`, and runs them under the same credential. To this
@@ -1445,22 +1556,32 @@ pub fn catalog() -> Vec<Profile> {
         google(
             "google-drive",
             "Google Drive",
-            "List, search and download files.",
+            "List, search, download and export files; edit and comment at `edit`.",
             "https://www.googleapis.com",
-            vec![
-                access(
-                    "read",
-                    "list, get and download",
-                    &["https://www.googleapis.com/auth/drive.readonly"],
-                    vec![rule("reads", &["GET"], &["/drive/v3/**"], "allow")],
-                ),
-                access(
-                    "write",
-                    "also upload, update and delete",
-                    &["https://www.googleapis.com/auth/drive"],
-                    vec![rule("all", &["*"], &["/drive/v3/**", "/upload/drive/v3/**"], "allow")],
-                ),
-            ],
+            google_drive_access(),
+        )
+        .noting(
+            "A service account has a Drive of its own, and it is empty: `files.list` \
+             answers 200 with nothing in it, which looks like a broken grant and is not \
+             one. Either share the folders you mean with the service-account email — or \
+             add it to a shared drive — or set `--var subject=<email>` to act as a \
+             Workspace user through domain-wide delegation, in which case the token sees \
+             everything that user can. Shared drives also need \
+             `supportsAllDrives=true` (and `includeItemsFromAllDrives=true` on a list), \
+             or their files are silently left out. Google Docs, Sheets and Slides have no \
+             bytes to download: `?alt=media` 403s on them and `/files/<id>/export` is the \
+             read. `edit` creates, uploads, copies, renames, moves and comments; it \
+             denies DELETE and every change to `/permissions`, because sharing a file to \
+             `anyone` is the one write that hands the content to someone outside this \
+             proxy — but it cannot stop a file being moved into a folder that is already \
+             shared more widely, and `trashed: true` in a PATCH is a delete that \
+             Google keeps for 30 days. `/files/<id>/watch` and `/changes/watch` are \
+             denied below `write`: a channel pushes notifications to any URL until it \
+             expires — up to a day on a file, a week on changes — and does not stop when the agent's IAP token is revoked. \
+             `POST /batch/drive/v3` carries sub-requests the ACL cannot see into, so no \
+             level allows it. A resumable upload's `Location` is Google's own URL; send \
+             the follow-up PUT to the same path through the proxy, or use \
+             `uploadType=multipart`, which is one request.",
         )
         .probing("/drive/v3/about?fields=user"),
         google(
@@ -3145,6 +3266,71 @@ mod tests {
         let write = gsc.find_access("write").unwrap();
         assert!(read.scopes[0].ends_with("webmasters.readonly"));
         assert!(write.scopes[0].ends_with("/webmasters"));
+    }
+
+    #[test]
+    fn every_google_profile_delegates_through_a_variable_not_a_flag() {
+        // A profile refuses every credential flag but `--secret`, so a note
+        // telling the operator to pass `--subject` sent them to a refusal.
+        for profile in catalog().into_iter().filter(|p| p.vendor == "Google") {
+            assert!(
+                profile.vars.iter().any(|var| var.name == "subject"),
+                "`{}` has no `subject` variable",
+                profile.id
+            );
+            assert!(
+                !profile
+                    .note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("--subject"),
+                "`{}` still points at `--subject`",
+                profile.id
+            );
+        }
+
+        let drive = get("google-drive").unwrap();
+        let subject = |value: &str| {
+            let vars = BTreeMap::from([("subject".to_string(), value.to_string())]);
+            match build_auth(&drive.service, "op://P/GCP/key", &vars, &[]).unwrap() {
+                AuthSpec::ServiceAccountJwt { subject, .. } => subject,
+                other => panic!("google-drive enrolled as {other:?}"),
+            }
+        };
+        assert_eq!(
+            subject("person@example.com").as_deref(),
+            Some("person@example.com")
+        );
+        // Blank is no delegation, not a `sub` claim of "".
+        assert_eq!(subject(""), None);
+        assert_eq!(subject("  "), None);
+    }
+
+    #[test]
+    fn drive_scopes_follow_the_level_and_only_write_may_share() {
+        let drive = get("google-drive").unwrap();
+        assert_eq!(drive.default_access().name, "read");
+        let read = drive.find_access("read").unwrap();
+        assert_eq!(
+            read.scopes,
+            ["https://www.googleapis.com/auth/drive.readonly"]
+        );
+        let edit = drive.find_access("edit").unwrap();
+        assert_eq!(edit.scopes, ["https://www.googleapis.com/auth/drive"]);
+        let action = |level: &Access, suffix: &str| {
+            level
+                .rules
+                .iter()
+                .find(|rule| rule.suffix == suffix)
+                .map(|rule| rule.action.clone())
+        };
+        assert_eq!(action(edit, "sharing").as_deref(), Some("deny"));
+        assert_eq!(action(edit, "deletes").as_deref(), Some("deny"));
+        // Denials come before the allows they would otherwise lose to.
+        let position = |suffix: &str| edit.rules.iter().position(|r| r.suffix == suffix);
+        assert!(position("sharing") < position("edits"));
+        assert!(position("deletes") < position("creates"));
+        assert!(position("watch") < position("creates"));
     }
 
     #[test]

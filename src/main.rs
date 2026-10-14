@@ -3339,6 +3339,7 @@ fn show_profile(id: &str) -> Result<()> {
         println!("\nVARIABLES");
         for var in &profile.vars {
             let default = match &var.default {
+                Some(value) if value.is_empty() => " (optional)".to_string(),
                 Some(value) => format!(" (default `{value}`)"),
                 None => " (required)".to_string(),
             };
