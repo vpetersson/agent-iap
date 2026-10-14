@@ -357,6 +357,9 @@ pub enum Intent {
     /// rather than as a field, because it is the one thing on this form that
     /// is not being edited — ACL rules and agents' `targets` point at it.
     EditUpstream(String),
+    /// Rewriting the agent it names. The id travels with the intent for the
+    /// same reason: every audit record and every rule naming it says it.
+    EditAgent(String),
     McpServer,
     Rule,
     Profile,

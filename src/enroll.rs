@@ -501,30 +501,7 @@ pub fn add_agent(
         );
     }
 
-    // Targets that name nothing are the failure this command exists to catch:
-    // the file stays valid, the agent looks scoped, and every call it makes is
-    // denied by a rule that never mentions the target it was pointed at.
-    let reachable: Vec<&str> = existing
-        .upstreams
-        .iter()
-        .map(|up| up.name.as_str())
-        .chain(
-            existing
-                .mcp_servers
-                .iter()
-                .map(|server| server.name.as_str()),
-        )
-        .collect();
-    for target in targets {
-        if !reachable.iter().any(|name| *name == target) {
-            bail!(
-                "no upstream or MCP server named `{target}` in `{}` — add it first with \
-                 `agent-iap upstream add {target} --base-url <url>`, or `--any-target` for \
-                 all of them",
-                path.display()
-            );
-        }
-    }
+    check_targets(&existing, targets, path)?;
 
     let token = identity::generate_token()?;
 
@@ -548,6 +525,78 @@ pub fn add_agent(
         id: id.to_string(),
         token,
     })
+}
+
+/// Targets that name nothing are the failure enrolment exists to catch: the
+/// file stays valid, the agent looks scoped, and every call it makes is denied
+/// by a rule that never mentions the target it was pointed at.
+fn check_targets(existing: &Config, targets: &[String], path: &Path) -> Result<()> {
+    let reachable: Vec<&str> = existing
+        .upstreams
+        .iter()
+        .map(|up| up.name.as_str())
+        .chain(
+            existing
+                .mcp_servers
+                .iter()
+                .map(|server| server.name.as_str()),
+        )
+        .collect();
+    for target in targets {
+        if !reachable.iter().any(|name| *name == target) {
+            bail!(
+                "no upstream or MCP server named `{target}` in `{}` — add it first with \
+                 `agent-iap upstream add {target} --base-url <url>`, or `--any-target` for \
+                 all of them",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite an agent's name and targets in place.
+///
+/// Submitted whole, like `edit_upstream`: the console opens the form filled in
+/// from the file, so a field left alone is a field that survives, and a name
+/// cleared is a name removed. The id is not editable — it is what every audit
+/// record and every rule naming this agent says — and neither is the token,
+/// which has its own door in `rotate_agent`. `token_ref` is left exactly where
+/// it was.
+///
+/// The same refusal as `add_agent`: no targets and no `Any` is not read as
+/// "every target", because that is the blanket grant arrived at by clearing a
+/// field.
+pub fn edit_agent(path: &Path, id: &str, name: Option<&str>, reach: Reach<'_>) -> Result<()> {
+    let targets = reach.targets();
+    if targets.is_empty() && !reach.is_any() {
+        bail!(
+            "`{id}` was left with no targets, which in the file means *every* upstream and MCP \
+             server — name the services it may address, or turn on `any target` to say that \
+             is what you meant"
+        );
+    }
+
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    let index = agent_index(&existing, id, path)?;
+    check_targets(&existing, targets, path)?;
+
+    let entry = entry_mut(&mut document, "agents", index, path)?;
+    match name {
+        Some(name) => entry["name"] = toml_edit::value(name),
+        None => {
+            entry.remove("name");
+        }
+    }
+    // `Any` is the absent key, the one spelling of it — see `add_agent`.
+    match targets.is_empty() {
+        true => {
+            entry.remove("targets");
+        }
+        false => entry["targets"] = toml_edit::value(string_array(targets)),
+    }
+    save(path, document)
 }
 
 /// Remove `[[agents]]`, and with `prune` the rules that name it outright.

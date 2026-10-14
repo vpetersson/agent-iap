@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use crate::approval::{PendingView, Verdict};
 use crate::audit::AuditEvent;
-use crate::config::UpstreamConfig;
+use crate::config::{AgentConfig, UpstreamConfig};
 use crate::list::Inventory;
 use crate::profiles::Profile;
 use crate::reload::Trigger;
@@ -208,7 +208,12 @@ impl Tab {
                 ("d", "deny once"),
                 ("f", "forget"),
             ],
-            Tab::Agents => &[("n", "enrol"), ("t", "new token"), ("x", "revoke")],
+            Tab::Agents => &[
+                ("n", "enrol"),
+                ("e", "edit"),
+                ("t", "new token"),
+                ("x", "revoke"),
+            ],
             Tab::Upstreams => &[
                 ("n", "add"),
                 ("e", "edit"),
@@ -1285,7 +1290,20 @@ impl App {
             }
 
             (Tab::Agents, KeyCode::Char('n')) => {
-                self.modal = Some(Modal::Form(Box::new(agent_form())))
+                self.modal = Some(Modal::Form(Box::new(agent_form(&self.policy.inventory))))
+            }
+            // Name and targets, without opening the file. `enter` too, for
+            // the same double-click pairing the upstreams pane has.
+            (Tab::Agents, KeyCode::Char('e')) | (Tab::Agents, KeyCode::Enter) => {
+                if let Some(agent) = self
+                    .agent_at_cursor()
+                    .and_then(|id| self.policy.config.agent(&id).cloned())
+                {
+                    self.modal = Some(Modal::Form(Box::new(agent_edit_form(
+                        &agent,
+                        &self.policy.inventory,
+                    ))));
+                }
             }
             (Tab::Agents, KeyCode::Char('t')) => {
                 if let Some(id) = self.agent_at_cursor() {
@@ -2713,7 +2731,7 @@ fn draw_help(frame: &mut Frame, area: Rect) -> Rect {
             "n",
             "add — agent, upstream (from a profile, or spelled out), MCP server, rule",
         ),
-        ("e", "edit the upstream the cursor is on"),
+        ("e", "edit the agent or upstream the cursor is on"),
         (
             "v",
             "verify the upstream or MCP server the cursor is on — call it, with its credential",
@@ -2799,25 +2817,98 @@ fn picked(form: &Form) -> Option<String> {
     form.picker.then(|| form.text("id"))
 }
 
-fn agent_form() -> Form {
+/// Enrol an agent.
+///
+/// `any target` opens on. Reach is the coarse gate in front of the ACL, not
+/// the grant — a new agent still has every call decided by a rule or by
+/// `acl_default` — and a form that opened on neither answer could not be
+/// submitted as it stood, with nothing on it to say what the blank field
+/// wanted. Names typed into `targets` win over the switch, so narrowing it is
+/// one field rather than two (see `actions::reach`).
+fn agent_form(inventory: &Inventory) -> Form {
     Form::new(
         Intent::Agent,
         "enrol an agent",
         "Mints a token and writes only its sha256. The token is shown once, here — `c` copies it.",
         vec![
-            Field::text("id", "id", "how the agent authenticates, and the name every audit record uses"),
-            Field::text("name", "name", "what a human calls it, when the id is not that"),
             Field::text(
-                "targets",
-                "targets",
-                "upstreams and MCP servers it may address at all. One of this and the switch below.",
+                "id",
+                "id",
+                "how the agent authenticates, and the name every audit record uses",
             ),
-            Field::flag(
-                "any-target",
-                "any target",
-                "every upstream and MCP server, including ones added later — the widest thing this file can say about an agent",
+            Field::text(
+                "name",
+                "name",
+                "what a human calls it, when the id is not that",
             ),
+            targets_field(inventory, ""),
+            any_target_field(true),
         ],
+    )
+}
+
+/// The same form, opened on an agent that already exists.
+///
+/// Prefilled from the file and submitted whole, like `upstream_edit_form`.
+/// The id is missing on purpose — it is what the audit log and the rules
+/// naming this agent say — and so is the token, which is `t`.
+fn agent_edit_form(agent: &AgentConfig, inventory: &Inventory) -> Form {
+    Form::new(
+        Intent::EditAgent(agent.id.clone()),
+        &format!("edit agent `{}`", agent.id),
+        "Rewrites its name and targets. The token is untouched — `t` on the pane mints a new one.",
+        vec![
+            Field::prefilled(
+                "name",
+                "name",
+                "what a human calls it, when the id is not that",
+                agent.name.as_deref().unwrap_or_default(),
+            ),
+            targets_field(inventory, &agent.targets.join(", ")),
+            any_target_field(agent.targets.is_empty()),
+        ],
+    )
+}
+
+/// What an agent may address, with the names it could hold in the hint: the
+/// field is a list, and a list of what is enrolled is the cue a blank one
+/// never gave.
+fn targets_field(inventory: &Inventory, value: &str) -> Field {
+    let names: Vec<String> = inventory
+        .upstreams
+        .iter()
+        .flatten()
+        .map(|upstream| upstream.name.clone())
+        .chain(
+            inventory
+                .mcp_servers
+                .iter()
+                .flatten()
+                .map(|server| server.name.clone()),
+        )
+        .collect();
+    let enrolled = match names.is_empty() {
+        true => "none enrolled yet".to_string(),
+        false => format!("enrolled: {}", names.join(", ")),
+    };
+    Field::prefilled(
+        "targets",
+        "targets",
+        format!(
+            "upstreams and MCP servers it may address, comma-separated ({enrolled}). \
+             Names here win over the switch below."
+        ),
+        value,
+    )
+}
+
+fn any_target_field(on: bool) -> Field {
+    Field::switch(
+        "any-target",
+        "any target",
+        "every upstream and MCP server, including ones added later, when `targets` is empty — \
+         the ACL still decides each call",
+        on,
     )
 }
 
@@ -3273,6 +3364,7 @@ mod tests {
     use crate::acl::AccessRequest;
     use crate::approval::AskingRule;
     use crate::config::Config;
+    use crate::enroll;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -3826,7 +3918,7 @@ action = "deny"
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
 
-        let mut form = agent_form();
+        let mut form = agent_form(&app.policy.inventory);
         form.fields[0].value = form::Value::Text("codex".into());
         form.fields[2].value = form::Value::Text("github".into());
 
@@ -5597,11 +5689,8 @@ base_url = "https://api.github.com"
         for ch in "new-agent".chars() {
             app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
         }
-        // id → name → targets → the `any target` switch, turned on.
-        for _ in 0..3 {
-            app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
-        }
-        app.handle(KeyEvent::from(KeyCode::Char(' '))).unwrap();
+        // Nothing else: the form opens on `any target`, so an id is all it
+        // needs to be submittable.
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
         app.settle().await;
 
@@ -5610,10 +5699,53 @@ base_url = "https://api.github.com"
         assert!(!app.flash.as_ref().unwrap().failed);
     }
 
-    /// And the form will not do it by being left alone. Same rule as the
-    /// command line: the blanket grant is a decision, not a default.
+    /// The form used to open on a blank `targets` and the switch off, which
+    /// it would not submit, with nothing on screen to say what the field
+    /// wanted. It opens on `any target` now, says what is enrolled, and a
+    /// name typed into `targets` still narrows it.
     #[tokio::test]
-    async fn the_enrol_form_will_not_grant_every_target_by_default() {
+    async fn the_enrol_form_opens_on_any_target_and_typed_targets_narrow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+
+        let form = agent_form(&app.policy.inventory);
+        assert!(form.flag("any-target"), "the switch opens on");
+        let hint = &form
+            .fields
+            .iter()
+            .find(|field| field.key == "targets")
+            .expect("a targets field")
+            .hint;
+        assert!(hint.contains("enrolled: github"), "{hint}");
+
+        let mut wide = agent_form(&app.policy.inventory);
+        wide.fields[0].value = form::Value::Text("wide".into());
+        let effect = actions::submit(&app.policy, &wide).unwrap();
+        assert!(
+            effect.message.contains("every upstream"),
+            "{}",
+            effect.message
+        );
+
+        let mut narrow = agent_form(&app.policy.inventory);
+        narrow.fields[0].value = form::Value::Text("narrow".into());
+        narrow.fields[2].value = form::Value::Text("github".into());
+        let effect = actions::submit(&app.policy, &narrow).unwrap();
+        assert!(effect.message.contains("github"), "{}", effect.message);
+
+        let config = enroll::policy(&app.policy.path).unwrap();
+        assert!(config.agent("wide").unwrap().targets.is_empty());
+        assert_eq!(
+            config.agent("narrow").unwrap().targets,
+            vec!["github".to_string()],
+            "a name typed beside a switch left on is the narrower answer, not ignored"
+        );
+    }
+
+    /// The switch turned off with nothing typed is still the blanket grant by
+    /// omission, and still refused — the same rule as the command line.
+    #[tokio::test]
+    async fn the_enrol_form_will_not_grant_every_target_by_omission() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
         app.tab = Tab::Agents;
@@ -5622,6 +5754,11 @@ base_url = "https://api.github.com"
         for ch in "new-agent".chars() {
             app.handle(KeyEvent::from(KeyCode::Char(ch))).unwrap();
         }
+        // id → name → targets → the `any target` switch, turned off.
+        for _ in 0..3 {
+            app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        }
+        app.handle(KeyEvent::from(KeyCode::Char(' '))).unwrap();
         app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
 
         assert_eq!(
@@ -5638,6 +5775,96 @@ base_url = "https://api.github.com"
         let error = form.error.as_deref().expect("with the reason on it");
         assert!(error.contains("--any-target"), "{error}");
     }
+
+    /// Changing what an agent may reach, or what it is called, meant an
+    /// editor. `e` on the row, the form filled in from the file, and the
+    /// token it already holds goes on working.
+    #[tokio::test]
+    async fn an_agent_can_be_edited_in_the_console_without_losing_its_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Agents;
+        app.clamp_cursors();
+
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("`e` on an agent opens the form");
+        };
+        assert_eq!(form.text("name"), "Claude Code", "prefilled from the file");
+        assert!(form.flag("any-target"), "no targets in the file is any");
+
+        // name → targets
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        type_in(&mut app, "github");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(app.modal.is_none(), "a saved form closes");
+        app.settle().await;
+
+        let agent = app
+            .state
+            .config()
+            .agent("claude-code")
+            .cloned()
+            .expect("still there, under the id its rules and audit records use");
+        assert_eq!(agent.targets, vec!["github".to_string()]);
+        assert_eq!(
+            agent.name.as_deref(),
+            Some("Claude Code"),
+            "left alone, kept"
+        );
+        assert_eq!(
+            app.state
+                .agents
+                .authenticate("iap_test")
+                .map(|agent| agent.id.clone()),
+            Some("claude-code".to_string()),
+            "an edit is not a rotation: the token it holds still works"
+        );
+
+        // Reopened, it reads back what was written — and clearing the
+        // targets with the switch off is the blanket grant by omission.
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form opens again");
+        };
+        assert_eq!(form.text("targets"), "github");
+        assert!(!form.flag("any-target"));
+        app.handle(KeyEvent::from(KeyCode::Tab)).unwrap();
+        app.handle(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("refused, so the form stays up");
+        };
+        let error = form.error.as_deref().expect("with the reason on it");
+        assert!(error.contains("any target"), "{error}");
+        assert_eq!(
+            enroll::policy(&app.policy.path)
+                .unwrap()
+                .agent("claude-code")
+                .unwrap()
+                .targets,
+            vec!["github".to_string()],
+            "and the file is untouched"
+        );
+    }
+
+    /// A target that names nothing is refused on an edit as on an enrolment.
+    #[tokio::test]
+    async fn an_agent_edit_refuses_a_target_that_is_not_enrolled() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_for_test(dir.path());
+        let agent = app.policy.config.agent("claude-code").cloned().unwrap();
+
+        let mut form = agent_edit_form(&agent, &app.policy.inventory);
+        form.fields[1].value = form::Value::Text("linear".into());
+        let error = match actions::submit(&app.policy, &form) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("`linear` is not in the file"),
+        };
+        assert!(error.contains("`linear`"), "{error}");
+    }
+
     /// The rules pane's own door into the same grant. `target` is prefilled
     /// `*`, so a form walked through on its defaults with `allow` picked is
     /// the console typing the rule SIRI-186 was reported about.

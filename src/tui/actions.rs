@@ -163,6 +163,31 @@ impl Effect {
     }
 }
 
+/// What an agent form says about where the agent may go.
+///
+/// Targets typed into the field win over the `any target` switch. The switch
+/// opens on for a new agent, so it is often the form talking rather than the
+/// operator, and of the two readings of "both" the narrower one is the one a
+/// default may never widen past. Neither is `Only(&[])`, which `enroll`
+/// refuses with the reason.
+fn reach<'a>(form: &Form, targets: &'a [String]) -> enroll::Reach<'a> {
+    match targets.is_empty() && form.flag("any-target") {
+        true => enroll::Reach::Any,
+        false => enroll::Reach::Only(targets),
+    }
+}
+
+/// The same, said back after the write — every time, because the blanket
+/// grant is the widest thing the file can say about an agent.
+fn reaches(reach: enroll::Reach<'_>) -> String {
+    match reach {
+        enroll::Reach::Any => {
+            "It may address every upstream and MCP server — the ACL decides each call.".into()
+        }
+        enroll::Reach::Only(targets) => format!("It may address: {}.", targets.join(", ")),
+    }
+}
+
 /// Apply a filled-in form to the policy file.
 pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
     let path = policy.path.as_path();
@@ -170,21 +195,26 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
         Intent::Agent => {
             let id = required(form, "id")?;
             let targets = form.list("targets");
-            let agent = enroll::add_agent(
-                path,
-                &id,
-                form.opt("name").as_deref(),
-                match form.flag("any-target") {
-                    true => enroll::Reach::Any,
-                    false => enroll::Reach::Only(&targets),
-                },
-            )?;
+            let reach = reach(form, &targets);
+            let agent = enroll::add_agent(path, &id, form.opt("name").as_deref(), reach)?;
             Ok(Effect {
-                message: format!("enrolled `{id}` — its token is live now, no restart needed"),
+                message: format!(
+                    "enrolled `{id}` — its token is live now, no restart needed. {}",
+                    reaches(reach)
+                ),
                 token: Some((agent.id, agent.token)),
                 preview: None,
                 verify: None,
             })
+        }
+        Intent::EditAgent(id) => {
+            let targets = form.list("targets");
+            let reach = reach(form, &targets);
+            enroll::edit_agent(path, id, form.opt("name").as_deref(), reach)?;
+            Ok(Effect::said(format!(
+                "updated agent `{id}` — live now. {}",
+                reaches(reach)
+            )))
         }
         Intent::Upstream => {
             let name = required(form, "name")?;
