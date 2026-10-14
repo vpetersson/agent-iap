@@ -1041,6 +1041,159 @@ fn sentry_mcp_access() -> Vec<Access> {
     ]
 }
 
+/// What `read`, `triage` and `write` mean for the Asana REST API.
+///
+/// Split out because two of the three levels are mostly one long list of paths,
+/// and because the thing an operator is deciding here is not "may it write" but
+/// "may it write *to tasks*": an agent working a queue needs to comment,
+/// complete and assign, and needs none of the project, team, membership,
+/// webhook or export endpoints that `write` also hands over.
+fn asana_rest_access() -> Vec<Access> {
+    // `POST /batch` takes up to ten sub-requests, each with its own `method`
+    // and `relative_path`, and runs them under the same credential. To this
+    // ACL it is one POST to one path: a rule that allows it allows everything
+    // the token can reach, and the audit log records a single row reading
+    // `POST /batch` with the real operations inside a body nothing here reads.
+    // So the narrower levels deny it by name rather than letting it fall
+    // through to `acl_default` — the refusal then names the rule that made it.
+    const BATCH: &[&str] = &["/batch"];
+    // Working a task queue: create, comment, complete, assign, re-file. Every
+    // one of these addresses a task or a section, which is what keeps `triage`
+    // off `/projects`, `/teams`, `/workspaces`, `/memberships`, `/webhooks`
+    // and the export endpoints — those fall through to the `ask` rule below.
+    const TASK_WRITES: &[&str] = &[
+        "/tasks",
+        "/tasks/*/stories",
+        "/tasks/*/subtasks",
+        "/tasks/*/addProject",
+        "/tasks/*/removeProject",
+        "/tasks/*/addTag",
+        "/tasks/*/removeTag",
+        "/tasks/*/addFollowers",
+        "/tasks/*/removeFollowers",
+        "/tasks/*/addDependencies",
+        "/tasks/*/removeDependencies",
+        "/tasks/*/addDependents",
+        "/tasks/*/removeDependents",
+        "/tasks/*/setParent",
+        "/sections/*/addTask",
+    ];
+    vec![
+        access(
+            "read",
+            "GET across the whole 1.0 API; the batch endpoint is denied by name",
+            &[],
+            vec![
+                rule("batch", &["*"], BATCH, "deny"),
+                // Every search, typeahead and report in this API is a GET —
+                // `/workspaces/*/tasks/search` included — so unlike PostHog or
+                // Graylog there is no read here that needs a POST allowed.
+                rule("reads", &["GET"], &["/**"], "allow"),
+            ],
+        ),
+        access(
+            "triage",
+            "reads, plus commenting on and editing tasks; DELETE denied, anything \
+             else prompts",
+            &[],
+            vec![
+                rule("batch", &["*"], BATCH, "deny"),
+                rule("reads", &["GET"], &["/**"], "allow"),
+                rule("task-writes", &["POST"], TASK_WRITES, "allow"),
+                // Completing, assigning, re-dating and renaming a task are one
+                // PUT with different bodies. `/stories/*` is the comment it
+                // just left: Asana refuses an edit to anybody else's with a
+                // 403 of its own, so the ACL does not have to.
+                rule("task-edits", &["PUT"], &["/tasks/*", "/stories/*"], "allow"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every method across the whole API, batch and webhooks included",
+            &[],
+            vec![rule("all", &["*"], &["/**"], "allow")],
+        ),
+    ]
+}
+
+/// The V2 MCP server's tools, by what they do to the Work Graph.
+///
+/// Named one by one rather than matched by verb prefix: the catalog is
+/// documented, small enough to write down, and inconsistent enough that a verb
+/// rule would mis-sort it — `search_objects` and `search_tasks` read, while
+/// `create_tasks`, `update_tasks` and `delete_task` are the three tools that
+/// change anything and all three sort under verbs no `get_*` glob catches.
+/// Asana says the list moves, so everything unrecognised prompts rather than
+/// being denied: a tool added next month arrives as an `ask` row in the audit
+/// log, not as a silent failure.
+fn asana_mcp_access() -> Vec<Access> {
+    const READS: &[&str] = &[
+        "search_objects",
+        "search_tasks",
+        // Drafts a search and renders it; it reads and commits nothing.
+        "search_tasks_preview",
+        "get_task",
+        "get_tasks",
+        "get_my_tasks",
+        "get_project",
+        "get_projects",
+        "get_portfolio",
+        "get_portfolios",
+        "get_items_for_portfolio",
+        "get_status_overview",
+        "get_attachments",
+        "get_user",
+        "get_me",
+        "get_users",
+        "get_teams",
+        "get_agent",
+        "get_workspace_agents",
+    ];
+    vec![
+        access(
+            "read",
+            "the tools that look things up; everything else prompts",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "triage",
+            "also creating, updating and commenting on tasks — not deleting them, \
+             and nothing at project level",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule(
+                    "task-writes",
+                    &["tools/call"],
+                    &[
+                        "create_tasks",
+                        "update_tasks",
+                        "add_comment",
+                        // Drafts a task for review before anything is created.
+                        // Harmless on its own, and useless without the create
+                        // tool beside it, so it sits at this level.
+                        "create_task_preview",
+                    ],
+                    "allow",
+                ),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every tool the server exposes, `delete_task` included",
+            &[],
+            vec![rule("tools", &["tools/call"], &["**"], "allow")],
+        ),
+    ]
+}
+
 pub fn catalog() -> Vec<Profile> {
     let mut profiles = vec![
         // ---------------- Google ----------------
@@ -1234,6 +1387,137 @@ pub fn catalog() -> Vec<Profile> {
                 ),
             ],
         ),
+        // ---------------- Asana ----------------
+        Profile {
+            id: "asana".into(),
+            title: "Asana REST API".into(),
+            vendor: "Asana".into(),
+            summary: "Tasks, projects, portfolios, goals and the rest of the Work Graph."
+                .into(),
+            default_name: "asana".into(),
+            credential: Credential {
+                about: "a personal access token, or a service account token on Enterprise — \
+                        neither carries scopes, so this ACL is the only narrowing there is"
+                    .into(),
+                url: "https://app.asana.com/0/my-apps".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://app.asana.com/api/1.0".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: asana_rest_access(),
+            note: Some(
+                "An Asana token has no scopes. A personal access token is the whole of what \
+                 its owner can see in every workspace they belong to, and the ACL cannot \
+                 narrow that by workspace or project: most of this API addresses objects by \
+                 gid — `/tasks/<gid>` is the entire path — so there is nothing in the path \
+                 for a rule to match a workspace against. If \"which projects\" has to be a \
+                 real limit, it belongs in Asana: a service account (Enterprise) or a bot \
+                 user invited only to the projects you mean, whose token is then what this \
+                 proxy holds. `POST /batch` is the hole that follows from that: it carries \
+                 up to ten sub-requests, each naming its own method and path, so one \
+                 allowed POST becomes every call the token can make and the audit log keeps \
+                 one row reading `POST /batch`. `read` and `triage` deny it; `write` allows \
+                 it, where it grants nothing new but does cost you the detail in the log. \
+                 Two more things `write` hands over quietly: `POST /webhooks` registers a \
+                 durable push of workspace changes to any URL, which outlives this policy \
+                 and does not stop when the agent's IAP token is revoked, and \
+                 `/organization_exports`, `/exports/graph` and `/exports/resource` dump the \
+                 domain rather than read a record — reads in effect, POSTs in shape, and \
+                 outside `read` for that reason. Finally, the MCP server is a separate \
+                 credential and not this one: it answers a personal access token with \
+                 `token was not issued by Asana OAuth`, and a token minted for an MCP app \
+                 is refused here. `asana-mcp` is the profile for it."
+                    .into(),
+            ),
+            // The documented "is this token good" call, and the reason the
+            // profile declares one at all: the base URL answers `404 No
+            // matching route for request` to a perfect token and a garbage one
+            // alike, so probing the root would report a wrong base URL for a
+            // credential that is fine. `/users/me` is a GET, free, on every
+            // plan, and 401s with `Not Authorized` for a bad token.
+            probe: Some("/users/me".into()),
+        },
+        Profile {
+            id: "asana-mcp".into(),
+            title: "Asana MCP server (V2)".into(),
+            vendor: "Asana".into(),
+            summary: "The Work Graph as MCP tools: search, tasks, projects, portfolios, \
+                      status."
+                .into(),
+            default_name: "asana-mcp".into(),
+            credential: Credential {
+                about: "nothing this proxy holds — an Asana MCP app's client id and secret \
+                        in a file the `mcp-remote` child reads, plus a browser sign-in on \
+                        first use"
+                    .into(),
+                url: "https://app.asana.com/0/my-apps".into(),
+            },
+            vars: vec![v(
+                "client_file",
+                "absolute path to a JSON file holding your Asana MCP app's credentials — \
+                 `{\"client_id\": \"…\", \"client_secret\": \"…\"}`, mode 600. `mcp-remote` \
+                 reads the file itself, so `~` is not expanded and the secret stays off the \
+                 command line. Register the app's redirect URL as \
+                 `http://localhost:3334/oauth/callback`, which is the port below.",
+                None,
+            )],
+            service: Service::McpStdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    // Pinned to `@latest` because that is the invocation Asana
+                    // documents for this server, and `mcp-remote`'s OAuth
+                    // behaviour is what the setup depends on.
+                    "mcp-remote@latest".into(),
+                    "https://mcp.asana.com/v2/mcp".into(),
+                    // The callback port, as a positional argument. Explicit
+                    // rather than derived, because Asana requires the redirect
+                    // URL to be registered on the app and to match exactly —
+                    // `mcp-remote` then fails instead of walking to a free
+                    // port, which is the behaviour you want when the port is
+                    // half of a registration.
+                    "3334".into(),
+                    "--static-oauth-client-info".into(),
+                    "@{client_file}".into(),
+                    // RFC 8707 resource indicator. Asana's docs spell it
+                    // `https://mcp.asana.com/v2` for one client and the full
+                    // endpoint for another; this is what the server itself
+                    // publishes as `resource` in its protected-resource
+                    // metadata, and `mcp-remote` sends none unless told.
+                    "--resource".into(),
+                    "https://mcp.asana.com/v2/mcp".into(),
+                ],
+                env: vec![],
+            },
+            access: asana_mcp_access(),
+            note: Some(
+                "Asana's MCP server does OAuth and nothing else: it answers a personal \
+                 access token with `Invalid token signature - token was not issued by Asana \
+                 OAuth`, and its authorization server offers only the authorization-code \
+                 and refresh-token grants — there is no exchange the proxy could perform on \
+                 its own. So this profile runs the server through `npx mcp-remote`, which \
+                 does the browser flow and caches the grant in `~/.mcp-auth` on the host \
+                 running the proxy: every JSON-RPC message is still ruled on and logged \
+                 here, but the credential lives in the child rather than in the proxy, and \
+                 the client secret lives in the file `--var client_file=…` points at. That \
+                 file is read by `mcp-remote`, not by this proxy, so it is outside the \
+                 credential machinery `agent-iap list credentials` inventories. `mcp-remote` \
+                 is community software Asana does not support. An authorized session is \
+                 pinned to the one workspace chosen at sign-in and carries whatever the \
+                 authorizing user can see — MCP apps take no scopes — so the tool rules \
+                 here are the only narrowing, and `asana` is the profile to reach for when \
+                 the credential has to stay with the proxy. If the token exchange is \
+                 refused, the `--resource` argument is the one to try without. The beta \
+                 server at `https://mcp.asana.com/sse` is deprecated and shuts down on \
+                 11 May 2026; this profile uses the V2 endpoint. Command by Asana has its \
+                 own server at `https://mcp.asana.com/v2/command/mcp`, which needs a \
+                 Command licence and is not this profile."
+                    .into(),
+            ),
+            probe: None,
+        },
         // ---------------- PostHog ----------------
         Profile {
             id: "posthog".into(),
@@ -2995,6 +3279,208 @@ mod tests {
                 }),
                 "`triage` does not reach `{path}`"
             );
+        }
+    }
+
+    /// The first rule that matches, which is how the ACL itself decides.
+    fn decide<'a>(level: &'a Access, method: &str, path: &str) -> Option<&'a str> {
+        level
+            .rules
+            .iter()
+            .find(|rule| {
+                rule.methods.iter().any(|m| m == method || m == "*")
+                    && rule.paths.iter().any(|pattern| {
+                        globset::Glob::new(pattern)
+                            .map(|glob| glob.compile_matcher().is_match(path))
+                            .unwrap_or(false)
+                    })
+            })
+            .map(|rule| rule.action.as_str())
+    }
+
+    /// The scheme, and the one route that can answer for the credential.
+    ///
+    /// Asana's base URL answers `404 No matching route for request` to a good
+    /// token and a garbage one alike, so a profile that probed the root would
+    /// report a wrong base URL for a token that is fine.
+    #[test]
+    fn asana_authenticates_a_bearer_token_and_probes_a_route_that_can_fail() {
+        let asana = get("asana").unwrap();
+        match build_auth(
+            &asana.service,
+            "op://Private/Asana/pat",
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap()
+        {
+            AuthSpec::Bearer { secret } => assert_eq!(secret, "op://Private/Asana/pat"),
+            other => panic!("Asana authenticates a bearer token, got {other:?}"),
+        }
+        assert_eq!(asana.probe.as_deref(), Some("/users/me"));
+        // Nothing here is the operator's to supply: the token is the whole
+        // address, so a var would be a field the console asks for and the
+        // policy never uses.
+        assert!(asana.vars.is_empty());
+    }
+
+    /// `POST /batch` runs up to ten sub-requests, each naming its own method
+    /// and path, under the same credential. To the ACL it is one POST to one
+    /// path — so a level that allowed it would allow everything the token can
+    /// reach, and leave the audit log one row reading `POST /batch`. Denying it
+    /// by name is also what makes the refusal name a rule instead of
+    /// `<default>`.
+    #[test]
+    fn the_narrow_asana_levels_refuse_the_endpoint_that_tunnels_every_other_call() {
+        let asana = get("asana").unwrap();
+        for level in ["read", "triage"] {
+            let level = asana.find_access(level).unwrap();
+            for method in ["POST", "GET", "DELETE"] {
+                assert_eq!(
+                    decide(level, method, "/batch"),
+                    Some("deny"),
+                    "`{}` does not deny `{method} /batch`",
+                    level.name
+                );
+            }
+        }
+        // `write` is every method on every path and says so; what batch costs
+        // there is the audit detail, which is in the note rather than a rule.
+        assert_eq!(
+            decide(asana.find_access("write").unwrap(), "POST", "/batch"),
+            Some("allow")
+        );
+        let note = asana.note.as_deref().expect("the limits are written down");
+        assert!(note.contains("/batch"), "{note}");
+        assert!(note.contains("/webhooks"), "{note}");
+    }
+
+    /// What `triage` is for: an agent that works a task queue. Reads, comments,
+    /// task edits — and not the project, team, membership or webhook
+    /// endpoints `write` also hands over.
+    #[test]
+    fn asana_triage_writes_to_tasks_and_asks_before_anything_else() {
+        let triage = get("asana").unwrap().find_access("triage").unwrap().clone();
+
+        assert_eq!(decide(&triage, "GET", "/projects/1201"), Some("allow"));
+        assert_eq!(
+            decide(&triage, "GET", "/workspaces/1337/tasks/search"),
+            Some("allow"),
+            "every Asana search is a GET, so the read rule has to cover them"
+        );
+        // Commenting, creating, completing and re-filing a task.
+        for path in [
+            "/tasks",
+            "/tasks/1204/stories",
+            "/tasks/1204/subtasks",
+            "/tasks/1204/addProject",
+            "/sections/1205/addTask",
+        ] {
+            assert_eq!(decide(&triage, "POST", path), Some("allow"), "{path}");
+        }
+        assert_eq!(decide(&triage, "PUT", "/tasks/1204"), Some("allow"));
+
+        // One path over is a project edit, a new team member or a webhook
+        // pointed at a URL of the caller's choosing. `ask` with nobody at the
+        // console resolves to a denial, which is the safe end of it.
+        for (method, path) in [
+            ("POST", "/projects"),
+            ("PUT", "/projects/1201"),
+            ("POST", "/webhooks"),
+            ("POST", "/teams/1300/addUser"),
+            ("POST", "/organization_exports"),
+            ("POST", "/exports/graph"),
+        ] {
+            assert_eq!(
+                decide(&triage, method, path),
+                Some("ask"),
+                "`{method} {path}` is not a triage action"
+            );
+        }
+        // Deleting a task takes its subtasks with it and cannot be undone, so
+        // it is refused rather than put to a human.
+        assert_eq!(decide(&triage, "DELETE", "/tasks/1204"), Some("deny"));
+    }
+
+    /// Asana's MCP server issues its own tokens and accepts nothing else: a
+    /// personal access token comes back `token was not issued by Asana OAuth`,
+    /// and its authorization server offers only the authorization-code and
+    /// refresh-token grants. There is no exchange the proxy can perform, so
+    /// the grant goes to an `mcp-remote` child — and the note has to say so,
+    /// because "the proxy holds the credential" is the reason this proxy
+    /// exists and this is the profile where it is not true.
+    #[test]
+    fn the_asana_mcp_profile_delegates_an_oauth_flow_the_proxy_cannot_perform() {
+        let profile = get("asana-mcp").unwrap();
+        let vars = BTreeMap::from([(
+            "client_file".to_string(),
+            "/etc/agent-iap/asana-client.json".to_string(),
+        )]);
+        let service = substitute_service(&profile.service, &vars, "").unwrap();
+        let Service::McpStdio { command, args, env } = &service else {
+            panic!("the V2 server takes no credential this proxy could inject");
+        };
+        assert_eq!(command, "npx");
+        assert!(args.contains(&"https://mcp.asana.com/v2/mcp".to_string()));
+        // The port is half of a registered redirect URL, so it is pinned
+        // rather than derived.
+        assert!(args.contains(&"3334".to_string()));
+        assert!(args.contains(&"@/etc/agent-iap/asana-client.json".to_string()));
+        // Nothing of the operator's goes into the child's environment: the
+        // client secret is in the file the flag points at, which `mcp-remote`
+        // reads itself.
+        assert!(env.is_empty());
+        assert!(matches!(
+            build_auth(&service, "", &vars, &[]).unwrap(),
+            AuthSpec::None
+        ));
+
+        let note = profile.note.as_deref().expect("where the grant lives");
+        assert!(note.contains("mcp-remote"), "{note}");
+        assert!(note.contains("not issued by Asana OAuth"), "{note}");
+    }
+
+    /// The V2 tool catalog, sorted by what each tool does rather than by the
+    /// verb it starts with: `search_objects` reads, `update_tasks` writes, and
+    /// `delete_task` is the one that cannot be undone.
+    #[test]
+    fn the_asana_mcp_levels_sort_the_tools_by_what_they_do() {
+        let profile = get("asana-mcp").unwrap();
+        let tool = |level: &str, name: &str| -> Option<String> {
+            decide(profile.find_access(level).unwrap(), "tools/call", name).map(str::to_string)
+        };
+        for read in ["search_objects", "get_my_tasks", "get_status_overview"] {
+            assert_eq!(tool("read", read).as_deref(), Some("allow"), "{read}");
+        }
+        for write in ["create_tasks", "update_tasks", "add_comment", "delete_task"] {
+            assert_eq!(tool("read", write).as_deref(), Some("ask"), "{write}");
+        }
+        for triage in ["create_tasks", "update_tasks", "add_comment"] {
+            assert_eq!(tool("triage", triage).as_deref(), Some("allow"), "{triage}");
+        }
+        // Permanent, and it takes subtasks with it.
+        assert_eq!(tool("triage", "delete_task").as_deref(), Some("ask"));
+        assert_eq!(tool("write", "delete_task").as_deref(), Some("allow"));
+        // Asana says the catalog moves, so a tool nobody here has met prompts
+        // rather than failing as a denial nothing explains.
+        assert_eq!(
+            tool("read", "some_tool_shipped_next_month").as_deref(),
+            Some("ask")
+        );
+    }
+
+    /// Two profiles, one vocabulary: `--access triage` has to mean the same
+    /// thing whether it is given to the REST API or to the MCP server.
+    #[test]
+    fn both_asana_profiles_offer_the_same_three_levels() {
+        for id in ["asana", "asana-mcp"] {
+            let names: Vec<_> = get(id)
+                .unwrap()
+                .access
+                .iter()
+                .map(|level| level.name.clone())
+                .collect();
+            assert_eq!(names, ["read", "triage", "write"], "`{id}`");
         }
     }
 

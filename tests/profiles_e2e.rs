@@ -813,6 +813,92 @@ fn a_dry_run_writes_nothing_and_prints_what_it_would_have() {
     assert!(!added.rules.is_empty());
 }
 
+/// What an agent working a task queue can do through a real proxy, and the
+/// three refusals that never reach Asana.
+///
+/// The batch case is the one worth a live proxy: `POST /batch` carries its own
+/// method and path per sub-request, so if it were reachable at this level the
+/// policy would mean nothing — and a round trip that merely returned an error
+/// would still have spent the credential.
+#[tokio::test]
+async fn asana_triage_comments_on_a_task_and_cannot_tunnel_past_the_policy() {
+    std::env::set_var("TEST_ASANA_PAT", "asana-real-pat");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_ASANA_PAT");
+    opts.access = Some("triage".into());
+    let harness = harness_from_profiles(&[("asana", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/asana/workspaces/1337/tasks/search").await;
+    assert_eq!(status, 200);
+    // Asana's every search is a GET, so the read rule covers them; the real
+    // token went upstream and the agent's own did not travel with it.
+    assert_eq!(seen["authorization"], "Bearer asana-real-pat");
+    assert!(seen["x-iap-token"].is_null());
+
+    let (status, seen) = call(&harness, "POST", "/asana/tasks/1204/stories").await;
+    assert_eq!(status, 200, "a triage agent cannot comment on a task");
+    assert_eq!(seen["method"], "POST");
+
+    let (status, seen) = call(&harness, "PUT", "/asana/tasks/1204").await;
+    assert_eq!(
+        status, 200,
+        "a triage agent cannot complete or assign a task"
+    );
+    assert_eq!(seen["method"], "PUT");
+
+    // One POST over is a webhook pointed anywhere the caller likes, which
+    // outlives this policy. `ask` with nobody at the console is a denial.
+    let (status, body) = call(&harness, "POST", "/asana/webhooks").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a webhook registration reached Asana from the triage level: {body}"
+    );
+
+    // The tunnel: one allowed POST would otherwise carry ten calls of its own.
+    let (status, body) = call(&harness, "POST", "/asana/batch").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a batch request reached Asana, taking every rule here with it: {body}"
+    );
+
+    // Deleting a task takes its subtasks with it, so it is denied rather than
+    // parked for a human.
+    let (status, body) = call(&harness, "DELETE", "/asana/tasks/1204").await;
+    assert_eq!(status, 403);
+    assert!(body["path"].is_null(), "a DELETE reached Asana: {body}");
+}
+
+/// The default level reads and does nothing else — including through `/batch`,
+/// which is a POST and would therefore fall through a GET-only rule to
+/// `acl_default`. It is denied by name so the audit row names a rule.
+#[tokio::test]
+async fn the_asana_read_level_cannot_write_by_any_route() {
+    std::env::set_var("TEST_ASANA_READONLY", "asana-readonly-pat");
+    let upstream = spawn_upstream().await;
+    let harness =
+        harness_from_profiles(&[("asana", options("env:TEST_ASANA_READONLY"))], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/asana/users/me").await;
+    assert_eq!(status, 200, "the profile's own probe path is not readable");
+    assert_eq!(seen["authorization"], "Bearer asana-readonly-pat");
+
+    for (method, path) in [
+        ("POST", "/asana/tasks"),
+        ("PUT", "/asana/tasks/1204"),
+        ("POST", "/asana/batch"),
+        ("DELETE", "/asana/tasks/1204"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `read`");
+        assert!(
+            body["path"].is_null(),
+            "`{method} {path}` reached Asana from a read-only level: {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sentry_triage_resolves_an_issue_and_can_do_nothing_else() {
     std::env::set_var("TEST_SENTRY_TOKEN", "sntryu_real-token");
