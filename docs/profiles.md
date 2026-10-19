@@ -63,7 +63,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Seven levels exist for reasons that are not about permissions:
+Eight levels exist for reasons that are not about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
   parks everything else for a human. The ACL cannot tell a reasonable POST from
@@ -99,6 +99,13 @@ Seven levels exist for reasons that are not about permissions:
   change or a GitHub OIDC binding, because one bills and the other is a
   standing publish grant to a repository the proxy never sees. `sbomify-v1`
   has the same four levels on v1's paths.
+- **`screenly --access content`** (and `anthias`, `screenly-mcp`) is the
+  person who edits what plays, not the one who runs the fleet: every read, plus
+  creating and editing assets, playlists and labels. Deleting content prompts.
+  On Screenly, pairing a screen adds a billed device and sharing a playlist
+  hands it to another team, so both prompt, and any other DELETE is refused. On
+  Anthias, settings, reboot, shutdown and restoring a backup prompt — settings
+  can change the very password the proxy holds.
 
 ## What is in the catalog
 
@@ -117,6 +124,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths) |
+| Screenly | `screenly` (API v4 and v4.1, `Authorization: Token`), `screenly-mcp` (the CLI's `screenly mcp`, same token), `anthias` (one self-hosted player, `--var host=… --var username=…`) |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Object storage | `s3` (`--var region=…`), `r2` (`--var account_id=…`), `s3-compatible` (`--var host=…` — MinIO, B2, Wasabi, Spaces, Ceph, …) — all `aws_sigv4`, all needing `--var access_key_id=…` and `--var bucket=…` |
 | GitHub | `github` (the REST API), `github-git` (`git clone`, `fetch` and `push` over HTTPS, `--var repo=owner/name` to narrow it) |
@@ -257,6 +265,30 @@ file in the clear, while the token stays a reference.
   `/artifacts/spdx/<component>`. v1 has been deprecated since 26 August 2026
   with no sunset date yet; it also mounts `/internal`, which `sbomify-v1`
   denies.
+- **Screenly's API names its rows in the query string.** It is PostgREST:
+  `PATCH /v4/assets?id=eq.<id>` edits one asset, and the same call without the
+  filter is a statement about every asset the token can see. Rules match the
+  path and never the query, so `screenly` can grant *which kind* of object an
+  agent may change but not *which one* — which is why `content` prompts for its
+  DELETEs rather than allowing them. The scheme is `Authorization: Token
+  <token>`; the reference calls it bearer, and `Bearer` is a 401. v4 and v4.1
+  are served side by side and the rules name both. `screenly-mcp` runs
+  `screenly mcp` as a child with the token in `API_TOKEN`, so the CLI has to be
+  installed where the proxy runs and the child, not the proxy, attaches the
+  credential.
+- **An Anthias device with authentication off accepts anything.** That is how
+  a new device ships: the API ignores the credential, so every call succeeds,
+  `verify` proves only that the player answered, and anything else on its
+  network can drive it without passing this proxy. Turn it on under Settings →
+  Authentication; the password is the `--secret`, the username a `--var`. A
+  stock install is plain HTTP on port 80 and needs `--var scheme=http`, which
+  sends that password across the LAN in a header — the default is `https`,
+  which only a device set up with `bin/enable_ssl.sh` answers. Anthias logs HTTP
+  Basic as deprecated, though it is the only credential its API takes outside a
+  browser session today. `GET /v2/assets/control/<command>` switches what is on
+  screen, so `read` prompts for it; no level allows changing settings,
+  shutting down or restoring a backup without asking. One upstream is one player — `--as anthias-<where>`
+  for each.
 - **A Spotify token is app-only, and expires in an hour.** Spotify issues no
   long-lived API key: every call carries an OAuth access token. So `spotify` is
   the one profile whose credential the proxy *spends* rather than forwards — it

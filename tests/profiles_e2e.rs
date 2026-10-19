@@ -1614,6 +1614,81 @@ async fn sbomify_publish_uploads_and_releases_and_can_do_nothing_else() {
     }
 }
 
+// ---- Screenly and Anthias -----------------------------------------------
+
+#[tokio::test]
+async fn screenly_sends_token_not_bearer_and_content_cannot_touch_the_fleet() {
+    std::env::set_var("TEST_SCREENLY_TOKEN", "screenly-real-token");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SCREENLY_TOKEN");
+    opts.access = Some("content".into());
+    let harness = harness_from_profiles(&[("screenly", opts)], upstream).await;
+
+    for (method, path) in [
+        ("GET", "/screenly/v4/screens?limit=1"),
+        ("POST", "/screenly/v4/assets"),
+        (
+            "PATCH",
+            "/screenly/v4.1/playlists?id=eq.01HC9RFEFP1ATEH5ZT5VQMF65P",
+        ),
+    ] {
+        let (status, seen) = call(&harness, method, path).await;
+        assert_eq!(status, 200, "`{method} {path}` was refused at `content`");
+        // The reference says bearer and documents `Token`; `Bearer` is a 401.
+        assert_eq!(seen["authorization"], "Token screenly-real-token");
+    }
+
+    // Pairing a screen bills, a DELETE outside content is refused, and a
+    // content DELETE asks — nobody is watching, so all three end as denials.
+    for (method, path) in [
+        ("POST", "/screenly/v4/screens"),
+        (
+            "DELETE",
+            "/screenly/v4/screens?id=eq.01HC9RFEFP1ATEH5ZT5VQMF65P",
+        ),
+        (
+            "DELETE",
+            "/screenly/v4/assets?id=eq.01HC9RFEFP1ATEH5ZT5VQMF65P",
+        ),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `content`");
+        assert!(
+            body["path"].is_null(),
+            "`{method} {path}` reached Screenly from `content`: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn anthias_signs_in_as_the_device_user_and_read_leaves_the_screen_alone() {
+    std::env::set_var("TEST_ANTHIAS_PASSWORD", "anthias-real-password");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_ANTHIAS_PASSWORD");
+    opts.vars = vec!["host=anthias.local".into(), "username=pi".into()];
+    let harness = harness_from_profiles(&[("anthias", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/anthias/v2/assets").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/api/v2/assets");
+    let expected = base64_encode("pi:anthias-real-password");
+    assert_eq!(seen["authorization"], format!("Basic {expected}"));
+
+    for (method, path) in [
+        ("GET", "/anthias/v2/assets/control/next"),
+        ("PATCH", "/anthias/v2/device_settings"),
+        ("POST", "/anthias/v2/shutdown"),
+        ("GET", "/anthias/v1/assets"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `read`");
+        assert!(
+            body["path"].is_null(),
+            "`{method} {path}` reached the player from `read`: {body}"
+        );
+    }
+}
+
 // ---- git over HTTPS -------------------------------------------------------
 
 /// How git calls the proxy: no `Authorization` of its own unless it was handed
