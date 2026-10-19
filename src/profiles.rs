@@ -40,7 +40,14 @@ pub struct Var {
     pub name: String,
     pub about: String,
     pub default: Option<String>,
+    /// Refuses a value that would expand into rules matching nothing — a
+    /// grant that parses, loads, and then asks about every call it was meant
+    /// to cover. `None` takes anything.
+    pub check: Option<VarCheck>,
 }
+
+/// Says what is wrong with a variable's value, or nothing.
+pub type VarCheck = fn(&str) -> std::result::Result<(), String>;
 
 /// The credential scheme, minus the reference the caller supplies as `--secret`.
 #[derive(Debug, Clone)]
@@ -59,6 +66,13 @@ pub enum AuthTemplate {
     /// a documented constant — Graylog's `<token>:token`.
     BasicSecretUser {
         password: String,
+    },
+    /// Basic auth where the *user* field is a documented constant and the
+    /// credential is the password — GitHub's git endpoints take a token as
+    /// `x-access-token:<token>`. The constant names no one, so it is written in
+    /// the clear rather than asked for as a var nobody would ever change.
+    BasicFixedUser {
+        username: String,
     },
     /// The credential goes in the query string, because the vendor takes it
     /// nowhere else — Semrush's v3 `?key=`. Worth naming as its own template so
@@ -658,6 +672,15 @@ fn resolve_vars(profile: &Profile, given: &[String]) -> Result<BTreeMap<String, 
                     profile.id, var.name, var.about
                 )
             })?;
+        if let Some(check) = var.check {
+            check(&value).map_err(|problem| {
+                anyhow::anyhow!(
+                    "`--var {}={value}` for profile `{}`: {problem}",
+                    var.name,
+                    profile.id
+                )
+            })?;
+        }
         resolved.insert(var.name.clone(), value);
     }
     Ok(resolved)
@@ -751,6 +774,11 @@ fn build_auth(
             username_secret: Some(secret.to_string()),
             secret: format!("literal:{password}"),
         },
+        AuthTemplate::BasicFixedUser { username } => AuthSpec::Basic {
+            username: Some(username),
+            username_secret: None,
+            secret: secret.to_string(),
+        },
         AuthTemplate::Query { param } => AuthSpec::Query {
             param,
             secret: secret.to_string(),
@@ -812,6 +840,7 @@ fn v(name: &str, about: &str, default: Option<&str>) -> Var {
         name: name.into(),
         about: about.into(),
         default: default.map(Into::into),
+        check: None,
     }
 }
 
@@ -926,6 +955,121 @@ fn object_store(
         // `SignatureDoesNotMatch` are a bad credential, `AccessDenied` is a good
         // one without ListBuckets — which is most keys scoped to one bucket.
         probe: None,
+    }
+}
+
+/// Git over HTTPS on `github.com`: the companion `github` cannot be, because an
+/// upstream is one base URL and git's smart-HTTP endpoints are not on the API
+/// host, nor authenticated the way it is.
+///
+/// A fetch is two requests, `GET <repo>.git/info/refs?service=git-upload-pack`
+/// and `POST <repo>.git/git-upload-pack`; a push is the same pair for
+/// `git-receive-pack`. Rules match the path and never the query string, so the
+/// one thing a rule cannot tell apart is which service an `info/refs` asks
+/// about. That leaves the receive-pack *advertisement* — the ref list, which a
+/// fetch is shown anyway — readable at `read`, and puts the line where the
+/// write actually happens: the `POST` to `git-receive-pack`, which `read`
+/// denies by name.
+///
+/// `repo` defaults to `*/*`, every repository the token reaches, because a
+/// fine-grained token is already limited to the repositories it was made for
+/// and one the operator chose; `owner/name` or `owner/*` narrows the rules the
+/// way `bucket` does for the object stores.
+fn github_git() -> Profile {
+    // `.git` is how a clone URL is usually spelled and the bare name is how it
+    // is usually typed; GitHub answers both, so the rules cover both.
+    let refs = ["/{repo}.git/info/refs", "/{repo}/info/refs"];
+    let upload = ["/{repo}.git/git-upload-pack", "/{repo}/git-upload-pack"];
+    let receive = ["/{repo}.git/git-receive-pack", "/{repo}/git-receive-pack"];
+    let fetch = || {
+        vec![
+            rule("refs", &["GET"], &refs, "allow"),
+            rule("fetch", &["POST"], &upload, "allow"),
+        ]
+    };
+    // Denied rather than left to the default, which `init` writes as `ask`: a
+    // push at `read` is a decision the operator already made, and the refusal
+    // should name the rule that made it.
+    let mut read = fetch();
+    read.push(rule("push", &["POST"], &receive, "deny"));
+    let mut write = fetch();
+    write.push(rule("push", &["POST"], &receive, "allow"));
+
+    Profile {
+        id: "github-git".into(),
+        title: "GitHub git over HTTPS".into(),
+        vendor: "GitHub".into(),
+        summary: "`git clone`, `fetch` and `push` against github.com, beside the REST API.".into(),
+        default_name: "github-git".into(),
+        credential: Credential {
+            about: "a fine-grained personal access token with Contents read (and write, to \
+                    push) on the repositories — the `github` profile's token works if it has \
+                    that permission"
+                .into(),
+            url: "https://github.com/settings/personal-access-tokens".into(),
+        },
+        vars: vec![Var {
+            check: Some(github_repo),
+            ..v(
+                "repo",
+                "the repositories the access level's rules cover: `owner/name`, `owner/*`, or \
+                 the default `*/*` for every repository the token can reach",
+                Some("*/*"),
+            )
+        }],
+        service: Service::Http {
+            base_url: "https://github.com".into(),
+            auth: AuthTemplate::BasicFixedUser {
+                username: "x-access-token".into(),
+            },
+        },
+        access: vec![
+            access("read", "clone and fetch; a push is denied", &[], read),
+            access("write", "clone, fetch and push", &[], write),
+        ],
+        note: Some(
+            "Git sends its own `Authorization`, so the agent's token goes in `X-IAP-Token` — \
+             `agent-iap git-config` prints the settings that do that and rewrite \
+             `https://github.com/` to the proxy, so `git clone https://github.com/o/r.git` \
+             works unchanged. Rules match the path and not the query string, so `read` cannot \
+             refuse `info/refs?service=git-receive-pack`; that answers with the ref list a \
+             fetch sees anyway, and the push itself — the `POST` to `git-receive-pack` — is \
+             denied by name. A request body is buffered up to `server.max_body_bytes` (10 MiB \
+             by default), so a large push needs that raised. Repository names compare \
+             case-sensitively here and not on GitHub: `--var repo=` should be spelled the way \
+             the clone URL will be. Only `https://github.com/` is rewritten — an `ssh://` or \
+             `git@github.com:` remote does not come through the proxy — and Git LFS objects \
+             are served from other hosts and are not covered. `verify` reads a public \
+             repository's refs, which proves GitHub accepts the token and not that it reaches \
+             yours; `--path /<owner>/<repo>.git/info/refs?service=git-upload-pack` asks that."
+                .into(),
+        ),
+        // A bad token is a 401 even on a public repository, and a good one —
+        // any token GitHub accepts — reads every public repository, so the
+        // canonical demo repository answers for the credential and nothing
+        // else. Not `/`: github.com serves its home page to a garbage token.
+        probe: Some("/octocat/Hello-World.git/info/refs?service=git-upload-pack".into()),
+    }
+}
+
+/// `owner/name`, either half of which may be `*`. Anything else — `api`,
+/// `acme/api.git`, `acme/**` — expands into rules no clone URL matches, or
+/// into ones wider than the two segments a repository is, so it is refused
+/// where it is typed rather than discovered as a prompt on every fetch.
+fn github_repo(value: &str) -> std::result::Result<(), String> {
+    let part = |part: &str| {
+        part == "*"
+            || (!part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    };
+    match value.split_once('/') {
+        Some((_, name)) if name.ends_with(".git") => {
+            Err("name the repository without `.git` — the rules add it".into())
+        }
+        Some((owner, name)) if part(owner) && part(name) => Ok(()),
+        _ => Err("expected `owner/name`, `owner/*` or `*/*`".into()),
     }
 }
 
@@ -2838,6 +2982,7 @@ pub fn catalog() -> Vec<Profile> {
             write_paths: &["/**"],
         })
         .probing("/user"),
+        github_git(),
         bearer_api(BearerApi {
             id: "linear",
             title: "Linear API",
@@ -3441,6 +3586,140 @@ mod tests {
         }
     }
 
+    /// git's smart-HTTP endpoints, authenticated the way github.com wants a
+    /// token: as the password, under a user name that is a constant.
+    #[test]
+    fn github_git_signs_as_x_access_token_and_only_write_pushes() {
+        let profile = get("github-git").unwrap();
+        let vars = resolve_vars(&profile, &[]).unwrap();
+        let service = substitute_service(&profile.service, &vars, "op://P/GitHub/token").unwrap();
+        assert_eq!(service.endpoint(), "https://github.com");
+        match build_auth(&service, "op://P/GitHub/token", &vars, &[]).unwrap() {
+            AuthSpec::Basic {
+                username,
+                username_secret,
+                secret,
+            } => {
+                assert_eq!(username.as_deref(), Some("x-access-token"));
+                assert!(username_secret.is_none());
+                assert_eq!(secret, "op://P/GitHub/token");
+            }
+            other => panic!("expected basic, got {other:?}"),
+        }
+
+        // `read` is the default: it fetches any repository, `.git` or not,
+        // and a push stops on a rule that says so rather than on the default.
+        let read = profile.default_access();
+        assert_eq!(read.name, "read");
+        let read = expanded(&profile, read, &vars);
+        for (method, path) in [
+            ("GET", "/acme/api.git/info/refs"),
+            ("POST", "/acme/api.git/git-upload-pack"),
+            ("GET", "/acme/api/info/refs"),
+            ("POST", "/acme/api/git-upload-pack"),
+        ] {
+            assert_eq!(
+                decide(&read, method, path),
+                Some("allow"),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            decide(&read, "POST", "/acme/api.git/git-receive-pack"),
+            Some("deny")
+        );
+        // Nothing but git: the website and its other routes are not this.
+        for (method, path) in [
+            ("GET", "/acme/api"),
+            ("GET", "/acme/api.git/objects/info/packs"),
+            ("POST", "/acme/api.git/info/refs"),
+            ("GET", "/login"),
+        ] {
+            assert_eq!(decide(&read, method, path), None, "{method} {path}");
+        }
+
+        let write = expanded(&profile, profile.find_access("write").unwrap(), &vars);
+        assert_eq!(
+            decide(&write, "POST", "/acme/api.git/git-receive-pack"),
+            Some("allow")
+        );
+        assert!(profile.note.as_deref().unwrap().contains("X-IAP-Token"));
+        assert!(profile.note.as_deref().unwrap().contains("git-config"));
+        // `/` on github.com is the home page whatever the token; a public
+        // repository's refs are a 401 to a bad one.
+        assert!(profile
+            .probe
+            .as_deref()
+            .unwrap()
+            .ends_with(".git/info/refs?service=git-upload-pack"));
+    }
+
+    /// `--var repo=` narrows every rule to one repository, or one owner.
+    #[test]
+    fn github_git_grants_one_repository_when_told_which() {
+        let profile = get("github-git").unwrap();
+        let vars = resolve_vars(&profile, &["repo=acme/api".into()]).unwrap();
+        let read = expanded(&profile, profile.default_access(), &vars);
+        assert_eq!(
+            read.rules[0].paths,
+            ["/acme/api.git/info/refs", "/acme/api/info/refs"]
+        );
+        assert_eq!(
+            decide(&read, "POST", "/acme/api.git/git-upload-pack"),
+            Some("allow")
+        );
+        assert_eq!(decide(&read, "POST", "/acme/web.git/git-upload-pack"), None);
+        assert_eq!(decide(&read, "GET", "/other/api.git/info/refs"), None);
+
+        let vars = resolve_vars(&profile, &["repo=acme/*".into()]).unwrap();
+        let read = expanded(&profile, profile.default_access(), &vars);
+        assert_eq!(
+            decide(&read, "GET", "/acme/web.git/info/refs"),
+            Some("allow")
+        );
+        assert_eq!(decide(&read, "GET", "/other/web.git/info/refs"), None);
+
+        // A value that would write rules no clone URL matches is refused where
+        // it is typed, not discovered as a prompt on every fetch.
+        for bad in [
+            "api",
+            "acme/api.git",
+            "acme/**",
+            "acme/api/extra",
+            "/api",
+            "acme/{x}",
+        ] {
+            let error = resolve_vars(&profile, &[format!("repo={bad}")])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("--var repo={bad}")),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    /// An access level with its `{var}`s filled in, as `planned_rules` writes it.
+    fn expanded(profile: &Profile, level: &Access, vars: &BTreeMap<String, String>) -> Access {
+        let service = substitute_service(&profile.service, vars, "").unwrap();
+        let planned = planned_rules(&profile.id, &service, level, vars).unwrap();
+        Access {
+            name: level.name.clone(),
+            about: level.about.clone(),
+            scopes: level.scopes.clone(),
+            rules: planned
+                .into_iter()
+                .zip(&level.rules)
+                .map(|(rule, template)| RuleTemplate {
+                    suffix: template.suffix.clone(),
+                    methods: rule.methods,
+                    paths: rule.paths,
+                    action: rule.action,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn semrush_keeps_the_two_key_versions_on_two_schemes() {
         // The keys are version-specific and Semrush does not accept one for the
@@ -3517,7 +3796,16 @@ mod tests {
                 rule.action == "allow"
                     && rule.methods.iter().any(|m| m == "GET" || m == "*")
                     && rule.paths.iter().any(|pattern| {
-                        globset::Glob::new(pattern)
+                        // As an enrolment with no `--var` writes it: a default
+                        // is the value, as `github-git`'s `*/*` is every
+                        // repository, the probe's public one included.
+                        let pattern = profile.vars.iter().fold(pattern.clone(), |pattern, var| {
+                            match &var.default {
+                                Some(value) => pattern.replace(&format!("{{{}}}", var.name), value),
+                                None => pattern,
+                            }
+                        });
+                        globset::Glob::new(&pattern)
                             .map(|glob| glob.compile_matcher().is_match(&concrete))
                             .unwrap_or(false)
                     })

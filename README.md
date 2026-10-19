@@ -248,6 +248,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic
 export ANTHROPIC_AUTH_TOKEN=iap_...        # the token from step 2, not your API key
 ```
 
+Git has no base URL to set, so `eval "$(agent-iap git-config)"` points
+`https://github.com/` at a `github-git` upstream instead — see
+[§ Git](docs/agents.md#git).
+
 Or, for an agent rather than an SDK, give it the proxy as an MCP server and let
 it discover the rest — what it can reach, and how to call it, come back from the
 policy itself. See [§ MCP](docs/mcp.md):
