@@ -127,7 +127,11 @@ async fn serve(
         .into_response();
     }
 
-    match dispatch(&state, &caller, &message).await {
+    // The address the agent reached us on, for the documents that name the
+    // HTTP gateway: `agent-iap gateway` relays to the daemon's own address, so
+    // over stdio this is still one the agent's programs can use.
+    let base = crate::discovery::base_url(&state, &headers);
+    match dispatch(&state, &caller, &base, &message).await {
         // A notification. No body, and 202 is what the transport expects.
         None => StatusCode::ACCEPTED.into_response(),
         Some(response) => Json(response).into_response(),
@@ -146,7 +150,12 @@ fn unauthenticated(failure: &crate::identity::AuthFailure) -> Response {
 }
 
 /// Answer one JSON-RPC frame. `None` for a notification, which takes no reply.
-pub async fn dispatch(state: &AppState, caller: &Caller, message: &Value) -> Option<Value> {
+pub async fn dispatch(
+    state: &AppState,
+    caller: &Caller,
+    base: &str,
+    message: &Value,
+) -> Option<Value> {
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = message.get("params").cloned().unwrap_or(json!({}));
@@ -156,12 +165,12 @@ pub async fn dispatch(state: &AppState, caller: &Caller, message: &Value) -> Opt
     let is_notification = message.get("id").is_none() || id.is_null();
 
     let outcome = match method {
-        "initialize" => Ok(initialize(state, caller)),
+        "initialize" => Ok(initialize(state, caller, base)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list(state, caller)),
-        "tools/call" => call_tool(state, caller, &params).await,
-        "resources/list" => Ok(resources_list(state, caller)),
-        "resources/read" => read_resource(state, caller, &params),
+        "tools/call" => call_tool(state, caller, base, &params).await,
+        "resources/list" => Ok(resources_list(state, caller, base)),
+        "resources/read" => read_resource(state, caller, base, &params),
         // Advertised as empty rather than unimplemented: a client that asks is
         // enumerating, and an error would read as a fault it should report.
         "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
@@ -196,7 +205,7 @@ fn error_frame(id: &Value, code: i64, message: &str) -> Value {
     })
 }
 
-fn initialize(state: &AppState, caller: &Caller) -> Value {
+fn initialize(state: &AppState, caller: &Caller, base: &str) -> Value {
     let mut record = AuditRecord::new("mcp", "session_start");
     record.agent = caller.agent().id.clone();
     record.agent_name = Some(caller.display_name().to_string());
@@ -223,7 +232,7 @@ fn initialize(state: &AppState, caller: &Caller) -> Value {
             "title": "agent-iap gateway",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": skills::instructions(state, caller.agent()),
+        "instructions": skills::instructions(state, caller.agent(), base),
     })
 }
 
@@ -352,8 +361,8 @@ fn tools_list(state: &AppState, caller: &Caller) -> Value {
     ]})
 }
 
-fn resources_list(state: &AppState, caller: &Caller) -> Value {
-    let resources: Vec<Value> = skills::catalog(state, caller.agent())
+fn resources_list(state: &AppState, caller: &Caller, base: &str) -> Value {
+    let resources: Vec<Value> = skills::catalog(state, caller.agent(), base)
         .into_iter()
         .map(|skill| {
             json!({
@@ -368,7 +377,12 @@ fn resources_list(state: &AppState, caller: &Caller) -> Value {
     json!({ "resources": resources })
 }
 
-fn read_resource(state: &AppState, caller: &Caller, params: &Value) -> Result<Value, RpcError> {
+fn read_resource(
+    state: &AppState,
+    caller: &Caller,
+    base: &str,
+    params: &Value,
+) -> Result<Value, RpcError> {
     let uri = params
         .get("uri")
         .and_then(Value::as_str)
@@ -377,7 +391,7 @@ fn read_resource(state: &AppState, caller: &Caller, params: &Value) -> Result<Va
             message: "`uri` is required".into(),
         })?;
 
-    let skill = skills::find(state, caller.agent(), uri).ok_or_else(|| RpcError {
+    let skill = skills::find(state, caller.agent(), base, uri).ok_or_else(|| RpcError {
         code: INVALID_PARAMS,
         message: format!("no resource `{uri}` — list them with resources/list"),
     })?;
@@ -391,7 +405,12 @@ fn read_resource(state: &AppState, caller: &Caller, params: &Value) -> Result<Va
     }]}))
 }
 
-async fn call_tool(state: &AppState, caller: &Caller, params: &Value) -> Result<Value, RpcError> {
+async fn call_tool(
+    state: &AppState,
+    caller: &Caller,
+    base: &str,
+    params: &Value,
+) -> Result<Value, RpcError> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -412,7 +431,7 @@ async fn call_tool(state: &AppState, caller: &Caller, params: &Value) -> Result<
             Err(failure) => tool_error(&failure),
         }),
         "iap_catalog" => Ok(catalog_result(state, caller)),
-        "iap_skill" => Ok(skill_result(state, caller, &arguments)),
+        "iap_skill" => Ok(skill_result(state, caller, base, &arguments)),
         other => Err(RpcError {
             code: INVALID_PARAMS,
             message: format!("`{other}` is not a tool this server offers"),
@@ -483,14 +502,14 @@ fn catalog_result(state: &AppState, caller: &Caller) -> Value {
     text_result(text, Some(json!({ "upstreams": entries })))
 }
 
-fn skill_result(state: &AppState, caller: &Caller, arguments: &Value) -> Value {
+fn skill_result(state: &AppState, caller: &Caller, base: &str, arguments: &Value) -> Value {
     let Some(wanted) = arguments.get("name").and_then(Value::as_str) else {
         return tool_error("`name` is required — try `using-this-gateway`");
     };
-    match skills::find(state, caller.agent(), wanted) {
+    match skills::find(state, caller.agent(), base, wanted) {
         Some(skill) => text_result(skill.text, None),
         None => {
-            let known: Vec<String> = skills::catalog(state, caller.agent())
+            let known: Vec<String> = skills::catalog(state, caller.agent(), base)
                 .into_iter()
                 .map(|skill| skill.name)
                 .collect();

@@ -1594,6 +1594,7 @@ async fn git_reaches_github_through_the_proxy_with_only_git_config() {
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("IAP_PROXY_URL")
         .env_remove("IAP_URL")
+        .env_remove("IAP_TOKEN_FILE")
         .env("IAP_TOKEN", AGENT_TOKEN)
         .output()
         .await
@@ -1609,4 +1610,186 @@ async fn git_reaches_github_through_the_proxy_with_only_git_config() {
         format!("{}\trefs/heads/main", "a".repeat(40)),
         "{stderr}"
     );
+}
+
+/// A shell with nothing of the developer's own in it: a fresh home, no system
+/// git configuration, no token in the environment.
+fn agent_shell(home: &Path, script: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", script])
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("IAP_PROXY_URL")
+        .env_remove("IAP_URL")
+        .env_remove("IAP_TOKEN")
+        .env_remove("IAP_TOKEN_FILE")
+        .env_remove("IAP_CONFIG_DIR");
+    command
+}
+
+fn write_token_file(home: &Path, mode: u32) -> std::path::PathBuf {
+    let dir = home.join(".config").join("agent-iap");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("token");
+    std::fs::write(&path, format!("{AGENT_TOKEN}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    path
+}
+
+async fn run_ok(mut command: tokio::process::Command) -> String {
+    let output = command.output().await.unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    stdout
+}
+
+fn has_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// The reported failure: the tool shell is not a login shell, so `IAP_TOKEN`
+/// is not in it. The token is in the default file, and git gets it from the
+/// credential helper when the proxy challenges — the agent never handles it,
+/// and the user's own `credential.helper = store` is never handed it.
+#[tokio::test]
+async fn git_reaches_github_with_the_token_file_and_nothing_in_the_environment() {
+    if !has_git() {
+        eprintln!("skipped: no git on PATH");
+        return;
+    }
+    std::env::set_var("TEST_GITHUB_GIT_TOKEN_FILE", "github_pat_file");
+    let expected = format!("Basic {}", base64_encode("x-access-token:github_pat_file"));
+    let upstream = spawn_git_upstream(expected).await;
+    let harness = harness_from_profiles(
+        &[("github-git", options("env:TEST_GITHUB_GIT_TOKEN_FILE"))],
+        upstream,
+    )
+    .await;
+
+    let home = tempfile::tempdir().unwrap();
+    write_token_file(home.path(), 0o600);
+    // A helper that writes whatever it is given to disk in the clear.
+    std::fs::write(
+        home.path().join(".gitconfig"),
+        "[credential]\n\thelper = store\n",
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_agent-iap");
+    let want = format!("{}\trefs/heads/main", "a".repeat(40));
+
+    // In one shell, the way the skill tells an agent to run it.
+    let stdout = run_ok(agent_shell(
+        home.path(),
+        &format!(
+            "eval \"$('{exe}' git-config --proxy-url http://{})\" && git ls-remote https://github.com/o/r.git",
+            harness.proxy
+        ),
+    ))
+    .await;
+    assert_eq!(stdout.trim(), want);
+
+    // Once, for every later shell: the next one has no `eval` in it at all.
+    run_ok(agent_shell(
+        home.path(),
+        &format!(
+            "'{exe}' git-config --global --proxy-url http://{} | sh",
+            harness.proxy
+        ),
+    ))
+    .await;
+    let stdout = run_ok(agent_shell(
+        home.path(),
+        "git ls-remote https://github.com/o/r.git",
+    ))
+    .await;
+    assert_eq!(stdout.trim(), want);
+    // Twice is the same as once.
+    run_ok(agent_shell(
+        home.path(),
+        &format!(
+            "'{exe}' git-config --global --proxy-url http://{} | sh",
+            harness.proxy
+        ),
+    ))
+    .await;
+    let gitconfig = std::fs::read_to_string(home.path().join(".gitconfig")).unwrap();
+    assert_eq!(
+        gitconfig.matches("git-credential").count(),
+        1,
+        "{gitconfig}"
+    );
+    assert!(!gitconfig.contains(AGENT_TOKEN), "{gitconfig}");
+    assert!(
+        !home.path().join(".git-credentials").exists(),
+        "the user's own helper was handed the agent token"
+    );
+}
+
+/// A token file others can read is refused where it is set up, not on the
+/// first clone.
+#[tokio::test]
+async fn a_token_file_others_can_read_stops_git_config() {
+    if !cfg!(unix) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    write_token_file(home.path(), 0o644);
+    let output = agent_shell(
+        home.path(),
+        &format!(
+            "'{}' git-config --proxy-url http://127.0.0.1:9",
+            env!("CARGO_BIN_EXE_agent-iap")
+        ),
+    )
+    .output()
+    .await
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("chmod 600"), "{stderr}");
+    assert!(!stderr.contains(AGENT_TOKEN), "{stderr}");
+}
+
+/// The MCP client's header helper reads the same file git does.
+#[tokio::test]
+async fn the_header_helper_reads_the_same_token_file() {
+    let home = tempfile::tempdir().unwrap();
+    let file = write_token_file(home.path(), 0o600);
+    let exe = env!("CARGO_BIN_EXE_agent-iap");
+    for script in [
+        format!("'{exe}' headers"),
+        format!("IAP_TOKEN_FILE='{}' '{exe}' headers", file.display()),
+    ] {
+        let stdout = run_ok(agent_shell(home.path(), &script)).await;
+        let headers: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            headers,
+            serde_json::json!({ "Authorization": format!("Bearer {AGENT_TOKEN}") })
+        );
+    }
+    // The variable still wins, so a setup that exports it is unchanged.
+    let stdout = run_ok(agent_shell(
+        home.path(),
+        &format!("IAP_TOKEN=iap_from_env '{exe}' headers"),
+    ))
+    .await;
+    assert!(stdout.contains("Bearer iap_from_env"), "{stdout}");
 }

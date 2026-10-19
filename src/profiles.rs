@@ -1028,10 +1028,11 @@ fn github_git() -> Profile {
             access("write", "clone, fetch and push", &[], write),
         ],
         note: Some(
-            "Git sends its own `Authorization`, so the agent's token goes in `X-IAP-Token` — \
-             `agent-iap git-config` prints the settings that do that and rewrite \
-             `https://github.com/` to the proxy, so `git clone https://github.com/o/r.git` \
-             works unchanged. Rules match the path and not the query string, so `read` cannot \
+            "`agent-iap git-config` prints the settings that rewrite `https://github.com/` to \
+             the proxy and make `agent-iap git-credential` git's helper for it, so `git clone \
+             https://github.com/o/r.git` works unchanged and git fetches the agent's token \
+             itself. The proxy takes the agent's `Authorization`, Basic included, and sends \
+             github.com the profile's own in its place. Rules match the path and not the query string, so `read` cannot \
              refuse `info/refs?service=git-receive-pack`; that answers with the ref list a \
              fetch sees anyway, and the push itself — the `POST` to `git-receive-pack` — is \
              denied by name. A request body is buffered up to `server.max_body_bytes` (10 MiB \
@@ -3643,7 +3644,7 @@ mod tests {
             decide(&write, "POST", "/acme/api.git/git-receive-pack"),
             Some("allow")
         );
-        assert!(profile.note.as_deref().unwrap().contains("X-IAP-Token"));
+        assert!(profile.note.as_deref().unwrap().contains("git-credential"));
         assert!(profile.note.as_deref().unwrap().contains("git-config"));
         // `/` on github.com is the home page whatever the token; a public
         // repository's refs are a 401 to a bad one.

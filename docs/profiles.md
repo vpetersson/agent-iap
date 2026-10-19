@@ -137,8 +137,9 @@ The honest limits, all printed by `profile show`:
   every repository the token reaches. Rules match the path and never the query
   string, so `read` cannot refuse `info/refs?service=git-receive-pack` — that
   answers with the ref list a fetch is shown anyway, and the push itself is the
-  POST it denies. Git sends its own `Authorization`, so the agent's token goes
-  in `X-IAP-Token`, and `agent-iap git-config` sets that up
+  POST it denies. `agent-iap git-config` points git at the upstream and makes
+  `agent-iap git-credential` its credential helper there, so git sends the
+  agent's token as Basic and github.com is sent the profile's own in its place
   ([§ Git](agents.md#git)). A push is buffered whole, up to
   `server.max_body_bytes` (10 MiB unless raised); `ssh://` and `git@github.com:`
   remotes are not rewritten, and Git LFS objects live on other hosts the

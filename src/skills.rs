@@ -16,6 +16,16 @@
 //! uses, because knowing that a call will arrive bearing `x-api-key` is how an
 //! agent stops trying to set the header itself; the secret behind it stays in
 //! the daemon, which is the whole point.
+//!
+//! What a skill does name is where the agent's *own* token is kept. `iap_request`
+//! needs no credential, but a program the agent runs — git above all, whose
+//! smart-HTTP protocol is binary and cannot go through a tool call — reaches
+//! the same upstreams over the HTTP gateway, and that takes the agent token.
+//! An agent told only "you hold no credential" concludes it has none, and the
+//! one place it could learn otherwise is from the proxy itself: hunting through
+//! its own configuration for a token is rightly treated as credential
+//! exploration. So the documents say where the token is and that using it for
+//! those programs is the intended route.
 
 use crate::acl::Kind;
 use crate::config::{Action, AgentConfig};
@@ -42,7 +52,10 @@ const SCHEME: &str = "skill://agent-iap/";
 /// Deliberately short. It has to survive being pasted into a system prompt
 /// alongside every other server's, so it says what this one is, the two rules
 /// that change how an agent should behave, and where the detail lives.
-pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
+///
+/// `base` is the address the agent reached this proxy on, so the HTTP gateway
+/// is named by an address it can use.
+pub fn instructions(state: &AppState, agent: &AgentConfig, base: &str) -> String {
     let reachable = reachable_upstreams(state, agent);
     let names = if reachable.is_empty() {
         "nothing yet — this agent has no upstream it may address".to_string()
@@ -60,7 +73,8 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
     let mut text = format!(
         "agent-iap is an identity-aware proxy. Call third-party APIs through \
          `iap_request` instead of over the network directly: it holds the \
-         credentials, so you never need one and should never ask for one.\n\n\
+         credentials, so for `iap_request` you need none and should never ask \
+         for one.\n\n\
          Reachable from here when this session started: {names}. The policy \
          can change while you run, so `iap_catalog` is the current list — \
          check it again before concluding something is out of reach.\n\n\
@@ -76,6 +90,28 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
          how to call any one of them."
     );
 
+    if !reachable.is_empty() {
+        text.push_str(&format!(
+            "\n\nA program that cannot call a tool — git, an SDK, curl — uses the \
+             same proxy over HTTP at `{base}/<upstream>/<path>`, with your agent \
+             token in `Authorization: Bearer` or `X-IAP-Token`. That is the \
+             intended route for those programs, not a way around this one: the \
+             same policy decides and the same log records it. Your token is \
+             {where_}. `using-this-gateway` has the detail.",
+            where_ = token_location(),
+        ));
+        if let Some(git) = reachable
+            .iter()
+            .map(|reachable| &reachable.upstream)
+            .find(|upstream| fronts_github(upstream))
+        {
+            text.push_str(&format!(
+                " For git, `{}` and then plain `git` against `https://github.com/…`.",
+                git_config_command(base, &git.name)
+            ));
+        }
+    }
+
     if state.acl.can_ask() {
         text.push_str(
             "\n\nThis policy does hold calls for approval, so expect the second \
@@ -86,20 +122,20 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
 }
 
 /// Every skill this agent may read, overview first.
-pub fn catalog(state: &AppState, agent: &AgentConfig) -> Vec<Skill> {
-    let mut skills = vec![overview(state, agent)];
+pub fn catalog(state: &AppState, agent: &AgentConfig, base: &str) -> Vec<Skill> {
+    let mut skills = vec![overview(state, agent, base)];
     for reachable in reachable_upstreams(state, agent) {
-        skills.push(upstream_skill(state, agent, &reachable.upstream.name));
+        skills.push(upstream_skill(state, agent, base, &reachable.upstream.name));
     }
     skills
 }
 
 /// Look a skill up by the short name or by the full `skill://` URI, so a client
 /// reading resources and a model calling `iap_skill` reach the same document.
-pub fn find(state: &AppState, agent: &AgentConfig, wanted: &str) -> Option<Skill> {
+pub fn find(state: &AppState, agent: &AgentConfig, base: &str, wanted: &str) -> Option<Skill> {
     let wanted = wanted.trim();
     let short = wanted.strip_prefix(SCHEME).unwrap_or(wanted);
-    catalog(state, agent)
+    catalog(state, agent, base)
         .into_iter()
         .find(|skill| skill.name == short)
 }
@@ -186,7 +222,70 @@ pub(crate) fn reachable_upstreams(state: &AppState, agent: &AgentConfig) -> Vec<
         .collect()
 }
 
-fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
+/// Where the agent's token is, in the order `agent-iap` itself reads it
+/// (`crate::agent_token`). Written for the agent's machine, which may not be
+/// this one, so it names the convention rather than a path resolved here.
+fn token_location() -> String {
+    format!(
+        "`${}` when that is set, and otherwise in the file `${}` names, or `{}` \
+         (under `$XDG_CONFIG_HOME` when that is set)",
+        crate::agent_token::TOKEN_VAR,
+        crate::agent_token::TOKEN_FILE_VAR,
+        crate::agent_token::DEFAULT_FILE_DISPLAY,
+    )
+}
+
+/// An upstream git can be sent to: the `github-git` profile's base.
+fn fronts_github(upstream: &crate::config::UpstreamConfig) -> bool {
+    upstream.base_url.trim_end_matches('/') == "https://github.com"
+}
+
+fn git_config_command(base: &str, upstream: &str) -> String {
+    let upstream = match upstream {
+        "github-git" => String::new(),
+        other => format!(" --upstream {other}"),
+    };
+    format!("eval \"$(agent-iap git-config --proxy-url {base}{upstream})\"")
+}
+
+/// The HTTP gateway, for the programs `iap_request` cannot stand in for.
+fn programs_section(state: &AppState, base: &str) -> String {
+    let mut text = format!(
+        "\n\n## Programs: git, SDKs, curl\n\n\
+         `iap_request` is for you. A program you run cannot call a tool, and \
+         some work can only be done by one — git's protocol is binary, and an \
+         SDK expects a base URL. Those programs use this proxy's HTTP gateway, \
+         which fronts the same upstreams under the same policy and writes to \
+         the same audit log. Using it for them is intended; it is not routing \
+         around the proxy.\n\n\
+         - Address: `{base}/<upstream>/<the path the upstream sees>`. For an \
+         SDK, the base URL is `{base}/<upstream>`.\n\
+         - Your agent token goes in `Authorization: Bearer <token>` or \
+         `X-IAP-Token: <token>` (or as the password of HTTP Basic, which is \
+         what git sends). The upstream's own credential is attached here; any \
+         you send is dropped.\n\
+         - Your token is {where_}. That file is yours to read for this; it is \
+         the whole of your access and works nowhere but this proxy.\n\n\
+         ```sh\n\
+         curl -H \"X-IAP-Token: $(cat {file})\" {base}/<upstream>/<path>\n\
+         ```\n\n\
+         For git, see the skill of an upstream fronting `https://github.com`: \
+         `agent-iap git-config` sets git up so it asks for the token itself, \
+         and you never handle it.",
+        where_ = token_location(),
+        file = crate::agent_token::DEFAULT_FILE_DISPLAY,
+    );
+    if state.workload.mode() == crate::config::WorkloadMode::Required {
+        text.push_str(&format!(
+            "\n\nThis proxy takes only workload tokens on the gateway: exchange \
+             your agent token at `POST {base}/_iap/token` first, and send what \
+             comes back."
+        ));
+    }
+    text
+}
+
+fn overview(state: &AppState, agent: &AgentConfig, base: &str) -> Skill {
     let mut text = String::new();
     text.push_str(
         "# Calling APIs through agent-iap\n\n\
@@ -204,7 +303,8 @@ fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
          refused. `body` may be a JSON value (sent as `application/json`) or a \
          string (sent as-is). Omit `body` for a GET.\n\n\
          Do not set an `Authorization` header, an API-key header, or any other \
-         credential. The proxy sets them; anything you send is replaced.\n\n\
+         credential on an `iap_request`. The proxy sets them; anything you send \
+         is replaced.\n\n\
          ## Reading the answer\n\n\
          You get the upstream's status code, its headers and its body. A `4xx` \
          from the upstream is the upstream's answer, and it comes back as a \
@@ -246,6 +346,9 @@ fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
     }
 
     let upstreams = reachable_upstreams(state, agent);
+    if !upstreams.is_empty() {
+        text.push_str(&programs_section(state, base));
+    }
     text.push_str("\n\n## What you can reach\n\n");
     if upstreams.is_empty() {
         text.push_str(
@@ -284,7 +387,7 @@ fn skill_name_for(upstream: &str) -> String {
 }
 
 /// One upstream, as its policy actually reads for this agent.
-fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
+fn upstream_skill(state: &AppState, agent: &AgentConfig, base: &str, name: &str) -> Skill {
     let config = state.config();
     let upstream = config.upstream(name);
     let mut text = format!("# `{name}`\n\n");
@@ -307,6 +410,13 @@ fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
                 text.push_str(&format!(
                     "The proxy also sets {headers} on every call to this upstream.\n\n"
                 ));
+            }
+            text.push_str(&format!(
+                "From a program: `{base}/{name}/<path>`, with your agent token \
+                 (`using-this-gateway` § Programs).\n\n"
+            ));
+            if fronts_github(upstream) {
+                text.push_str(&git_section(base, name));
             }
         }
         None => text.push_str("This upstream is no longer in the policy file.\n\n"),
@@ -337,6 +447,30 @@ fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
         description: format!("Base URL, credential scheme and the rules that apply to `{name}`."),
         text,
     }
+}
+
+/// The exact git invocation, for an upstream git can be sent to.
+fn git_section(base: &str, name: &str) -> String {
+    format!(
+        "## Using git\n\n\
+         Clone, fetch and push with git itself, through this upstream — not by \
+         rebuilding commits through the API. In the same shell command as git, \
+         since a tool shell may not keep its environment between calls:\n\n\
+         ```sh\n\
+         {setup} && git clone https://github.com/<owner>/<repo>.git\n\
+         ```\n\n\
+         `git-config` points `https://github.com/` at `{base}/{name}/` and makes \
+         `agent-iap git-credential` git's credential helper for that prefix \
+         alone, so git asks it for your token when the proxy asks for one. No \
+         setting holds the token, and you do not handle it. Remotes stay \
+         `https://github.com/…`; an `ssh://` or `git@github.com:` remote does \
+         not go through the proxy.\n\n\
+         Without `agent-iap` on this machine, send the token yourself, for this \
+         prefix only: `git -c http.{base}/{name}/.extraHeader=\"X-IAP-Token: \
+         <token>\" clone {base}/{name}/<owner>/<repo>.git`.\n\n\
+         A push is allowed only if a rule below allows `git-receive-pack`.\n\n",
+        setup = git_config_command(base, name),
+    )
 }
 
 /// The rules that can match this agent against this target, in the order the
@@ -424,6 +558,8 @@ mod tests {
     use crate::config::Config;
     use std::sync::Arc;
 
+    const BASE: &str = "http://iap.example.com:8080";
+
     fn state() -> Arc<AppState> {
         state_with_default("deny")
     }
@@ -497,7 +633,7 @@ action = "allow"
     #[test]
     fn the_catalog_covers_every_reachable_upstream_and_nothing_else() {
         let state = state();
-        let names: Vec<String> = catalog(&state, &agent(&state, "claude"))
+        let names: Vec<String> = catalog(&state, &agent(&state, "claude"), BASE)
             .into_iter()
             .map(|skill| skill.name)
             .collect();
@@ -510,7 +646,7 @@ action = "allow"
         // `unmentioned` falls through to this policy's default, which denies.
         // Documenting it would be documenting a call that cannot succeed.
         let state = state();
-        let names: Vec<String> = catalog(&state, &agent(&state, "grounded"))
+        let names: Vec<String> = catalog(&state, &agent(&state, "grounded"), BASE)
             .into_iter()
             .map(|skill| skill.name)
             .collect();
@@ -574,7 +710,7 @@ action = "allow"
         let state = state_with_default("ask");
         let agent = agent(&state, "grounded");
 
-        let text = instructions(&state, &agent);
+        let text = instructions(&state, &agent, BASE);
         assert!(
             text.contains("`unmentioned` (calls stop for approval)"),
             "{text}"
@@ -582,14 +718,14 @@ action = "allow"
         // A rule-governed upstream needs no such note; its skill has the rules.
         assert!(text.contains("`anthropic`, "), "{text}");
 
-        let overview = find(&state, &agent, "using-this-gateway").unwrap();
+        let overview = find(&state, &agent, BASE, "using-this-gateway").unwrap();
         assert!(
             overview.text.contains("calls stop for approval"),
             "{}",
             overview.text
         );
 
-        let skill = find(&state, &agent, "upstream/unmentioned").unwrap();
+        let skill = find(&state, &agent, BASE, "upstream/unmentioned").unwrap();
         assert!(
             skill.text.contains("calls stop for approval"),
             "{}",
@@ -603,14 +739,14 @@ action = "allow"
         // Instructions are read once, at `initialize`, and a client may keep
         // them for the whole session. They must not read as the last word.
         let state = state();
-        let text = instructions(&state, &agent(&state, "claude"));
+        let text = instructions(&state, &agent(&state, "claude"), BASE);
         assert!(text.contains("`iap_catalog` is the current list"), "{text}");
     }
 
     #[test]
     fn an_upstream_skill_names_the_scheme_but_never_the_secret() {
         let state = state();
-        let skill = find(&state, &agent(&state, "claude"), "upstream/anthropic").unwrap();
+        let skill = find(&state, &agent(&state, "claude"), BASE, "upstream/anthropic").unwrap();
 
         assert!(
             skill.text.contains("https://api.anthropic.com"),
@@ -624,7 +760,7 @@ action = "allow"
     #[test]
     fn the_rules_listed_are_the_http_ones_in_match_order() {
         let state = state();
-        let skill = find(&state, &agent(&state, "claude"), "upstream/anthropic").unwrap();
+        let skill = find(&state, &agent(&state, "claude"), BASE, "upstream/anthropic").unwrap();
 
         let read = skill.text.find("read-models").expect("allow rule listed");
         let confirm = skill.text.find("confirm-sends").expect("ask rule listed");
@@ -642,20 +778,162 @@ action = "allow"
     fn a_skill_is_reachable_by_short_name_or_by_uri() {
         let state = state();
         let agent = agent(&state, "claude");
-        let by_uri = find(&state, &agent, "skill://agent-iap/upstream/anthropic").unwrap();
-        let by_name = find(&state, &agent, "upstream/anthropic").unwrap();
+        let by_uri = find(&state, &agent, BASE, "skill://agent-iap/upstream/anthropic").unwrap();
+        let by_name = find(&state, &agent, BASE, "upstream/anthropic").unwrap();
         assert_eq!(by_uri.uri, by_name.uri);
-        assert!(find(&state, &agent, "nothing-like-this").is_none());
+        assert!(find(&state, &agent, BASE, "nothing-like-this").is_none());
     }
 
     #[test]
     fn the_instructions_name_what_is_reachable_and_warn_about_approvals() {
         let state = state();
-        let text = instructions(&state, &agent(&state, "claude"));
+        let text = instructions(&state, &agent(&state, "claude"), BASE);
         assert!(text.contains("`anthropic`"), "{text}");
         assert!(text.contains("approval"), "{text}");
         // The one instruction that matters most: do not go looking for a key.
         assert!(text.contains("never ask for one"), "{text}");
+    }
+
+    /// A policy with a `github-git` upstream, and one with workload tokens
+    /// required, for the documents about programs.
+    fn git_state(workload: &str) -> Arc<AppState> {
+        let config: Config = toml::from_str(&format!(
+            r#"
+[server.workload_identity]
+mode = "{workload}"
+
+[audit]
+path = "/dev/null"
+stderr = false
+
+[[agents]]
+id = "claude"
+token_sha256 = "{hash}"
+targets = ["github-git"]
+
+[[upstreams]]
+name = "github-git"
+base_url = "https://github.com"
+auth = {{ type = "basic", username = "x-access-token", secret = "literal:github_pat_real" }}
+
+[[acl]]
+name = "github-git-fetch"
+target = "github-git"
+methods = ["GET", "POST"]
+paths = ["/*/*.git/info/refs", "/*/*.git/git-upload-pack"]
+action = "allow"
+"#,
+            hash = crate::identity::token_hash("iap_claude"),
+        ))
+        .unwrap();
+        AppState::build(config, false).unwrap()
+    }
+
+    /// The issue in one test: an MCP agent is told the HTTP gateway exists,
+    /// where it is, how to authenticate to it and where its token lives — and
+    /// still that `iap_request` needs nothing.
+    #[test]
+    fn the_instructions_point_programs_at_the_gateway_and_the_token() {
+        let state = state();
+        let text = instructions(&state, &agent(&state, "claude"), BASE);
+        assert!(text.contains("never ask for one"), "{text}");
+        assert!(
+            text.contains("`http://iap.example.com:8080/<upstream>/<path>`"),
+            "{text}"
+        );
+        assert!(text.contains("X-IAP-Token"), "{text}");
+        assert!(text.contains("`$IAP_TOKEN`"), "{text}");
+        assert!(text.contains("`$IAP_TOKEN_FILE`"), "{text}");
+        assert!(text.contains("~/.config/agent-iap/token"), "{text}");
+        assert!(text.contains("intended route"), "{text}");
+        // No GitHub upstream here, so no git to speak of.
+        assert!(!text.contains("git-config"), "{text}");
+
+        let skill = find(&state, &agent(&state, "claude"), BASE, "using-this-gateway").unwrap();
+        assert!(skill.text.contains("## Programs"), "{}", skill.text);
+        assert!(
+            skill
+                .text
+                .contains("http://iap.example.com:8080/<upstream>"),
+            "{}",
+            skill.text
+        );
+        assert!(skill.text.contains("not routing"), "{}", skill.text);
+        // The ban on credentials is about the tool, not about every program.
+        assert!(
+            skill.text.contains("credential on an `iap_request`"),
+            "{}",
+            skill.text
+        );
+        let upstream = find(&state, &agent(&state, "claude"), BASE, "upstream/anthropic").unwrap();
+        assert!(
+            upstream
+                .text
+                .contains("`http://iap.example.com:8080/anthropic/<path>`"),
+            "{}",
+            upstream.text
+        );
+    }
+
+    #[test]
+    fn an_agent_that_reaches_nothing_is_not_sent_to_the_gateway_either() {
+        let state = state();
+        let mut config = (*state.config().agent("claude").unwrap()).clone();
+        config.id = "walled".into();
+        config.targets = vec!["unmentioned".into()];
+        assert!(!instructions(&state, &config, BASE).contains("X-IAP-Token"));
+        let overview = &catalog(&state, &config, BASE)[0];
+        assert!(!overview.text.contains("## Programs"), "{}", overview.text);
+    }
+
+    #[test]
+    fn a_github_upstream_carries_the_git_invocation() {
+        let state = git_state("optional");
+        let agent = agent(&state, "claude");
+        let text = instructions(&state, &agent, BASE);
+        assert!(
+            text.contains(
+                "`eval \"$(agent-iap git-config --proxy-url http://iap.example.com:8080)\"`"
+            ),
+            "{text}"
+        );
+
+        let skill = find(&state, &agent, BASE, "upstream/github-git").unwrap();
+        assert!(skill.text.contains("## Using git"), "{}", skill.text);
+        assert!(
+            skill.text.contains(
+                "eval \"$(agent-iap git-config --proxy-url http://iap.example.com:8080)\" \
+                 && git clone https://github.com/<owner>/<repo>.git"
+            ),
+            "{}",
+            skill.text
+        );
+        assert!(skill.text.contains("git-credential"), "{}", skill.text);
+        assert!(!skill.text.contains("github_pat_real"), "{}", skill.text);
+        // Workload tokens are optional here, so nothing about exchanging one.
+        let overview = find(&state, &agent, BASE, "using-this-gateway").unwrap();
+        assert!(!overview.text.contains("_iap/token"), "{}", overview.text);
+    }
+
+    #[test]
+    fn an_upstream_under_another_name_is_named_to_git_config() {
+        assert_eq!(
+            git_config_command(BASE, "gh"),
+            "eval \"$(agent-iap git-config --proxy-url http://iap.example.com:8080 --upstream gh)\""
+        );
+    }
+
+    #[test]
+    fn a_proxy_that_requires_workload_tokens_says_to_exchange_first() {
+        let state = git_state("required");
+        let overview = find(&state, &agent(&state, "claude"), BASE, "using-this-gateway").unwrap();
+        assert!(
+            overview
+                .text
+                .contains("`POST http://iap.example.com:8080/_iap/token`"),
+            "{}",
+            overview.text
+        );
     }
 
     #[test]
@@ -667,7 +945,7 @@ action = "allow"
         let mut config = (*state.config().agent("claude").unwrap()).clone();
         config.id = "walled".into();
         config.targets = vec!["unmentioned".into()];
-        let text = instructions(&state, &config);
+        let text = instructions(&state, &config, BASE);
         assert!(text.contains("no upstream it may address"), "{text}");
     }
 }

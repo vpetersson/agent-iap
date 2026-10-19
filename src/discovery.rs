@@ -142,7 +142,7 @@ async fn bundle(
     }
 
     let mut text = document(&state, &caller, &base);
-    for skill in skills::catalog(&state, caller.agent()) {
+    for skill in skills::catalog(&state, caller.agent(), &base) {
         text.push_str("\n\n---\n\n");
         text.push_str(&skill.text);
     }
@@ -178,8 +178,9 @@ async fn one_skill(
         .strip_prefix(SKILL_MOUNT)
         .unwrap_or_default()
         .trim_start_matches('/');
-    let Some(skill) = skills::find(&state, caller.agent(), wanted) else {
-        let known: Vec<String> = skills::catalog(&state, caller.agent())
+    let base = base_url(&state, &headers);
+    let Some(skill) = skills::find(&state, caller.agent(), &base, wanted) else {
+        let known: Vec<String> = skills::catalog(&state, caller.agent(), &base)
             .into_iter()
             .map(|skill| skill.name)
             .collect();
@@ -247,7 +248,7 @@ fn identify(state: &AppState, headers: &HeaderMap) -> Result<Caller, AuthFailure
 /// `Host` is the caller's own claim, so it is used only after it looks like a
 /// host and nothing else — a header carrying a path, a scheme or a space would
 /// otherwise come back as a URL this proxy appeared to vouch for.
-fn base_url(state: &AppState, headers: &HeaderMap) -> String {
+pub(crate) fn base_url(state: &AppState, headers: &HeaderMap) -> String {
     let config = state.config();
     let scheme = if config.server.tls.is_some() {
         "https"
@@ -719,7 +720,7 @@ pub fn describe(state: &AppState, caller: &Caller, base: &str) -> Value {
 }
 
 fn skill_index(state: &AppState, caller: &Caller, base: &str) -> Vec<Value> {
-    skills::catalog(state, caller.agent())
+    skills::catalog(state, caller.agent(), base)
         .into_iter()
         .map(|skill| {
             json!({

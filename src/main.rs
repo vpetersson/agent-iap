@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_iap::agent_token;
 use agent_iap::audit;
 use agent_iap::clipboard;
 use agent_iap::config::{Action, Config};
@@ -52,6 +53,29 @@ struct ConfigArg {
         global = true
     )]
     config: PathBuf,
+}
+
+/// Where a command an agent runs finds the agent's own token. The order is
+/// `agent_iap::agent_token`'s: the token, then the file named, then
+/// `~/.config/agent-iap/token`.
+#[derive(Args, Clone)]
+struct TokenArg {
+    /// The agent's IAP token.
+    #[arg(long, env = "IAP_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// A file holding the agent's IAP token, mode 0600. Read when no token is
+    /// given; `~/.config/agent-iap/token` when neither is.
+    #[arg(long, value_name = "PATH", env = "IAP_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
+}
+
+impl TokenArg {
+    fn source(&self) -> agent_token::TokenSource {
+        agent_token::TokenSource {
+            token: self.token.clone(),
+            file: self.token_file.clone(),
+        }
+    }
 }
 
 /// The opt-out for the one convenience that touches a secret.
@@ -146,9 +170,8 @@ enum Command {
         /// Name of the `[[mcp_servers]]` entry to front.
         #[arg(short, long)]
         server: String,
-        /// The agent's IAP token.
-        #[arg(long, env = "IAP_TOKEN", hide_env_values = true)]
-        token: String,
+        #[command(flatten)]
+        token: TokenArg,
         /// Control-plane address of the running proxy.
         #[arg(long, env = "IAP_ADMIN_URL")]
         admin_url: Option<String>,
@@ -158,9 +181,8 @@ enum Command {
     Gateway {
         #[command(flatten)]
         config: ConfigArg,
-        /// The agent's IAP token.
-        #[arg(long, env = "IAP_TOKEN", hide_env_values = true)]
-        token: String,
+        #[command(flatten)]
+        token: TokenArg,
         /// Data-plane address of the running proxy.
         #[arg(long, env = "IAP_PROXY_URL")]
         proxy_url: Option<String>,
@@ -168,10 +190,10 @@ enum Command {
     /// Print the git settings that send `https://github.com/` through the proxy.
     ///
     /// `eval "$(agent-iap git-config)"` and then `git clone
-    /// https://github.com/<owner>/<repo>.git` reaches the `github-git` upstream
-    /// with the agent's token in `X-IAP-Token`. The settings are environment
-    /// variables for this shell, and the token is read from `$IAP_TOKEN` when
-    /// they are evaluated — nothing is written to `~/.gitconfig`.
+    /// https://github.com/<owner>/<repo>.git` reaches the `github-git` upstream.
+    /// The token is in none of the settings: git asks `agent-iap
+    /// git-credential` for it, which reads `$IAP_TOKEN` or the token file.
+    /// `--global` prints `git config --global` commands instead, for `| sh`.
     GitConfig {
         #[command(flatten)]
         config: ConfigArg,
@@ -182,6 +204,30 @@ enum Command {
         /// then to `server.listen` in the policy file.
         #[arg(long, env = "IAP_PROXY_URL")]
         proxy_url: Option<String>,
+        /// Print `git config --global` commands rather than variables for this
+        /// shell, so every later shell has them. Neither form holds the token.
+        #[arg(long)]
+        global: bool,
+        #[command(flatten)]
+        token: TokenArg,
+    },
+    /// Git's credential helper for the proxy: `get` answers with the agent's
+    /// token as the password. `git-config` sets it up; git runs it.
+    GitCredential {
+        /// The proxy it answers for. Asked about any other host, it answers
+        /// nothing.
+        #[arg(long, env = "IAP_PROXY_URL")]
+        proxy_url: Option<String>,
+        #[command(flatten)]
+        token: TokenArg,
+        /// `get`, `store` or `erase`, as git passes it.
+        operation: String,
+    },
+    /// Print the agent's token as `{"Authorization": "Bearer …"}`, for an MCP
+    /// client's header helper (Claude Code's `headersHelper`).
+    Headers {
+        #[command(flatten)]
+        token: TokenArg,
     },
     /// Show every service this proxy exposes: agents, upstreams, MCP servers, ACL.
     List {
@@ -1017,6 +1063,7 @@ fn main() -> Result<()> {
                 .context(
                     "no control-plane address — pass --admin-url or set server.admin_listen",
                 )?;
+            let token = token.source().resolve()?;
             tokio_runtime()?.block_on(mcp::run(
                 config,
                 mcp::BridgeOptions {
@@ -1038,6 +1085,7 @@ fn main() -> Result<()> {
                 let scheme = tls::scheme(config.server.tls.is_some());
                 format!("{scheme}://{}", config.server.listen)
             });
+            let token = token.source().resolve()?;
             tokio_runtime()?.block_on(stdio::run(
                 config,
                 stdio::StdioOptions {
@@ -1050,7 +1098,22 @@ fn main() -> Result<()> {
             config,
             upstream,
             proxy_url,
-        } => git_config(&config.config, upstream, proxy_url),
+            global,
+            token,
+        } => git_config(&config.config, upstream, proxy_url, global, &token),
+        Command::GitCredential {
+            proxy_url,
+            token,
+            operation,
+        } => git_credential(proxy_url, &token, &operation),
+        Command::Headers { token } => {
+            let token = token.source().resolve()?;
+            println!(
+                "{}",
+                serde_json::json!({ "Authorization": format!("Bearer {token}") })
+            );
+            Ok(())
+        }
         Command::List {
             config,
             what,
@@ -2101,7 +2164,13 @@ fn list_config(path: &Path, options: &ListOptions, output: OutputArg) -> Result<
 /// was given comes first. On the proxy's own host the file says where it
 /// listens — and whether the upstream named is one it fronts, which is worth
 /// saying now rather than as a `404 unknown_upstream` on the first clone.
-fn git_config(path: &Path, upstream: String, proxy_url: Option<String>) -> Result<()> {
+fn git_config(
+    path: &Path,
+    upstream: String,
+    proxy_url: Option<String>,
+    global: bool,
+    token: &TokenArg,
+) -> Result<()> {
     let given = proxy_url.or_else(|| std::env::var("IAP_URL").ok());
     let proxy_url = match given.filter(|url| !url.trim().is_empty()) {
         Some(url) => url,
@@ -2128,11 +2197,60 @@ fn git_config(path: &Path, upstream: String, proxy_url: Option<String>) -> Resul
             format!("{scheme}://{}", config.server.listen)
         }
     };
+    // The helper reads the token when git asks for it, which is later and in
+    // another process. Reading it now as well is what makes a missing or
+    // world-readable token file an error here, where somebody is looking,
+    // rather than a `401` on the first clone.
+    let source = token.source();
+    source.resolve()?;
+    // A file named here is named to the helper too, so the settings mean the
+    // same thing in a shell where `IAP_TOKEN_FILE` is not set — which, for
+    // `--global`, is every later one.
+    let token_file = source
+        .file
+        .clone()
+        .filter(|file| !file.as_os_str().is_empty());
+    let exe = std::env::current_exe().context("finding this executable for the helper")?;
+    let helper = git::helper_command(&exe, &proxy_url, token_file.as_deref());
     let entries = git::entries(&git::GitConfigOptions {
         proxy_url,
         upstream,
+        helper,
     })?;
-    print!("{}", git::render_env(&entries, &git::existing_keys()));
+    if global {
+        print!("{}", git::render_global(&entries));
+    } else {
+        print!("{}", git::render_env(&entries, &git::existing_keys()));
+    }
+    Ok(())
+}
+
+/// `git-credential`: one exchange of git's credential protocol.
+fn git_credential(proxy_url: Option<String>, token: &TokenArg, operation: &str) -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("reading git's request")?;
+    // Nothing to answer means nothing to read: `store` and `erase` are git
+    // reporting back, and need neither the address nor the token.
+    if operation != "get" {
+        return Ok(());
+    }
+    let proxy_url = proxy_url
+        .or_else(|| std::env::var("IAP_URL").ok())
+        .filter(|url| !url.trim().is_empty())
+        .context(
+            "no proxy address — the helper answers only for the proxy, so it needs              --proxy-url (which `agent-iap git-config` writes), IAP_PROXY_URL or IAP_URL",
+        )?;
+    let proxy = git::proxy_address(&proxy_url)?;
+    match git::credential(operation, &input, &proxy, || token.source().resolve())? {
+        git::CredentialAnswer::Credential(lines) => print!("{lines}"),
+        git::CredentialAnswer::NotTheProxy(asked) => eprintln!(
+            "agent-iap git-credential: not answering for {asked}, which is not the proxy at {}",
+            proxy.as_str().trim_end_matches('/')
+        ),
+        git::CredentialAnswer::Nothing => {}
+    }
     Ok(())
 }
 
