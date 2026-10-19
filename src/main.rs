@@ -9,6 +9,7 @@ use agent_iap::audit;
 use agent_iap::clipboard;
 use agent_iap::config::{Action, Config};
 use agent_iap::enroll;
+use agent_iap::git;
 use agent_iap::identity;
 use agent_iap::init::{self, InitOptions, Template};
 use agent_iap::list::{Inventory, ListOptions, What};
@@ -161,6 +162,24 @@ enum Command {
         #[arg(long, env = "IAP_TOKEN", hide_env_values = true)]
         token: String,
         /// Data-plane address of the running proxy.
+        #[arg(long, env = "IAP_PROXY_URL")]
+        proxy_url: Option<String>,
+    },
+    /// Print the git settings that send `https://github.com/` through the proxy.
+    ///
+    /// `eval "$(agent-iap git-config)"` and then `git clone
+    /// https://github.com/<owner>/<repo>.git` reaches the `github-git` upstream
+    /// with the agent's token in `X-IAP-Token`. The settings are environment
+    /// variables for this shell, and the token is read from `$IAP_TOKEN` when
+    /// they are evaluated — nothing is written to `~/.gitconfig`.
+    GitConfig {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// The upstream enrolled from the `github-git` profile.
+        #[arg(long, default_value = "github-git")]
+        upstream: String,
+        /// Data-plane address of the running proxy. Defaults to `IAP_URL`, and
+        /// then to `server.listen` in the policy file.
         #[arg(long, env = "IAP_PROXY_URL")]
         proxy_url: Option<String>,
     },
@@ -1027,6 +1046,11 @@ fn main() -> Result<()> {
                 },
             ))
         }
+        Command::GitConfig {
+            config,
+            upstream,
+            proxy_url,
+        } => git_config(&config.config, upstream, proxy_url),
         Command::List {
             config,
             what,
@@ -2068,6 +2092,47 @@ fn list_config(path: &Path, options: &ListOptions, output: OutputArg) -> Result<
         OutputArg::Table => print!("{}", inventory.render()),
         OutputArg::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
     }
+    Ok(())
+}
+
+/// `git-config`: where the proxy is, then the settings that reach it.
+///
+/// An agent is usually handed `IAP_URL` and no policy file, so the address it
+/// was given comes first. On the proxy's own host the file says where it
+/// listens — and whether the upstream named is one it fronts, which is worth
+/// saying now rather than as a `404 unknown_upstream` on the first clone.
+fn git_config(path: &Path, upstream: String, proxy_url: Option<String>) -> Result<()> {
+    let given = proxy_url.or_else(|| std::env::var("IAP_URL").ok());
+    let proxy_url = match given.filter(|url| !url.trim().is_empty()) {
+        Some(url) => url,
+        None => {
+            let config = Config::load(path).context(
+                "no proxy address — pass --proxy-url, or set IAP_URL, or run this where the \
+                 policy file is",
+            )?;
+            match config.upstream(&upstream) {
+                None => eprintln!(
+                    "warning: `{upstream}` is not an upstream in {} — \
+                     `agent-iap profile add github-git` enrols it",
+                    path.display()
+                ),
+                Some(found) if found.base_url.trim_end_matches('/') != "https://github.com" => {
+                    eprintln!(
+                        "warning: `{upstream}` fronts {}, not https://github.com",
+                        found.base_url
+                    )
+                }
+                Some(_) => {}
+            }
+            let scheme = tls::scheme(config.server.tls.is_some());
+            format!("{scheme}://{}", config.server.listen)
+        }
+    };
+    let entries = git::entries(&git::GitConfigOptions {
+        proxy_url,
+        upstream,
+    })?;
+    print!("{}", git::render_env(&entries, &git::existing_keys()));
     Ok(())
 }
 

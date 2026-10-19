@@ -108,7 +108,8 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Object storage | `s3` (`--var region=…`), `r2` (`--var account_id=…`), `s3-compatible` (`--var host=…` — MinIO, B2, Wasabi, Spaces, Ceph, …) — all `aws_sigv4`, all needing `--var access_key_id=…` and `--var bucket=…` |
-| Others | `anthropic`, `openai`, `xai`, `github`, `linear`, `slack`, `stripe` |
+| GitHub | `github` (the REST API), `github-git` (`git clone`, `fetch` and `push` over HTTPS, `--var repo=owner/name` to narrow it) |
+| Others | `anthropic`, `openai`, `xai`, `linear`, `slack`, `stripe` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
@@ -125,6 +126,26 @@ The honest limits, all printed by `profile show`:
   is refused, and [§ S3, R2](policy-file.md#s3-r2-and-anything-else-speaking-the-s3-api)
   has the rest.
 
+- **Git is a second GitHub upstream.** An upstream is one base URL, and git's
+  smart-HTTP endpoints are on `github.com` rather than `api.github.com` and take
+  the token as HTTP Basic `x-access-token:<token>` rather than as a bearer — so
+  `github-git` is its own profile, usually on the same `--secret` as `github`.
+  `read` allows the two requests a clone or fetch makes, `GET
+  /<owner>/<repo>.git/info/refs` and `POST …/git-upload-pack`, and denies `POST
+  …/git-receive-pack` by name; `write` allows that too. `--var repo=acme/api`
+  (or `acme/*`) narrows every rule to that repository; the default `*/*` is
+  every repository the token reaches. Rules match the path and never the query
+  string, so `read` cannot refuse `info/refs?service=git-receive-pack` — that
+  answers with the ref list a fetch is shown anyway, and the push itself is the
+  POST it denies. Git sends its own `Authorization`, so the agent's token goes
+  in `X-IAP-Token`, and `agent-iap git-config` sets that up
+  ([§ Git](agents.md#git)). A push is buffered whole, up to
+  `server.max_body_bytes` (10 MiB unless raised); `ssh://` and `git@github.com:`
+  remotes are not rewritten, and Git LFS objects live on other hosts the
+  profile does not cover. `verify` reads a public repository's refs — a bad
+  token is a 401 there — which proves GitHub accepts the token, not that it
+  reaches yours; `--path '/<owner>/<repo>.git/info/refs?service=git-upload-pack'`
+  asks that.
 - **A Cloudflare token is half an address.** Most of `client/v4` lives under
 `/accounts/<id>/…`, and an account-owned token (`cfat_`, the durable
 service-principal kind) can only be verified at that account's own endpoint —
