@@ -141,6 +141,13 @@ fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
          You get the upstream's status code, its headers and its body. A `4xx` \
          from the upstream is the upstream's answer, and it comes back as a \
          normal result — it is not the proxy refusing you.\n\n\
+         A textual body (JSON, XML, `text/*`, …) arrives as `body`. Anything \
+         else — an archive, an image, a PDF, bytes that are not UTF-8 — arrives \
+         base64-encoded as `body_base64` instead, and there is no `body`. Decode \
+         it to get the exact bytes; never treat it as text. Pass \
+         `\"response_encoding\": \"base64\"` to get `body_base64` whatever the \
+         content type. A body larger than the proxy's limit is cut at that many \
+         bytes and the result says `truncated`.\n\n\
          ## When you are refused\n\n\
          A refusal is a tool error whose message names the rule. The codes:\n\n\
          - `policy_denied` — the ACL says no. Final. The rule name is in the \

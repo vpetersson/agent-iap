@@ -57,6 +57,13 @@ JSON-RPC error, because the model is the one that has to read it and pick
 something else. The upstream's own `4xx` is a normal result, labelled with its
 status so it does not read as a refusal.
 
+A textual response — `text/*`, JSON, XML, YAML and their `+json`/`+xml`
+variants, anything with a `charset`, or no content type at all — comes back as
+`body`, provided it is valid UTF-8. Anything else comes back base64-encoded as
+`body_base64`, with no `body`, so a tarball or an image arrives byte for byte
+instead of with every non-UTF-8 byte replaced. Pass
+`"response_encoding": "base64"` to get `body_base64` regardless.
+
 ### Skills, and why they are generated
 
 An agent that finds a tool called `iap_request` learns nothing from the name
@@ -82,8 +89,9 @@ itself. The secret behind it stays in the daemon.
 
 Responses are buffered, not streamed: a JSON-RPC result cannot be a stream, so a
 response is read up to `max_body_bytes` and truncation is reported in the
-result. Streaming output is what the HTTP proxy is for. JSON-RPC batching is not
-accepted, having been dropped from the protocol revision this implements.
+result. The cap applies to the raw bytes, before any base64 encoding. Streaming
+output is what the HTTP proxy is for. JSON-RPC batching is not accepted, having
+been dropped from the protocol revision this implements.
 
 ## The bridge
 
