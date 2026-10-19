@@ -4365,7 +4365,9 @@ action = "allow"
         // And `esc` puts back what was typed rather than the form, so a
         // mistyped letter does not cost the catalogue.
         app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
-        let rendered = render(&mut app, 120, 44);
+        // Tall enough for the whole catalogue, so `anthropic` is on screen
+        // rather than scrolled off above the cursor.
+        let rendered = render(&mut app, 120, 64);
         assert!(rendered.contains("anthropic"), "{rendered}");
         assert!(rendered.contains("pick a profile"), "{rendered}");
     }

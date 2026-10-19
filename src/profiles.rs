@@ -1121,6 +1121,596 @@ fn google_subject() -> Var {
     )
 }
 
+const CLOUD_PLATFORM: &str = "https://www.googleapis.com/auth/cloud-platform";
+const CLOUD_PLATFORM_READ_ONLY: &str = "https://www.googleapis.com/auth/cloud-platform.read-only";
+
+/// A Google Cloud infrastructure API: the APIs `gcloud` drives, as opposed to
+/// the Workspace and analytics ones `google` is for.
+struct GoogleCloud<'a> {
+    id: &'a str,
+    title: &'a str,
+    summary: &'a str,
+    base_url: &'a str,
+    /// `gcloud config set api_endpoint_overrides/<property>`, which is not
+    /// always the API's own name — Cloud SQL's is `sql`.
+    property: &'a str,
+    /// What gcloud expects after the upstream in that override, because some
+    /// of its clients carry the API path in the endpoint: `compute/v1/`.
+    override_path: &'a str,
+    /// The predefined role that makes `read` work, granted on the project.
+    role: &'a str,
+    levels: Vec<Access>,
+    /// What is particular to this API, ahead of what all of them share.
+    note: &'a str,
+}
+
+/// A Cloud API is reached through IAM on the project, which is why it is not
+/// built by `google`: none of that note is true here, and its `subject`
+/// variable is the wrong lever. A Workspace API is reached by sharing something
+/// with the service account, or by acting as a person who already has it; a
+/// Cloud API is reached by a role binding, and delegating to a Workspace user
+/// would only swap the service account's bindings for that person's. So there
+/// is no `subject` here to set by mistake — a `--var subject=` is refused as
+/// unknown rather than quietly turning the token into somebody's.
+fn google_cloud(spec: GoogleCloud<'_>) -> Profile {
+    let GoogleCloud {
+        id,
+        title,
+        summary,
+        base_url,
+        property,
+        override_path,
+        role,
+        levels,
+        note,
+    } = spec;
+    // Where only Google's catch-all scopes exist, the token is good for every
+    // Cloud API the role reaches, and saying so is the point of the note.
+    let read_scopes = &levels[0].scopes;
+    let scope = if read_scopes.iter().any(|scope| scope == CLOUD_PLATFORM) {
+        " Google offers this API no scope narrower than `cloud-platform`, which \
+         also writes, and to every Cloud API the role reaches — so the role and \
+         this ACL are the only narrowing there is, and there is no `write` level."
+    } else if read_scopes
+        .iter()
+        .any(|scope| scope == CLOUD_PLATFORM_READ_ONLY)
+    {
+        " Its narrowest scope is `cloud-platform.read-only`, shared by every Cloud \
+         API, so the role and this ACL are what keep the token to this one; its only \
+         write scope is `cloud-platform`, so there is no `write` level."
+    } else {
+        ""
+    };
+    let write = if levels.iter().any(|level| level.name == "write") {
+        " `write` needs a role that writes."
+    } else {
+        ""
+    };
+    Profile {
+        id: id.into(),
+        title: title.into(),
+        vendor: "Google".into(),
+        summary: summary.into(),
+        default_name: id.into(),
+        credential: Credential {
+            about: "the service-account JSON key, exactly as Google issues it".into(),
+            url: "https://console.cloud.google.com/iam-admin/serviceaccounts".into(),
+        },
+        vars: vec![],
+        service: Service::Http {
+            base_url: base_url.into(),
+            auth: AuthTemplate::ServiceAccountJwt { subject_var: None },
+        },
+        access: levels,
+        note: Some(format!(
+            "Grant the service account `{role}` on the project for `read` — a key with no \
+             binding authenticates and then 403s, and it is the role, not the level, that \
+             decides how far a call reaches. `roles/viewer` works too, but reads every \
+             service in the project.{write}{scope} Nothing is delegated: a Cloud API \
+             authorizes the service account itself, so this profile has no `subject`. \
+             gcloud works through the proxy with no login of its own: `gcloud config set \
+             auth/access_token_file ~/.config/agent-iap/token` (the agent's token file — \
+             gcloud strips the newline) and `gcloud config set \
+             api_endpoint_overrides/{property} http://<proxy>/{id}/{override_path}`, with \
+             the upstream's own name if it was added `--as` another. gcloud then sends the \
+             agent's token as the bearer and the proxy swaps in the service account's. \
+             {note}"
+        )),
+        probe: None,
+    }
+}
+
+/// The Cloud infrastructure APIs, read-only by default.
+///
+/// Scopes are the narrowest each API's discovery document lists for its GETs,
+/// and the POSTs `read` allows are the ones that document accepts under that
+/// read-only scope and that change nothing — `testIamPermissions`,
+/// `getIamPolicy` and the queries. Where the read-only scope is wider than
+/// that (Resource Manager takes `cloud-platform.read-only` for creating a
+/// lien), the ACL is what holds the line, which is why these are named paths
+/// and not `POST /**`.
+fn google_cloud_profiles() -> Vec<Profile> {
+    const COMPUTE_QUERIES: &[&str] = &[
+        "/compute/*/**/testIamPermissions",
+        "/compute/*/**/getHealth",
+        "/compute/*/**/listInstances",
+        "/compute/*/**/listManagedInstances",
+        "/compute/*/**/listPerInstanceConfigs",
+        "/compute/*/**/listNetworkEndpoints",
+        "/compute/*/**/listNodes",
+        "/compute/*/**/operations/*/wait",
+        "/compute/*/**/routers/*/preview",
+    ];
+    const RESOURCE_MANAGER_QUERIES: &[&str] = &[
+        "/v1/**/*:getIamPolicy",
+        "/v3/**/*:getIamPolicy",
+        "/v1/**/*:testIamPermissions",
+        "/v3/**/*:testIamPermissions",
+        "/v1/projects/*:getAncestry",
+        "/v1/**/*:getOrgPolicy",
+        "/v1/**/*:getEffectiveOrgPolicy",
+        "/v1/**/*:listOrgPolicies",
+        "/v1/**/*:listAvailableOrgPolicyConstraints",
+        "/v1/organizations:search",
+    ];
+    const IAM_QUERIES: &[&str] = &[
+        "/v1/**/*:getIamPolicy",
+        "/v1/**/*:testIamPermissions",
+        "/v1/roles:queryGrantableRoles",
+        "/v1/permissions:queryTestablePermissions",
+        "/v1/iamPolicies:queryAuditableServices",
+        "/v1/iamPolicies:lintPolicy",
+    ];
+    // Each of these hands the caller something that acts as a service account
+    // away from this proxy, and goes on working after the agent's token is
+    // revoked: a signed JWT or blob, or a key.
+    const IAM_MINTS: &[&str] = &[
+        "/v1/projects/*/serviceAccounts/*:signJwt",
+        "/v1/projects/*/serviceAccounts/*:signBlob",
+        "/v1/projects/*/serviceAccounts/*/keys",
+        "/v1/projects/*/serviceAccounts/*/keys:upload",
+    ];
+    const MONITORING_QUERIES: &[&str] = &[
+        "/v3/projects/*/timeSeries:query",
+        "/v1/projects/*/location/*/prometheus/api/v1/query",
+        "/v1/projects/*/location/*/prometheus/api/v1/query_range",
+        "/v1/projects/*/location/*/prometheus/api/v1/query_exemplars",
+        "/v1/projects/*/location/*/prometheus/api/v1/series",
+        "/v1/projects/*/location/*/prometheus/api/v1/labels",
+    ];
+    const PUBSUB_CONSUME: &[&str] = &[
+        "/v1/projects/*/subscriptions/*:pull",
+        "/v1/projects/*/subscriptions/*:acknowledge",
+        "/v1/projects/*/subscriptions/*:modifyAckDeadline",
+    ];
+    const SECRET_PAYLOADS: &[&str] = &["/v1/**/versions/*:access"];
+    const REDIS_AUTH: &[&str] = &["/v1/projects/*/locations/*/instances/*/authString"];
+    // What `redis.read-only` is accepted for, and nothing it is not.
+    const REDIS_READS: &[&str] = &[
+        "/v1/projects/*/locations/*/instances",
+        "/v1/projects/*/locations/*/instances/*",
+        "/v1/projects/*/locations/*/backupCollections",
+        "/v1/projects/*/locations/*/backupCollections/**",
+    ];
+    const COMPUTE_READ: &str = "https://www.googleapis.com/auth/compute.readonly";
+    const COMPUTE: &str = "https://www.googleapis.com/auth/compute";
+    const CONTAINER_READ: &str = "https://www.googleapis.com/auth/container.read-only";
+    const CONTAINER: &str = "https://www.googleapis.com/auth/container";
+    const SQL: &str = "https://www.googleapis.com/auth/sqlservice.admin";
+    const REDIS_READ: &str = "https://www.googleapis.com/auth/redis.read-only";
+    const REDIS: &str = "https://www.googleapis.com/auth/redis.read-write";
+    const MONITORING_READ: &str = "https://www.googleapis.com/auth/monitoring.read";
+    const MONITORING: &str = "https://www.googleapis.com/auth/monitoring";
+    const DNS_READ: &str = "https://www.googleapis.com/auth/ndev.clouddns.readonly";
+    const DNS: &str = "https://www.googleapis.com/auth/ndev.clouddns.readwrite";
+    const PUBSUB: &str = "https://www.googleapis.com/auth/pubsub";
+
+    vec![
+        google_cloud(GoogleCloud {
+            id: "google-cloud-logging",
+            title: "Google Cloud Logging",
+            summary: "Read log entries out of Cloud Logging.",
+            base_url: "https://logging.googleapis.com",
+            property: "logging",
+            override_path: "",
+            role: "roles/logging.viewer",
+            levels: vec![access(
+                "read",
+                "list entries — `entries:list` is a POST",
+                &["https://www.googleapis.com/auth/logging.read"],
+                vec![
+                    rule("reads", &["GET"], &["/v2/**"], "allow"),
+                    rule("list-entries", &["POST"], &["/v2/entries:list"], "allow"),
+                ],
+            )],
+            note: "`entries:list` reads with a POST, and `read` allows it. \
+                   `roles/logging.viewer` does not read Data Access audit logs; that is \
+                   `roles/logging.privateLogViewer`.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-storage",
+            title: "Google Cloud Storage",
+            summary: "Read objects and bucket metadata.",
+            base_url: "https://storage.googleapis.com",
+            property: "storage",
+            override_path: "storage/v1/",
+            role: "roles/storage.objectViewer",
+            levels: vec![
+                access(
+                    "read",
+                    "get objects and list buckets",
+                    &["https://www.googleapis.com/auth/devstorage.read_only"],
+                    vec![rule("reads", &["GET"], &["/**"], "allow")],
+                ),
+                access(
+                    "write",
+                    "also upload and delete",
+                    &["https://www.googleapis.com/auth/devstorage.read_write"],
+                    vec![rule("all", &["*"], &["/**"], "allow")],
+                ),
+            ],
+            note: "Storage roles can be granted on one bucket instead of the project, \
+                   which is the narrower of the two; listing buckets also takes \
+                   `roles/storage.bucketViewer`. These rules name no bucket, so the \
+                   binding is what keeps it to one.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-compute",
+            title: "Google Compute Engine",
+            summary: "Instances, disks, networks, firewalls, routers and NAT, load balancers.",
+            base_url: "https://compute.googleapis.com",
+            property: "compute",
+            override_path: "compute/v1/",
+            role: "roles/compute.viewer",
+            levels: vec![
+                access(
+                    "read",
+                    "every GET, plus the POSTs that only report — health, group members, \
+                     `testIamPermissions`, waiting on an operation; batch denied",
+                    &[COMPUTE_READ],
+                    vec![
+                        rule("batch", &["*"], &["/batch/**"], "deny"),
+                        rule("reads", &["GET"], &["/compute/*/**"], "allow"),
+                        rule("queries", &["POST"], COMPUTE_QUERIES, "allow"),
+                    ],
+                ),
+                access(
+                    "write",
+                    "everything under `compute/`",
+                    &[COMPUTE],
+                    vec![rule("all", &["*"], &["/compute/*/**"], "allow")],
+                ),
+            ],
+            note: "The override carries the API path — `…/google-cloud-compute/compute/v1/` — \
+                   because gcloud's compute client does. Also set `gcloud config set \
+                   compute/disable_batch_request true`: gcloud otherwise sends some \
+                   requests as one batch to `/batch/compute/v1` at the root of the proxy \
+                   rather than under the upstream, where nothing is enrolled, and a batch's \
+                   sub-requests are invisible to the ACL anyway, so `read` denies \
+                   `/batch/**` by name. `compute.readonly` cannot read the two Shared VPC \
+                   lookups, `projects/<p>/getXpnHost` and `getXpnResources`; Google wants \
+                   `compute` for those.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-container",
+            title: "Google Kubernetes Engine",
+            summary: "Clusters, node pools and their operations — the GKE control plane API.",
+            base_url: "https://container.googleapis.com",
+            property: "container",
+            override_path: "",
+            role: "roles/container.viewer",
+            levels: vec![
+                access(
+                    "read",
+                    "every GET",
+                    &[CONTAINER_READ],
+                    vec![rule("reads", &["GET"], &["/v1/**", "/v1beta1/**"], "allow")],
+                ),
+                access(
+                    "write",
+                    "also create, resize, upgrade and delete",
+                    &[CONTAINER],
+                    vec![rule("all", &["*"], &["/v1/**", "/v1beta1/**"], "allow")],
+                ),
+            ],
+            note: "This is the API that describes clusters, not the clusters' own \
+                   Kubernetes API: `kubectl` talks to each cluster's endpoint with a Google \
+                   token, which this profile does not front and the agent does not hold, \
+                   so `gcloud container clusters get-credentials` produces a kubeconfig \
+                   that cannot authenticate.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-sql",
+            title: "Google Cloud SQL Admin API",
+            summary: "Instances, replicas, databases, users, backups and operations.",
+            base_url: "https://sqladmin.googleapis.com",
+            property: "sql",
+            override_path: "",
+            role: "roles/cloudsql.viewer",
+            levels: vec![
+                access(
+                    "read",
+                    "every GET",
+                    &[SQL],
+                    vec![rule(
+                        "reads",
+                        &["GET"],
+                        &["/sql/v1beta4/**", "/v1/**"],
+                        "allow",
+                    )],
+                ),
+                access(
+                    "write",
+                    "everything — SQL execution and client certificates included",
+                    &[SQL],
+                    vec![rule("all", &["*"], &["/sql/v1beta4/**", "/v1/**"], "allow")],
+                ),
+            ],
+            note: "gcloud's property is `sql`, not `sqladmin`. gcloud speaks \
+                   `sql/v1beta4/…` and the newer clients `/v1/…`; both are covered. Google \
+                   has no read-only Cloud SQL scope, so `read` and `write` both ask for \
+                   `sqlservice.admin`, which can do anything to any instance the role \
+                   reaches — the role and this ACL are what make `read` read-only. `write` \
+                   includes `instances/<i>/executeSql`, which runs SQL as a database user, \
+                   and `:generateEphemeralCert`, which hands the caller a client \
+                   certificate for the instance.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-redis",
+            title: "Google Memorystore for Redis",
+            summary: "Redis instances and backups.",
+            base_url: "https://redis.googleapis.com",
+            property: "redis",
+            override_path: "",
+            role: "roles/redis.viewer",
+            levels: vec![
+                access(
+                    "read",
+                    "instances and backups, without the AUTH string",
+                    &[REDIS_READ],
+                    vec![
+                        rule("auth-string", &["*"], REDIS_AUTH, "deny"),
+                        rule("reads", &["GET"], REDIS_READS, "allow"),
+                    ],
+                ),
+                access(
+                    "write",
+                    "everything — clusters, operations and the AUTH string included",
+                    &[REDIS],
+                    vec![rule("all", &["*"], &["/v1/**"], "allow")],
+                ),
+            ],
+            note: "`redis.read-only` reaches instances and backups and nothing else: \
+                   clusters (Memorystore for Redis Cluster), operations and the location \
+                   list answer 403 to it however the ACL reads, so `read` does not list \
+                   them, and `gcloud redis operations` and `regions list` fail at that \
+                   level. Reading those takes `write`'s `redis.read-write` scope, with the \
+                   role kept at `roles/redis.viewer` so that IAM keeps it read-only. \
+                   `…/instances/<i>/authString` is a GET that returns the instance's AUTH \
+                   password, and the read-only scope is enough to call it, so `read` \
+                   denies it by name.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-monitoring",
+            title: "Google Cloud Monitoring",
+            summary: "Metrics, time series, PromQL, alert policies, uptime checks, dashboards.",
+            base_url: "https://monitoring.googleapis.com",
+            property: "monitoring",
+            override_path: "",
+            role: "roles/monitoring.viewer",
+            levels: vec![
+                access(
+                    "read",
+                    "every GET, plus MQL and PromQL queries — which are POSTs",
+                    &[MONITORING_READ],
+                    vec![
+                        rule("reads", &["GET"], &["/v3/**", "/v1/**"], "allow"),
+                        rule("queries", &["POST"], MONITORING_QUERIES, "allow"),
+                    ],
+                ),
+                access(
+                    "write",
+                    "also alert policies, uptime checks, channels, dashboards and metric data",
+                    &[MONITORING],
+                    vec![rule("all", &["*"], &["/v3/**", "/v1/**"], "allow")],
+                ),
+            ],
+            note: "`timeSeries:query` and the PromQL endpoints under \
+                   `/v1/projects/<p>/location/global/prometheus/api/v1/` read with a POST, \
+                   like Cloud Logging's `entries:list`, and `read` allows them. \
+                   `monitoring.write` would only write metric data; `write` asks for \
+                   `monitoring`, which configures everything.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-resource-manager",
+            title: "Google Cloud Resource Manager",
+            summary: "Projects, folders, organizations, their IAM policies, tags and liens.",
+            base_url: "https://cloudresourcemanager.googleapis.com",
+            property: "cloudresourcemanager",
+            override_path: "",
+            role: "roles/browser",
+            levels: vec![access(
+                "read",
+                "every GET, plus the IAM and org-policy reads — which are POSTs",
+                &[CLOUD_PLATFORM_READ_ONLY],
+                vec![
+                    rule("reads", &["GET"], &["/v1/**", "/v3/**"], "allow"),
+                    rule("queries", &["POST"], RESOURCE_MANAGER_QUERIES, "allow"),
+                ],
+            )],
+            note: "`roles/browser` reads the hierarchy; reading a project's IAM policy \
+                   (`:getIamPolicy`) also needs `roles/iam.securityReviewer`. Google \
+                   accepts `cloud-platform.read-only` for creating and deleting a lien, \
+                   so even the scope is not read-only here; `read` allows neither. \
+                   `verify` searches projects, which answers 200 with an empty list for a \
+                   good key with no binding.",
+        })
+        .probing("/v3/projects:search"),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-iam",
+            title: "Google Cloud IAM",
+            summary: "Service accounts, their keys' metadata, roles, deny policies.",
+            base_url: "https://iam.googleapis.com",
+            property: "iam",
+            override_path: "",
+            role: "roles/iam.securityReviewer",
+            levels: vec![access(
+                "read",
+                "every GET, plus the policy and permission queries — which are POSTs; \
+                 signing and key creation denied",
+                &[CLOUD_PLATFORM],
+                vec![
+                    rule("mints", &["POST"], IAM_MINTS, "deny"),
+                    rule("reads", &["GET"], &["/v1/**", "/v2/**"], "allow"),
+                    rule("queries", &["POST"], IAM_QUERIES, "allow"),
+                ],
+            )],
+            note: "`:signJwt`, `:signBlob` and creating or uploading a service-account key \
+                   each produce something that acts as a service account outside this \
+                   proxy and outlives the agent's token, so `read` denies them by name \
+                   rather than leaving them to an `ask` somebody might wave through; \
+                   `roles/iam.securityReviewer` holds none of those permissions either. \
+                   Short-lived tokens come from `iamcredentials.googleapis.com`, another \
+                   host no profile fronts. `verify` lists Google's predefined roles, which \
+                   any valid credential may.",
+        })
+        .probing("/v1/roles?pageSize=1"),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-dns",
+            title: "Google Cloud DNS",
+            summary: "Managed zones, record sets, policies and response policies.",
+            base_url: "https://dns.googleapis.com",
+            property: "dns",
+            override_path: "dns/v1/",
+            role: "roles/dns.reader",
+            levels: vec![
+                access(
+                    "read",
+                    "every GET, plus a zone's `getIamPolicy` and `testIamPermissions`",
+                    &[DNS_READ],
+                    vec![
+                        rule("reads", &["GET"], &["/dns/*/**"], "allow"),
+                        rule(
+                            "queries",
+                            &["POST"],
+                            &[
+                                "/dns/*/projects/*/managedZones/*:getIamPolicy",
+                                "/dns/*/projects/*/managedZones/*:testIamPermissions",
+                            ],
+                            "allow",
+                        ),
+                    ],
+                ),
+                access(
+                    "write",
+                    "also zones, record changes and policies",
+                    &[DNS],
+                    vec![rule("all", &["*"], &["/dns/*/**"], "allow")],
+                ),
+            ],
+            note: "The override carries the API path, as gcloud's own default does — \
+                   `…/google-cloud-dns/dns/v1/`.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-pubsub",
+            title: "Google Cloud Pub/Sub",
+            summary: "Topics, subscriptions, snapshots and schemas — configuration, not messages.",
+            base_url: "https://pubsub.googleapis.com",
+            property: "pubsub",
+            override_path: "",
+            role: "roles/pubsub.viewer",
+            levels: vec![
+                access(
+                    "read",
+                    "every GET and `testIamPermissions`; pulling and acking denied",
+                    &[PUBSUB],
+                    vec![
+                        rule("consume", &["POST"], PUBSUB_CONSUME, "deny"),
+                        rule("reads", &["GET"], &["/v1/**"], "allow"),
+                        rule(
+                            "queries",
+                            &["POST"],
+                            &["/v1/**/*:testIamPermissions"],
+                            "allow",
+                        ),
+                    ],
+                ),
+                access(
+                    "write",
+                    "everything — publishing and pulling included",
+                    &[PUBSUB],
+                    vec![rule("all", &["*"], &["/v1/**"], "allow")],
+                ),
+            ],
+            note: "Pub/Sub has one scope, `pubsub`, for reading and writing alike, so \
+                   the role and this ACL are what keep `read` read-only. Pulling is not \
+                   reading: a pull leases messages away from the subscription's real \
+                   consumer until their ack deadline passes, and an acknowledge removes \
+                   them for good, so `read` denies `:pull`, `:acknowledge` and \
+                   `:modifyAckDeadline` by name.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-secret-manager",
+            title: "Google Secret Manager",
+            summary: "Secrets and versions — metadata only at `read`, never a payload.",
+            base_url: "https://secretmanager.googleapis.com",
+            property: "secretmanager",
+            override_path: "",
+            role: "roles/secretmanager.viewer",
+            levels: vec![access(
+                "read",
+                "secret and version metadata and `testIamPermissions`; `:access` denied",
+                &[CLOUD_PLATFORM],
+                vec![
+                    rule("payloads", &["*"], SECRET_PAYLOADS, "deny"),
+                    rule("reads", &["GET"], &["/v1/**"], "allow"),
+                    rule(
+                        "queries",
+                        &["POST"],
+                        &["/v1/**/*:testIamPermissions"],
+                        "allow",
+                    ),
+                ],
+            )],
+            note: "`…/versions/<v>:access` returns the secret itself and is a GET like \
+                   every other read here, so `read` denies it by name, before the rule \
+                   that allows GETs; `roles/secretmanager.viewer` lacks \
+                   `secretmanager.versions.access` too, so it takes both to change. gcloud's \
+                   property is `secretmanager`, for `gcloud secrets`. Regional secrets are \
+                   on `secretmanager.<location>.rep.googleapis.com`, another host this \
+                   profile does not front.",
+        }),
+        google_cloud(GoogleCloud {
+            id: "google-cloud-artifact-registry",
+            title: "Google Artifact Registry",
+            summary: "Repositories, packages, versions, tags and file metadata.",
+            base_url: "https://artifactregistry.googleapis.com",
+            property: "artifactregistry",
+            override_path: "",
+            role: "roles/artifactregistry.reader",
+            levels: vec![access(
+                "read",
+                "every GET and `testIamPermissions`",
+                &[CLOUD_PLATFORM_READ_ONLY],
+                vec![
+                    rule("reads", &["GET"], &["/v1/**"], "allow"),
+                    rule(
+                        "queries",
+                        &["POST"],
+                        &["/v1/**/*:testIamPermissions"],
+                        "allow",
+                    ),
+                ],
+            )],
+            note: "This is the registry's management API. Pulling an image or a package \
+                   goes to `<location>-docker.pkg.dev` (or `-npm`, `-python`, …) with a \
+                   token exchange of its own, which no profile fronts. A file's bytes are \
+                   reachable here, though: `…/files/<f>:download` is a GET, and \
+                   `roles/artifactregistry.reader` may download.",
+        }),
+    ]
+}
+
 fn cloudflare_mcp(slug: &str, host: &str, title: &str, summary: &str) -> Profile {
     Profile {
         id: format!("cloudflare-mcp-{slug}"),
@@ -1746,41 +2336,6 @@ pub fn catalog() -> Vec<Profile> {
                     "also update and append",
                     &["https://www.googleapis.com/auth/spreadsheets"],
                     vec![rule("all", &["*"], &["/v4/spreadsheets/**"], "allow")],
-                ),
-            ],
-        ),
-        google(
-            "google-cloud-logging",
-            "Google Cloud Logging",
-            "Read log entries out of Cloud Logging.",
-            "https://logging.googleapis.com",
-            vec![access(
-                "read",
-                "list entries — `entries:list` is a POST",
-                &["https://www.googleapis.com/auth/logging.read"],
-                vec![
-                    rule("reads", &["GET"], &["/v2/**"], "allow"),
-                    rule("list-entries", &["POST"], &["/v2/entries:list"], "allow"),
-                ],
-            )],
-        ),
-        google(
-            "google-cloud-storage",
-            "Google Cloud Storage",
-            "Read objects and bucket metadata.",
-            "https://storage.googleapis.com",
-            vec![
-                access(
-                    "read",
-                    "get objects and list buckets",
-                    &["https://www.googleapis.com/auth/devstorage.read_only"],
-                    vec![rule("reads", &["GET"], &["/**"], "allow")],
-                ),
-                access(
-                    "write",
-                    "also upload and delete",
-                    &["https://www.googleapis.com/auth/devstorage.read_write"],
-                    vec![rule("all", &["*"], &["/**"], "allow")],
                 ),
             ],
         ),
@@ -3221,6 +3776,7 @@ pub fn catalog() -> Vec<Profile> {
     ] {
         profiles.push(cloudflare_mcp(slug, host, title, summary));
     }
+    profiles.extend(google_cloud_profiles());
 
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     profiles
@@ -3418,7 +3974,10 @@ mod tests {
     fn every_google_profile_delegates_through_a_variable_not_a_flag() {
         // A profile refuses every credential flag but `--secret`, so a note
         // telling the operator to pass `--subject` sent them to a refusal.
-        for profile in catalog().into_iter().filter(|p| p.vendor == "Google") {
+        for profile in catalog()
+            .into_iter()
+            .filter(|p| p.vendor == "Google" && !p.id.starts_with("google-cloud-"))
+        {
             assert!(
                 profile.vars.iter().any(|var| var.name == "subject"),
                 "`{}` has no `subject` variable",
@@ -3450,6 +4009,434 @@ mod tests {
         // Blank is no delegation, not a `sub` claim of "".
         assert_eq!(subject(""), None);
         assert_eq!(subject("  "), None);
+    }
+
+    fn cloud_profiles() -> Vec<Profile> {
+        let profiles: Vec<Profile> = catalog()
+            .into_iter()
+            .filter(|p| p.id.starts_with("google-cloud-"))
+            .collect();
+        assert_eq!(profiles.len(), 13, "a Cloud profile was added or lost");
+        profiles
+    }
+
+    /// A Cloud API is reached through a role binding on the project, so the
+    /// Workspace advice — share the property, or delegate to a person — is the
+    /// wrong note, and a `subject` is a lever that swaps the service account's
+    /// bindings for somebody else's. Refused where it is typed.
+    #[test]
+    fn a_cloud_profile_binds_through_iam_and_delegates_to_nobody() {
+        for profile in cloud_profiles() {
+            assert!(profile.vars.is_empty(), "`{}` takes a variable", profile.id);
+            let err = resolve_vars(&profile, &["subject=person@example.com".into()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("no variable `subject`"),
+                "{}: {err}",
+                profile.id
+            );
+            match build_auth(&profile.service, "op://P/GCP/key", &BTreeMap::new(), &[]).unwrap() {
+                AuthSpec::ServiceAccountJwt { subject, .. } => assert_eq!(subject, None),
+                other => panic!("`{}` enrolled as {other:?}", profile.id),
+            }
+
+            let note = profile.note.as_deref().unwrap_or_default();
+            assert!(
+                note.contains("roles/"),
+                "`{}` names no role: {note}",
+                profile.id
+            );
+            assert!(
+                !note.contains("domain-wide") && !note.contains("Search Console"),
+                "`{}` carries the Workspace note: {note}",
+                profile.id
+            );
+            // The recipe points gcloud at the token file the agent already
+            // has, rather than having it write a second copy.
+            assert!(
+                note.contains(&format!(
+                    "auth/access_token_file {}",
+                    crate::agent_token::DEFAULT_FILE_DISPLAY
+                )),
+                "`{}`: {note}",
+                profile.id
+            );
+        }
+    }
+
+    /// gcloud's property is not always the API's name, and some of its
+    /// clients carry the API path in the endpoint. Getting either wrong is a
+    /// gcloud that quietly keeps talking to Google directly, or a 404.
+    #[test]
+    fn each_cloud_note_names_the_override_gcloud_actually_reads() {
+        for (id, override_url) in [
+            (
+                "google-cloud-compute",
+                "api_endpoint_overrides/compute http://<proxy>/google-cloud-compute/compute/v1/`",
+            ),
+            (
+                "google-cloud-container",
+                "api_endpoint_overrides/container http://<proxy>/google-cloud-container/`",
+            ),
+            (
+                "google-cloud-sql",
+                "api_endpoint_overrides/sql http://<proxy>/google-cloud-sql/`",
+            ),
+            (
+                "google-cloud-redis",
+                "api_endpoint_overrides/redis http://<proxy>/google-cloud-redis/`",
+            ),
+            (
+                "google-cloud-monitoring",
+                "api_endpoint_overrides/monitoring http://<proxy>/google-cloud-monitoring/`",
+            ),
+            (
+                "google-cloud-resource-manager",
+                "api_endpoint_overrides/cloudresourcemanager \
+                 http://<proxy>/google-cloud-resource-manager/`",
+            ),
+            (
+                "google-cloud-iam",
+                "api_endpoint_overrides/iam http://<proxy>/google-cloud-iam/`",
+            ),
+            (
+                "google-cloud-dns",
+                "api_endpoint_overrides/dns http://<proxy>/google-cloud-dns/dns/v1/`",
+            ),
+            (
+                "google-cloud-pubsub",
+                "api_endpoint_overrides/pubsub http://<proxy>/google-cloud-pubsub/`",
+            ),
+            (
+                "google-cloud-secret-manager",
+                "api_endpoint_overrides/secretmanager \
+                 http://<proxy>/google-cloud-secret-manager/`",
+            ),
+            (
+                "google-cloud-artifact-registry",
+                "api_endpoint_overrides/artifactregistry \
+                 http://<proxy>/google-cloud-artifact-registry/`",
+            ),
+            (
+                "google-cloud-logging",
+                "api_endpoint_overrides/logging http://<proxy>/google-cloud-logging/`",
+            ),
+            (
+                "google-cloud-storage",
+                "api_endpoint_overrides/storage http://<proxy>/google-cloud-storage/storage/v1/`",
+            ),
+        ] {
+            let note = get(id).unwrap().note.unwrap();
+            assert!(note.contains(override_url), "`{id}`: {note}");
+        }
+        // gcloud derives the compute batch URL from the endpoint's host alone,
+        // which through the proxy is an address nothing is enrolled at.
+        let compute = get("google-cloud-compute").unwrap().note.unwrap();
+        assert!(
+            compute.contains("compute/disable_batch_request true"),
+            "{compute}"
+        );
+    }
+
+    /// The narrowest scope each API's discovery document accepts for its
+    /// reads, and a `write` level only where the API has a write scope of its
+    /// own — never one that mints `cloud-platform`.
+    #[test]
+    fn cloud_levels_ask_for_the_narrowest_scope_each_api_has() {
+        let auth = |name: &str| format!("https://www.googleapis.com/auth/{name}");
+        for (id, read, write) in [
+            ("google-cloud-compute", "compute.readonly", Some("compute")),
+            (
+                "google-cloud-container",
+                "container.read-only",
+                Some("container"),
+            ),
+            (
+                "google-cloud-sql",
+                "sqlservice.admin",
+                Some("sqlservice.admin"),
+            ),
+            (
+                "google-cloud-redis",
+                "redis.read-only",
+                Some("redis.read-write"),
+            ),
+            (
+                "google-cloud-monitoring",
+                "monitoring.read",
+                Some("monitoring"),
+            ),
+            (
+                "google-cloud-dns",
+                "ndev.clouddns.readonly",
+                Some("ndev.clouddns.readwrite"),
+            ),
+            ("google-cloud-pubsub", "pubsub", Some("pubsub")),
+            (
+                "google-cloud-resource-manager",
+                "cloud-platform.read-only",
+                None,
+            ),
+            (
+                "google-cloud-artifact-registry",
+                "cloud-platform.read-only",
+                None,
+            ),
+            ("google-cloud-iam", "cloud-platform", None),
+            ("google-cloud-secret-manager", "cloud-platform", None),
+            ("google-cloud-logging", "logging.read", None),
+            (
+                "google-cloud-storage",
+                "devstorage.read_only",
+                Some("devstorage.read_write"),
+            ),
+        ] {
+            let profile = get(id).unwrap();
+            assert_eq!(profile.default_access().name, "read", "{id}");
+            assert_eq!(profile.default_access().scopes, [auth(read)], "{id}");
+            let levels: Vec<&str> = profile.access.iter().map(|l| l.name.as_str()).collect();
+            match write {
+                Some(write) => {
+                    assert_eq!(levels, ["read", "write"], "{id}");
+                    assert_eq!(profile.find_access("write").unwrap().scopes, [auth(write)]);
+                }
+                None => assert_eq!(levels, ["read"], "{id}"),
+            }
+            // Where the only scopes are Google's catch-all ones, the note
+            // says the ACL and the role are all the narrowing there is.
+            let note = profile.note.as_deref().unwrap();
+            if read.starts_with("cloud-platform") {
+                assert!(note.contains("the role and this ACL"), "{id}: {note}");
+            }
+        }
+    }
+
+    /// How the proxy itself decides: first matching rule, `*` stopping at `/`.
+    fn acl_decide<'a>(level: &'a Access, method: &str, path: &str) -> Option<&'a str> {
+        level
+            .rules
+            .iter()
+            .find(|rule| {
+                let paths: Vec<_> = rule
+                    .paths
+                    .iter()
+                    .map(|pattern| crate::acl::path_glob(pattern).unwrap())
+                    .collect();
+                rule.methods.iter().any(|m| m == method || m == "*")
+                    && crate::acl::path_matches(&paths, path)
+            })
+            .map(|rule| rule.action.as_str())
+    }
+
+    /// `read` is GETs and the named POSTs that only report. Each API's
+    /// read-only scope is a backstop where one exists, but not everywhere —
+    /// Resource Manager takes `cloud-platform.read-only` for creating a lien,
+    /// and Secret Manager, IAM and Pub/Sub have no read-only scope at all.
+    #[test]
+    fn cloud_read_levels_allow_reports_and_nothing_that_changes_state() {
+        // Per profile: what `read` allows, what it refuses by name, and what
+        // it leaves to `acl_default` because no rule of its own covers it.
+        type Calls = &'static [&'static str];
+        let cases: &[(&str, Calls, Calls, Calls)] = &[
+            (
+                "google-cloud-compute",
+                &[
+                    "GET /compute/v1/projects/p/aggregated/instances",
+                    "GET /compute/v1/projects/p/regions/r/routers/nat/getNatMappingInfo",
+                    "POST /compute/v1/projects/p/global/backendServices/b/getHealth",
+                    "POST /compute/v1/projects/p/zones/z/instances/i/testIamPermissions",
+                    "POST /compute/v1/projects/p/zones/z/operations/o/wait",
+                ],
+                &[
+                    "POST /batch/compute/v1",
+                ],
+                &[
+                    "POST /compute/v1/projects/p/zones/z/instances",
+                    "POST /compute/v1/projects/p/zones/z/instances/i/stop",
+                    "DELETE /compute/v1/projects/p/zones/z/instances/i",
+                ],
+            ),
+            (
+                "google-cloud-container",
+                &[
+                    "GET /v1/projects/p/locations/l/clusters/c/nodePools",
+                ],
+                &[],
+                &[
+                    "POST /v1/projects/p/locations/l/clusters/c/nodePools",
+                ],
+            ),
+            (
+                "google-cloud-sql",
+                &[
+                    "GET /sql/v1beta4/projects/p/instances/db-replica",
+                    "GET /v1/projects/p/instances",
+                ],
+                &[],
+                &[
+                    "POST /sql/v1beta4/projects/p/instances/db/executeSql",
+                    "POST /v1/projects/p/instances/db:generateEphemeralCert",
+                ],
+            ),
+            (
+                "google-cloud-redis",
+                &[
+                    "GET /v1/projects/p/locations/l/instances",
+                    "GET /v1/projects/p/locations/l/instances/cache",
+                ],
+                &[
+                    "GET /v1/projects/p/locations/l/instances/cache/authString",
+                ],
+                &[
+                    "GET /v1/projects/p/locations/l/clusters",
+                ],
+            ),
+            (
+                "google-cloud-monitoring",
+                &[
+                    "POST /v3/projects/p/timeSeries:query",
+                    "POST /v1/projects/p/location/global/prometheus/api/v1/query_range",
+                    "GET /v3/projects/p/alertPolicies",
+                ],
+                &[],
+                &[
+                    "POST /v3/projects/p/alertPolicies",
+                    "POST /v3/projects/p/timeSeries",
+                ],
+            ),
+            (
+                "google-cloud-resource-manager",
+                &[
+                    "GET /v3/projects:search",
+                    "POST /v1/projects/p:getIamPolicy",
+                    "POST /v3/projects/p:getIamPolicy",
+                    "POST /v3/tagKeys/123:getIamPolicy",
+                    "POST /v1/projects/p:getEffectiveOrgPolicy",
+                ],
+                &[],
+                &[
+                    "POST /v3/projects/p:setIamPolicy",
+                    "POST /v1/liens",
+                    "POST /v3/liens",
+                    "DELETE /v3/liens/l",
+                ],
+            ),
+            (
+                "google-cloud-iam",
+                &[
+                    "GET /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys",
+                    "GET /v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies",
+                    "POST /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:getIamPolicy",
+                    "POST /v1/roles:queryGrantableRoles",
+                ],
+                &[
+                    "POST /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:signJwt",
+                    "POST /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:signBlob",
+                    "POST /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys",
+                    "POST /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys:upload",
+                ],
+                &[
+                    "POST /v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:setIamPolicy",
+                ],
+            ),
+            (
+                "google-cloud-dns",
+                &[
+                    "GET /dns/v1/projects/p/managedZones/z/rrsets",
+                    "POST /dns/v1/projects/p/managedZones/z:getIamPolicy",
+                ],
+                &[],
+                &[
+                    "POST /dns/v1/projects/p/managedZones/z/changes",
+                ],
+            ),
+            (
+                "google-cloud-pubsub",
+                &[
+                    "GET /v1/projects/p/subscriptions/s",
+                    "POST /v1/projects/p/topics/t:testIamPermissions",
+                ],
+                &[
+                    "POST /v1/projects/p/subscriptions/s:pull",
+                    "POST /v1/projects/p/subscriptions/s:acknowledge",
+                ],
+                &[
+                    "POST /v1/projects/p/topics/t:publish",
+                ],
+            ),
+            (
+                "google-cloud-artifact-registry",
+                &[
+                    "GET /v1/projects/p/locations/l/repositories/r/packages",
+                    "POST /v1/projects/p/locations/l/repositories/r:testIamPermissions",
+                ],
+                &[],
+                &[
+                    "POST /v1/projects/p/locations/l/repositories/r:prewarmArtifact",
+                ],
+            ),
+        ];
+        for (id, allowed, denied, unmatched) in cases {
+            let read = get(id).unwrap().default_access().clone();
+            for (calls, expected) in [
+                (allowed, Some("allow")),
+                (denied, Some("deny")),
+                (unmatched, None),
+            ] {
+                for call in calls.iter() {
+                    let (method, path) = call.split_once(' ').unwrap();
+                    assert_eq!(
+                        acl_decide(&read, method, path),
+                        expected,
+                        "`{id}` read: {call}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Secret Manager's `read` is metadata. The payload is `…/versions/<v>:access`,
+    /// a GET like every read beside it, so a GET-only level would hand it over;
+    /// it is refused by name, for global and regional secrets and for `latest`.
+    #[test]
+    fn secret_manager_read_refuses_the_payload() {
+        let read = get("google-cloud-secret-manager")
+            .unwrap()
+            .default_access()
+            .clone();
+        for path in [
+            "/v1/projects/p/secrets/db-password/versions/latest:access",
+            "/v1/projects/p/secrets/db-password/versions/3:access",
+            "/v1/projects/p/locations/europe-west1/secrets/db-password/versions/1:access",
+        ] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    acl_decide(&read, method, path),
+                    Some("deny"),
+                    "{method} {path}"
+                );
+            }
+        }
+        for path in [
+            "/v1/projects/p/secrets",
+            "/v1/projects/p/secrets/db-password",
+            "/v1/projects/p/secrets/db-password/versions",
+            "/v1/projects/p/secrets/db-password/versions/latest",
+            "/v1/projects/p/secrets/db-password:getIamPolicy",
+        ] {
+            assert_eq!(acl_decide(&read, "GET", path), Some("allow"), "{path}");
+        }
+        for path in [
+            "/v1/projects/p/secrets/db-password:addVersion",
+            "/v1/projects/p/secrets/db-password/versions/1:destroy",
+        ] {
+            assert_eq!(acl_decide(&read, "POST", path), None, "{path}");
+        }
+        assert_eq!(
+            read.rules[0].suffix, "payloads",
+            "the denial must come first"
+        );
     }
 
     #[test]
