@@ -212,7 +212,7 @@ from a shell is a form here, over the same functions with the same validation:
 
 `n` on the upstreams pane opens on the catalogue rather than on a blank form,
 and the catalogue is the whole screen: which service this is decides every field
-under it, and there are approaching sixty to choose from.
+under it, and there are over sixty to choose from.
 
 ```
 ┌ pick a profile ────────────────────────────────────────────────────────┐

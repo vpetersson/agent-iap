@@ -1417,6 +1417,147 @@ fn a_google_profile_takes_the_user_to_act_as_as_a_variable() {
     drop(dir);
 }
 
+// ---- Google Cloud ----------------------------------------------------------
+
+/// Secret Manager at `read` is the metadata a post-apply check wants — which
+/// secrets exist, which versions are enabled — and never a payload: the call
+/// that returns one is a GET like the rest, so it is refused by name before
+/// the rule that allows GETs, and never reaches Google.
+#[tokio::test]
+async fn secret_manager_read_lists_secrets_and_never_returns_a_payload() {
+    let upstream = spawn_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = service_account_key(dir.path(), &format!("http://{upstream}/token"));
+    let harness =
+        harness_from_profiles(&[("google-cloud-secret-manager", options(&key))], upstream).await;
+
+    for path in [
+        "/google-cloud-secret-manager/v1/projects/p/secrets",
+        "/google-cloud-secret-manager/v1/projects/p/secrets/db-password/versions",
+        "/google-cloud-secret-manager/v1/projects/p/secrets/db-password/versions/latest",
+    ] {
+        let (status, seen) = call(&harness, "GET", path).await;
+        assert_eq!(status, 200, "`GET {path}` is not readable at `read`");
+        assert_eq!(seen["authorization"], "Bearer ya29.minted-by-the-proxy");
+    }
+
+    for path in [
+        "/google-cloud-secret-manager/v1/projects/p/secrets/db-password/versions/latest:access",
+        "/google-cloud-secret-manager/v1/projects/p/secrets/db-password/versions/3:access",
+        "/google-cloud-secret-manager/v1/projects/p/locations/europe-west1/secrets/db-password/versions/1:access",
+    ] {
+        let (status, body) = call(&harness, "GET", path).await;
+        assert_eq!(status, 403, "`GET {path}` returned a payload at `read`");
+        refused_by(&body, "google-cloud-secret-manager-payloads");
+    }
+
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/google-cloud-secret-manager/v1/projects/p/secrets/db-password:addVersion",
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(body["path"].is_null(), "{body}");
+}
+
+/// The post-apply check from the issue — instances, health, the NAT router —
+/// through the path gcloud uses once its endpoint is overridden, and nothing
+/// that starts, stops or batches past the ACL.
+#[tokio::test]
+async fn compute_read_reports_on_the_project_and_changes_nothing() {
+    let upstream = spawn_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = service_account_key(dir.path(), &format!("http://{upstream}/token"));
+    let harness = harness_from_profiles(&[("google-cloud-compute", options(&key))], upstream).await;
+
+    for (method, path) in [
+        (
+            "GET",
+            "/google-cloud-compute/compute/v1/projects/p/aggregated/instances",
+        ),
+        (
+            "GET",
+            "/google-cloud-compute/compute/v1/projects/p/regions/r/routers/nat",
+        ),
+        (
+            "POST",
+            "/google-cloud-compute/compute/v1/projects/p/global/backendServices/b/getHealth",
+        ),
+    ] {
+        let (status, seen) = call(&harness, method, path).await;
+        assert_eq!(status, 200, "`{method} {path}` is not allowed at `read`");
+        assert_eq!(seen["authorization"], "Bearer ya29.minted-by-the-proxy");
+    }
+
+    let (status, body) = call(&harness, "POST", "/google-cloud-compute/batch/compute/v1").await;
+    assert_eq!(status, 403);
+    refused_by(&body, "google-cloud-compute-batch");
+
+    for (method, path) in [
+        (
+            "POST",
+            "/google-cloud-compute/compute/v1/projects/p/zones/z/instances/i/stop",
+        ),
+        (
+            "DELETE",
+            "/google-cloud-compute/compute/v1/projects/p/zones/z/instances/i",
+        ),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `read`");
+        assert!(body["path"].is_null(), "`{method} {path}` reached Google");
+    }
+}
+
+/// IAM has no scope narrower than `cloud-platform`, so the ACL is what keeps
+/// `read` from minting something that acts as a service account elsewhere.
+#[tokio::test]
+async fn iam_read_queries_policies_and_cannot_sign_or_mint_a_key() {
+    let upstream = spawn_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = service_account_key(dir.path(), &format!("http://{upstream}/token"));
+    let harness = harness_from_profiles(&[("google-cloud-iam", options(&key))], upstream).await;
+    let account = "/google-cloud-iam/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com";
+
+    for (method, path) in [
+        ("GET", "/google-cloud-iam/v1/roles?pageSize=1".to_string()),
+        ("GET", format!("{account}/keys")),
+        ("POST", format!("{account}:getIamPolicy")),
+    ] {
+        let (status, _) = call(&harness, method, &path).await;
+        assert_eq!(status, 200, "`{method} {path}` is not allowed at `read`");
+    }
+    for path in [
+        format!("{account}:signJwt"),
+        format!("{account}:signBlob"),
+        format!("{account}/keys"),
+    ] {
+        let (status, body) = call(&harness, "POST", &path).await;
+        assert_eq!(status, 403, "`POST {path}` was allowed at `read`");
+        refused_by(&body, "google-cloud-iam-mints");
+    }
+}
+
+/// A Cloud profile delegates to nobody: `--var subject=` is refused at
+/// enrolment instead of writing a token that acts as a Workspace user.
+#[test]
+fn a_cloud_profile_refuses_a_subject_where_it_is_typed() {
+    let (_dir, path) = minimal_policy();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let profile = profiles::get("google-cloud-container").unwrap();
+    let mut opts = options("op://Private/GCP/credential");
+    opts.vars = vec!["subject=person@example.com".into()];
+    let Err(err) = profiles::add(&path, &profile, &opts) else {
+        panic!("`--var subject=` was accepted by a Cloud profile");
+    };
+    assert!(
+        format!("{err:#}").contains("no variable `subject`"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
 /// `publish` is the CI path: upload an SBOM, file it into a release. The token
 /// reaches sbomify on the API's own prefix, and the calls a CI bot has no
 /// business making — minting itself a token, editing a product, deleting —
