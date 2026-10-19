@@ -9,7 +9,7 @@
 use agent_iap::config::Config;
 use agent_iap::state::AppState;
 use axum::extract::Request;
-use axum::routing::any;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -17,6 +17,13 @@ use std::sync::Arc;
 
 const AGENT_TOKEN: &str = "iap_agent_token";
 const UPSTREAM_KEY: &str = "sk-upstream-real";
+
+/// What the mock upstream serves as a download: the head of a gzip stream,
+/// whose second byte is not valid UTF-8 and so cannot survive being read as
+/// text.
+const GZIP_BYTES: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xfe, 0x80, 0x00,
+];
 
 /// A stand-in upstream that reports exactly what it was sent.
 async fn spawn_upstream() -> SocketAddr {
@@ -43,9 +50,18 @@ async fn spawn_upstream() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, Router::new().fallback(any(echo)))
-            .await
-            .unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/models/tarball",
+                get(|| async {
+                    (
+                        [(http::header::CONTENT_TYPE, "application/x-gzip")],
+                        GZIP_BYTES,
+                    )
+                }),
+            )
+            .fallback(any(echo));
+        axum::serve(listener, app).await.unwrap();
     });
     addr
 }
@@ -384,6 +400,57 @@ async fn an_upstreams_own_error_is_a_result_not_a_refusal() {
         .await;
     assert!(result.get("isError").is_none());
     assert_eq!(result["structuredContent"]["status"], 200);
+}
+
+#[tokio::test]
+async fn a_binary_download_arrives_byte_for_byte_as_base64() {
+    use base64::Engine;
+    let harness = spawn("").await;
+
+    let result = harness
+        .call(
+            "iap_request",
+            json!({ "upstream": "echo", "path": "/v1/models/tarball" }),
+        )
+        .await;
+    assert!(result.get("isError").is_none(), "{result}");
+    let structured = &result["structuredContent"];
+    assert!(structured.get("body").is_none(), "{structured}");
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(structured["body_base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, GZIP_BYTES);
+}
+
+#[tokio::test]
+async fn base64_can_be_asked_for_and_an_unknown_encoding_is_refused() {
+    use base64::Engine;
+    let harness = spawn("").await;
+
+    let result = harness
+        .call(
+            "iap_request",
+            json!({ "upstream": "echo", "path": "/v1/models", "response_encoding": "base64" }),
+        )
+        .await;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(result["structuredContent"]["body_base64"].as_str().unwrap())
+        .unwrap();
+    let echoed: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(echoed["path"], "/v1/models");
+
+    let result = harness
+        .call(
+            "iap_request",
+            json!({ "upstream": "echo", "path": "/v1/models", "response_encoding": "hex" }),
+        )
+        .await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("response_encoding"));
 }
 
 #[tokio::test]
