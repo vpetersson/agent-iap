@@ -66,7 +66,7 @@ stripe  https://api.stripe.com  bearer  op://Private/Stripe/key    none
 `RULES` counts the rules that could ever reach that target as this agent, so
 `none` is the interesting value: `stripe` is in the agent's `targets`, which
 reads like a grant, but no rule names it — every call falls through to the
-default and is denied.
+default: denied under `deny`, held for approval under `ask`.
 
 `--output json` gives the same inventory to something other than a human. All of
 it reads only the policy file: no running daemon, no call to 1Password, and
@@ -297,8 +297,9 @@ same way.
 
 Nothing here discloses more than the agent could learn by making one refused
 call. The document is built per agent, so an agent granted a target no rule
-names is told it can reach nothing. Credential *schemes* are named; credentials
-are not. Without a token the root says what this is and how to authenticate, and
+names is told it can reach nothing when the default is `deny`, and that calls to
+it stop for approval when the default is `ask`. Credential *schemes* are named;
+credentials are not. Without a token the root says what this is and how to authenticate, and
 nothing about the policy.
 
 Reading it is an audit event. An anonymous read is not: it names no agent, no

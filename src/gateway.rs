@@ -208,8 +208,13 @@ fn initialize(state: &AppState, caller: &Caller) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
-            // Neither list changes while the process runs — the policy file is
-            // read once at startup — so there is no `listChanged` to promise.
+            // What an agent may reach does change while the process runs — a
+            // reload swaps the policy under a live session — but this transport
+            // has no channel to say so: there is no server-to-client stream and
+            // no session to address one to. So no `listChanged` is promised.
+            // Instead nothing served once and cached by a client claims to be
+            // final: the instructions and `iap_request`'s description both
+            // defer to `iap_catalog`, which is computed on every call.
             "tools": {},
             "resources": {},
         },
@@ -223,18 +228,30 @@ fn initialize(state: &AppState, caller: &Caller) -> Value {
 }
 
 fn tools_list(state: &AppState, caller: &Caller) -> Value {
-    let reachable: Vec<String> = skills::catalog(state, caller.agent())
+    let reachable: Vec<String> = skills::reachable_upstreams(state, caller.agent())
         .into_iter()
-        .filter_map(|skill| skill.name.strip_prefix("upstream/").map(str::to_string))
+        .map(|reachable| match reachable.access.note() {
+            Some(note) => format!("{} ({note})", reachable.upstream.name),
+            None => reachable.upstream.name,
+        })
         .collect();
 
     // Naming them in the description rather than as an `enum`: a model that
     // guesses a name it was not given gets the proxy's refusal, which explains
     // itself, instead of a client-side schema rejection, which does not.
+    //
+    // Never "nothing is reachable", though. A client may keep this description
+    // for the whole session, and the policy can be reloaded under it — a
+    // cached absolute would outlive the grant that made it false. `iap_catalog`
+    // is computed per call, so that is where the description sends the agent.
     let upstreams = if reachable.is_empty() {
-        "no upstream is reachable by this agent".to_string()
+        "named by `iap_catalog`, which has the current list — call it first".to_string()
     } else {
-        format!("one of: {}", reachable.join(", "))
+        format!(
+            "one of: {} — or call `iap_catalog` for the current list, which can \
+             change while you run",
+            reachable.join(", ")
+        )
     };
 
     json!({ "tools": [
@@ -410,32 +427,38 @@ fn catalog_result(state: &AppState, caller: &Caller) -> Value {
     let mut entries = Vec::new();
     let mut text = String::new();
 
-    for skill in skills::catalog(state, agent) {
-        let Some(name) = skill.name.strip_prefix("upstream/") else {
-            continue;
-        };
-        let Some(upstream) = state.config().upstream(name).cloned() else {
-            continue;
-        };
+    for reachable in skills::reachable_upstreams(state, agent) {
+        let upstream = reachable.upstream;
+        let name = &upstream.name;
+        let skill = format!("upstream/{name}");
+        let note = reachable
+            .access
+            .note()
+            .map(|note| format!("; {note}"))
+            .unwrap_or_default();
         text.push_str(&format!(
-            "- `{}` — {} (credential: {}; skill: `{}`)\n",
+            "- `{}` — {} (credential: {}; skill: `{}`{note})\n",
             name,
             upstream.base_url,
             upstream.auth.describe(),
-            skill.name,
+            skill,
         ));
         entries.push(json!({
             "name": name,
             "base_url": upstream.base_url,
             "auth": upstream.auth.describe(),
-            "skill": skill.name,
+            "skill": skill,
+            // `rules` when the ACL names this upstream for this agent, else the
+            // default every call falls through to: `ask` or `allow`. A `deny`
+            // default with no rule is not listed at all.
+            "access": reachable.access.as_str(),
         }));
     }
 
     if entries.is_empty() {
         text = "This agent may not reach any upstream through this proxy. Either it \
-                has no `targets` grant, or no ACL rule names the upstreams it has. An \
-                operator has to change the policy file."
+                has no `targets` grant, or the upstreams it has are named by no ACL \
+                rule and the default denies. An operator has to change the policy file."
             .to_string();
     } else {
         text = format!(
