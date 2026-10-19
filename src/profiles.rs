@@ -1581,6 +1581,156 @@ fn asana_mcp_access() -> Vec<Access> {
     ]
 }
 
+/// Where the paths of sbomify's two API versions differ.
+///
+/// v2 is v1's views remounted under the product's own nouns — `/artifacts`
+/// where v1 says `/sboms`, the `/artifact/` and `/sbom/` segments folded away —
+/// so the levels are one decision and only the spellings change. Everything not
+/// named here is the same path in both.
+struct SbomifyPaths {
+    /// POSTs that answer a question and store nothing.
+    read_posts: &'static [&'static str],
+    /// Uploading an artifact and the evidence attached to one.
+    uploads: &'static [&'static str],
+    /// Putting an artifact into a release, and cutting the release.
+    releases: &'static [&'static str],
+    /// Refused at every level, with the reason at the call site.
+    denied: &'static [&'static str],
+}
+
+const SBOMIFY_V2: SbomifyPaths = SbomifyPaths {
+    read_posts: &[
+        "/licensing/license-expressions/validate",
+        "/vulnerability-scanning/components/*/vex-preview",
+        "/artifacts/cyclonedx/*/*/metadata",
+    ],
+    uploads: &[
+        "/artifacts/cyclonedx/*",
+        "/artifacts/spdx/*",
+        "/artifacts/vex/*",
+        "/artifacts/*/provenance",
+        "/artifacts/*/signature",
+        "/documents/",
+    ],
+    releases: &[
+        "/artifacts/*/releases",
+        "/releases",
+        "/releases/*/artifacts",
+    ],
+    denied: &["/auth/oidc/github/exchange", "/user/**"],
+};
+
+const SBOMIFY_V1: SbomifyPaths = SbomifyPaths {
+    read_posts: &[
+        "/licensing/license-expressions/validate",
+        "/vulnerability-scanning/components/*/vex-preview",
+        "/sboms/artifact/cyclonedx/*/*/metadata",
+    ],
+    uploads: &[
+        "/sboms/artifact/cyclonedx/*",
+        "/sboms/artifact/spdx/*",
+        "/sboms/artifact/vex/*",
+        "/sboms/sbom/*/provenance",
+        "/sboms/sbom/*/signature",
+        "/documents/",
+    ],
+    releases: &["/sboms/*/releases", "/releases", "/releases/*/artifacts"],
+    // v1 alone mounts `/internal`: unauthenticated, and kept off the internet
+    // by sbomify's own edge rather than by anything a token decides. v2 does
+    // not replay it, which is why only this list names it.
+    denied: &["/auth/oidc/github/exchange", "/user/**", "/internal/**"],
+};
+
+/// What `read`, `triage`, `publish` and `write` mean for the sbomify API.
+///
+/// The middle two follow sbomify's own roles rather than HTTP verbs: `triage`
+/// is the operator — every read plus recording a decision about a
+/// vulnerability — and `publish` is the CI bot, which uploads artifacts and
+/// files them into releases. Neither touches products, components, workspace
+/// settings, members or billing; those prompt, and DELETE is refused.
+fn sbomify_access(paths: &SbomifyPaths) -> Vec<Access> {
+    const TRIAGE: &[&str] = &[
+        "/vulnerability-scanning/components/*/triage",
+        "/vulnerability-scanning/triage/bulk",
+    ];
+    // Both spellings: sbomify answers the slashless one with a 301, and a rule
+    // that held back only the documented path would be one redirect wide.
+    const BILLING: &[&str] = &["/billing/change-plan", "/billing/change-plan/"];
+    // A GitHub binding is a standing, non-expiring publish grant to a
+    // repository outside this proxy — sbomify keeps creating one for admins.
+    const BINDINGS: &[&str] = &[
+        "/auth/oidc/github/bindings",
+        "/auth/oidc/github/bindings/**",
+    ];
+
+    // The OIDC exchange trades a GitHub Actions token for a fresh sbomify
+    // token and hands it to the caller: through this proxy, a credential
+    // returned to the agent. `/user/**` is the token owner's account — a GDPR
+    // export and account deletion. sbomify answers both as session-only today,
+    // so a PAT gets a 401; the rule is for the day that changes.
+    let denied = || rule("denied", &["*"], paths.denied, "deny");
+    let reads = || {
+        vec![
+            denied(),
+            rule("reads", &["GET"], &["/**"], "allow"),
+            rule("read-posts", &["POST"], paths.read_posts, "allow"),
+        ]
+    };
+    let rest = || {
+        vec![
+            rule("deletes", &["DELETE"], &["/**"], "deny"),
+            rule("writes", &["*"], &["/**"], "ask"),
+        ]
+    };
+
+    vec![
+        access(
+            "read",
+            "GET across the whole API, plus the POSTs that only validate or preview",
+            &[],
+            reads(),
+        ),
+        access(
+            "triage",
+            "reads, plus recording triage decisions on vulnerabilities; DELETE denied, \
+             anything else prompts",
+            &[],
+            [
+                reads(),
+                vec![rule("triage", &["POST"], TRIAGE, "allow")],
+                rest(),
+            ]
+            .concat(),
+        ),
+        access(
+            "publish",
+            "reads, plus uploading artifacts and filing them into releases; DELETE \
+             denied, anything else prompts",
+            &[],
+            [
+                reads(),
+                vec![
+                    rule("uploads", &["POST"], paths.uploads, "allow"),
+                    rule("releases", &["POST"], paths.releases, "allow"),
+                ],
+                rest(),
+            ]
+            .concat(),
+        ),
+        access(
+            "write",
+            "every method, except changing plan or binding a repository, which prompt",
+            &[],
+            vec![
+                denied(),
+                rule("billing", &["*"], BILLING, "ask"),
+                rule("oidc-bindings", &["POST"], BINDINGS, "ask"),
+                rule("all", &["*"], &["/**"], "allow"),
+            ],
+        ),
+    ]
+}
+
 pub fn catalog() -> Vec<Profile> {
     let mut profiles = vec![
         // ---------------- Google ----------------
@@ -2801,6 +2951,88 @@ pub fn catalog() -> Vec<Profile> {
                     .into(),
             ),
             probe: None,
+        },
+        // ---------------- sbomify ----------------
+        Profile {
+            id: "sbomify".into(),
+            title: "sbomify API (v2)".into(),
+            vendor: "sbomify".into(),
+            summary: "SBOMs and other artifacts, products, components, releases, \
+                      vulnerabilities and compliance."
+                .into(),
+            default_name: "sbomify".into(),
+            credential: Credential {
+                about: "a personal access token — optionally pinned to one workspace and \
+                        narrowed to a list of actions when you create it"
+                    .into(),
+                url: "https://app.sbomify.com/workspaces/settings/#tokens".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://app.sbomify.com/api/v2".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: sbomify_access(&SBOMIFY_V2),
+            note: Some(
+                "A token acts as its owner, so their role in each workspace still applies \
+                 underneath this ACL: `publish` at an `operator` is a 403 from sbomify. \
+                 Narrow it there too — a token can be pinned to one workspace and given an \
+                 action list, and that holds wherever the ACL is wide. Not reachable \
+                 through a token at all: `POST /artifacts/upload-file/…` and `/user/**` \
+                 are session-only, and the CI upload paths are \
+                 `/artifacts/cyclonedx/<component>` and `/artifacts/spdx/<component>`. \
+                 `POST /auth/oidc/github/exchange` is denied at every level, because it \
+                 answers with a new sbomify token and through this proxy that token goes \
+                 to the agent. What the ACL cannot see: publishing a product or component \
+                 to the Trust Center is a field in an ordinary `PATCH`, the same call that \
+                 renames it, so `triage` and `publish` prompt for both. A path without its \
+                 trailing slash gets a 301 rather than an answer — `/workspaces/`, not \
+                 `/workspaces`. A self-hosted install is the same API at your own host: \
+                 enrol with `--dry-run` and change `base_url`. v1 is a separate profile, \
+                 `sbomify-v1`."
+                    .into(),
+            ),
+            // Every plan, every role, and a 401 for a garbage token — unlike the
+            // public routes (`/products/<id>`, `/releases`), which answer an
+            // anonymous caller and would pass a token sbomify never issued.
+            probe: Some("/workspaces/".into()),
+        },
+        Profile {
+            id: "sbomify-v1".into(),
+            title: "sbomify API (v1, deprecated)".into(),
+            vendor: "sbomify".into(),
+            summary: "The original surface, `/sboms` and `team_key` — for clients that \
+                      have not moved to v2."
+                .into(),
+            default_name: "sbomify-v1".into(),
+            credential: Credential {
+                about: "a personal access token — the same kind v2 takes, and the same one \
+                        works on both"
+                    .into(),
+                url: "https://app.sbomify.com/workspaces/settings/#tokens".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://app.sbomify.com/api/v1".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: sbomify_access(&SBOMIFY_V1),
+            note: Some(
+                "v1 has been deprecated since 26 August 2026: every response carries \
+                 `Deprecation` and a `Link` to v2. No sunset date is set, so it still \
+                 answers, but new work belongs on `sbomify`. The two are the same views \
+                 under different names — `/sboms` for `/artifacts`, \
+                 `/sboms/artifact/cyclonedx/<component>` for `/artifacts/cyclonedx/…`, \
+                 `/sboms/sbom/<id>` for `/artifacts/<id>`, and `team_key` where v2 says \
+                 `workspace_key` — so the levels mean the same on both. What v2 dropped and \
+                 v1 still mounts is `/internal`, which this profile denies at every level. \
+                 Everything else in the `sbomify` note holds here: the token owner's role \
+                 applies underneath, `/sboms/upload-file/…` and `/user/**` are \
+                 session-only, the OIDC exchange is denied because it answers with a \
+                 token, and Trust Center visibility rides on an ordinary `PATCH`."
+                    .into(),
+            ),
+            probe: Some("/workspaces/".into()),
         },
         // ---------------- Common neighbours ----------------
         Profile {
@@ -4249,6 +4481,212 @@ mod tests {
                 .collect();
             assert_eq!(names, ["read", "triage", "write"], "`{id}`");
         }
+    }
+
+    /// The first rule that matches, matched the way the proxy matches it —
+    /// `*` stopping at `/` — because sbomify's rules lean on that: an upload
+    /// is `/artifacts/cyclonedx/*`, and its metadata enrichment one segment
+    /// deeper is a different rule.
+    fn sbomify_decides(id: &str, level: &str, method: &str, path: &str) -> Option<String> {
+        let profile = get(id).unwrap();
+        let level = profile.find_access(level).unwrap();
+        level
+            .rules
+            .iter()
+            .find(|rule| {
+                let patterns: Vec<_> = rule
+                    .paths
+                    .iter()
+                    .map(|pattern| crate::acl::path_glob(pattern).unwrap())
+                    .collect();
+                rule.methods.iter().any(|m| m == method || m == "*")
+                    && crate::acl::path_matches(&patterns, path)
+            })
+            .map(|rule| rule.action.clone())
+    }
+
+    #[test]
+    fn both_sbomify_versions_authenticate_a_bearer_token_and_probe_the_workspace_list() {
+        for (id, base_url) in [
+            ("sbomify", "https://app.sbomify.com/api/v2"),
+            ("sbomify-v1", "https://app.sbomify.com/api/v1"),
+        ] {
+            let profile = get(id).unwrap();
+            match build_auth(
+                &profile.service,
+                "op://Private/sbomify/pat",
+                &BTreeMap::new(),
+                &[],
+            )
+            .unwrap()
+            {
+                AuthSpec::Bearer { secret } => assert_eq!(secret, "op://Private/sbomify/pat"),
+                other => panic!("`{id}` authenticates a bearer token, got {other:?}"),
+            }
+            assert_eq!(profile.endpoint(), base_url, "`{id}`");
+            // A garbage token gets a 401 here. Much of the API answers an
+            // anonymous caller, so a public route would pass any token at all.
+            assert_eq!(profile.probe.as_deref(), Some("/workspaces/"), "`{id}`");
+            assert_eq!(
+                probe_for(base_url).as_deref(),
+                Some("/workspaces/"),
+                "`{id}`"
+            );
+            let names: Vec<_> = profile.access.iter().map(|l| l.name.clone()).collect();
+            assert_eq!(names, ["read", "triage", "publish", "write"], "`{id}`");
+        }
+    }
+
+    /// The OIDC exchange answers with a fresh sbomify token, which through this
+    /// proxy is a credential handed to the agent — `write` included.
+    #[test]
+    fn no_sbomify_level_lets_an_agent_mint_itself_a_token() {
+        for id in ["sbomify", "sbomify-v1"] {
+            for level in ["read", "triage", "publish", "write"] {
+                for path in ["/auth/oidc/github/exchange", "/user/delete", "/user/export"] {
+                    for method in ["GET", "POST"] {
+                        assert_eq!(
+                            sbomify_decides(id, level, method, path).as_deref(),
+                            Some("deny"),
+                            "`{id} --access {level}` lets `{method} {path}` through"
+                        );
+                    }
+                }
+            }
+        }
+        // v1 alone mounts `/internal`, unauthenticated.
+        assert_eq!(
+            sbomify_decides("sbomify-v1", "write", "GET", "/internal/domains").as_deref(),
+            Some("deny")
+        );
+    }
+
+    #[test]
+    fn the_sbomify_read_level_reads_and_writes_nothing() {
+        let read = |method, path| sbomify_decides("sbomify", "read", method, path);
+        assert_eq!(read("GET", "/workspaces/").as_deref(), Some("allow"));
+        assert_eq!(
+            read("GET", "/artifacts/abc123/download").as_deref(),
+            Some("allow")
+        );
+        // POSTs that store nothing.
+        assert_eq!(
+            read("POST", "/licensing/license-expressions/validate").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            read("POST", "/artifacts/cyclonedx/1.6/abc123/metadata").as_deref(),
+            Some("allow")
+        );
+        // Everything else falls through to `acl_default` — no rule allows it.
+        for (method, path) in [
+            ("POST", "/artifacts/cyclonedx/abc123"),
+            ("POST", "/releases"),
+            ("PATCH", "/products/abc123"),
+            ("DELETE", "/artifacts/abc123"),
+        ] {
+            assert_eq!(read(method, path), None, "`{method} {path}` at `read`");
+        }
+    }
+
+    /// `publish` is sbomify's CI bot and `triage` its operator: each gets the
+    /// writes that role exists for, and neither reaches the other's, a
+    /// product, a workspace or a DELETE.
+    #[test]
+    fn sbomify_triage_and_publish_write_what_their_role_writes_and_nothing_else() {
+        for (id, upload, metadata, attach) in [
+            (
+                "sbomify",
+                "/artifacts/cyclonedx/abc123",
+                "/artifacts/cyclonedx/1.6/abc123/metadata",
+                "/artifacts/abc123/releases",
+            ),
+            (
+                "sbomify-v1",
+                "/sboms/artifact/cyclonedx/abc123",
+                "/sboms/artifact/cyclonedx/1.6/abc123/metadata",
+                "/sboms/abc123/releases",
+            ),
+        ] {
+            let at = |level, method, path| sbomify_decides(id, level, method, path);
+            let triage = "/vulnerability-scanning/components/abc123/triage";
+
+            assert_eq!(
+                at("publish", "POST", upload).as_deref(),
+                Some("allow"),
+                "`{id}`"
+            );
+            assert_eq!(
+                at("publish", "POST", attach).as_deref(),
+                Some("allow"),
+                "`{id}`"
+            );
+            assert_eq!(at("publish", "POST", "/releases").as_deref(), Some("allow"));
+            // One segment deeper is the read-shaped enrichment, not an upload.
+            assert_eq!(
+                at("read", "POST", metadata).as_deref(),
+                Some("allow"),
+                "`{id}`"
+            );
+            assert_eq!(
+                at("publish", "POST", triage).as_deref(),
+                Some("ask"),
+                "`{id}`"
+            );
+
+            assert_eq!(
+                at("triage", "POST", triage).as_deref(),
+                Some("allow"),
+                "`{id}`"
+            );
+            assert_eq!(
+                at("triage", "POST", upload).as_deref(),
+                Some("ask"),
+                "`{id}`"
+            );
+
+            for level in ["triage", "publish"] {
+                // Trust Center visibility is a field in this PATCH.
+                assert_eq!(
+                    at(level, "PATCH", "/products/abc123").as_deref(),
+                    Some("ask")
+                );
+                assert_eq!(
+                    at(level, "POST", "/workspaces/k3y/invitations").as_deref(),
+                    Some("ask")
+                );
+                assert_eq!(at(level, "DELETE", "/releases/r1").as_deref(), Some("deny"));
+            }
+        }
+    }
+
+    /// `write` is every method, with the two calls whose cost outlives the
+    /// agent still asking: a plan change bills, and a GitHub binding is a
+    /// standing publish grant to a repository this proxy never sees.
+    #[test]
+    fn sbomify_write_still_asks_before_billing_or_binding_a_repository() {
+        let write = |method, path| sbomify_decides("sbomify", "write", method, path);
+        assert_eq!(
+            write("DELETE", "/artifacts/abc123").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(write("PATCH", "/products/abc123").as_deref(), Some("allow"));
+        assert_eq!(
+            write("POST", "/billing/change-plan/").as_deref(),
+            Some("ask")
+        );
+        assert_eq!(
+            write("POST", "/billing/change-plan").as_deref(),
+            Some("ask")
+        );
+        assert_eq!(
+            write("POST", "/auth/oidc/github/bindings").as_deref(),
+            Some("ask")
+        );
+        assert_eq!(
+            write("GET", "/auth/oidc/github/bindings").as_deref(),
+            Some("allow")
+        );
     }
 
     #[test]
