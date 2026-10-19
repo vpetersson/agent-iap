@@ -254,11 +254,30 @@ pub fn probe_for(base_url: &str) -> Option<String> {
         let Service::Http { base_url, .. } = &profile.service else {
             return None;
         };
+        if host_is_a_var(base_url) {
+            return None;
+        }
         if !is_the_same_service(base_url.trim_end_matches('/'), wanted) {
             return None;
         }
         profile.probe.filter(|probe| !probe.contains('{'))
     })
+}
+
+/// Whether a base URL template leaves the whole host to the caller —
+/// `{scheme}://{host}/api/v2`.
+///
+/// Such a template matches every host there is, so as a fallback it would
+/// claim any upstream whose path happens to end the same way — an unrelated
+/// API at `/api/v2` verified against sbomify's `/workspaces/`, and reported
+/// broken for answering 404. Upstreams enrolled from one of these profiles
+/// carry the `verify_path` the enrolment wrote and never need the fallback.
+fn host_is_a_var(template: &str) -> bool {
+    let Some((_, rest)) = template.split_once("://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    host.starts_with('{') && host.ends_with('}') && host.matches('{').count() == 1
 }
 
 /// Whether an enrolled base URL is the one this profile writes.
@@ -2321,6 +2340,61 @@ fn sbomify_access(paths: &SbomifyPaths) -> Vec<Access> {
     ]
 }
 
+/// A hosted sbomify profile pointed at a host the caller names — a staging
+/// deployment or an install of their own.
+///
+/// Same paths, same levels and same probe: the deployment decides the host,
+/// not the API, and a level that meant something different on staging would
+/// be one nobody could test against before production.
+fn sbomify_self_hosted(hosted: Profile, id: &str) -> Profile {
+    let Service::Http { base_url, auth } = hosted.service else {
+        unreachable!("the hosted sbomify profiles are HTTP");
+    };
+    let path = base_url
+        .strip_prefix("https://app.sbomify.com")
+        .expect("the hosted sbomify profiles front app.sbomify.com");
+    Profile {
+        id: id.into(),
+        title: hosted
+            .title
+            .replacen("sbomify API", "sbomify API, self-hosted", 1),
+        summary: format!("{} On staging or an install of your own.", hosted.summary),
+        credential: Credential {
+            about: "a personal access token from *that* install, under workspace settings → \
+                    Tokens — an app.sbomify.com token is not valid anywhere else"
+                .into(),
+            url: "https://github.com/sbomify/sbomify/blob/master/docs/deployment.md".into(),
+        },
+        vars: vec![
+            v(
+                "host",
+                "your sbomify host, e.g. `sbomify.example.com` or a staging host — no \
+                 scheme, no `/api/…`; a port goes here too (`localhost:8000`)",
+                None,
+            ),
+            v(
+                "scheme",
+                "`https`, or `http` for an install that terminates TLS nowhere — the \
+                 token crosses that wire in a header",
+                Some("https"),
+            ),
+        ],
+        service: Service::Http {
+            base_url: format!("{{scheme}}://{{host}}{path}"),
+            auth,
+        },
+        note: hosted.note.map(|note| {
+            format!(
+                "The same API and the same rules as `{}`, at the host you name. What \
+                 answers is that install's release, not app.sbomify.com's: an endpoint \
+                 it predates is a 404 rather than a denial. {note}",
+                hosted.id
+            )
+        }),
+        ..hosted
+    }
+}
+
 pub fn catalog() -> Vec<Profile> {
     let mut profiles = vec![
         // ---------------- Google ----------------
@@ -3542,9 +3616,8 @@ pub fn catalog() -> Vec<Profile> {
                  to the Trust Center is a field in an ordinary `PATCH`, the same call that \
                  renames it, so `triage` and `publish` prompt for both. A path without its \
                  trailing slash gets a 301 rather than an answer — `/workspaces/`, not \
-                 `/workspaces`. A self-hosted install is the same API at your own host: \
-                 enrol with `--dry-run` and change `base_url`. v1 is a separate profile, \
-                 `sbomify-v1`."
+                 `/workspaces`. Staging or an install of your own is \
+                 `sbomify-self-hosted`. v1 is a separate profile, `sbomify-v1`."
                     .into(),
             ),
             // Every plan, every role, and a 401 for a garbage token — unlike the
@@ -4009,6 +4082,18 @@ pub fn catalog() -> Vec<Profile> {
         profiles.push(cloudflare_mcp(slug, host, title, summary));
     }
     profiles.extend(google_cloud_profiles());
+    // Staging, or an install of your own, is the same API at another host.
+    for (hosted, id) in [
+        ("sbomify", "sbomify-self-hosted"),
+        ("sbomify-v1", "sbomify-v1-self-hosted"),
+    ] {
+        let hosted = profiles
+            .iter()
+            .find(|profile| profile.id == hosted)
+            .expect("the hosted sbomify profiles are in the catalog")
+            .clone();
+        profiles.push(sbomify_self_hosted(hosted, id));
+    }
 
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     profiles
@@ -5674,6 +5759,40 @@ mod tests {
             write("GET", "/auth/oidc/github/bindings").as_deref(),
             Some("allow")
         );
+    }
+
+    /// The self-hosted profiles are the hosted ones with the host left to the
+    /// caller — and because that host could be anything, they never claim an
+    /// upstream by URL, or every `/api/v2` API would be probed at `/workspaces/`.
+    #[test]
+    fn self_hosted_sbomify_is_the_hosted_api_and_claims_no_other_upstream() {
+        for (hosted, id, path) in [
+            ("sbomify", "sbomify-self-hosted", "/api/v2"),
+            ("sbomify-v1", "sbomify-v1-self-hosted", "/api/v1"),
+        ] {
+            let hosted = get(hosted).unwrap();
+            let profile = get(id).unwrap();
+            assert_eq!(profile.endpoint(), format!("{{scheme}}://{{host}}{path}"));
+            assert_eq!(profile.probe, hosted.probe, "`{id}`");
+            assert_eq!(profile.default_name, hosted.default_name, "`{id}`");
+            let levels = |p: &Profile| {
+                p.access
+                    .iter()
+                    .map(|l| (l.name.clone(), format!("{:?}", l.rules)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(levels(&profile), levels(&hosted), "`{id}`");
+            assert!(resolve_vars(&profile, &[]).is_err(), "`{id}` needs a host");
+        }
+        assert_eq!(probe_for("https://api.example.com/api/v2"), None);
+        assert_eq!(probe_for("https://sbomify.example.com/api/v1"), None);
+        assert_eq!(
+            probe_for("https://app.sbomify.com/api/v2").as_deref(),
+            Some("/workspaces/")
+        );
+        assert!(host_is_a_var("{scheme}://{host}/api/v2"));
+        assert!(!host_is_a_var("https://{region}.posthog.com"));
+        assert!(!host_is_a_var("https://app.sbomify.com/api/v2"));
     }
 
     #[test]
