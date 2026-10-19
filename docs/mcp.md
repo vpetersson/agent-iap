@@ -40,7 +40,7 @@ Three tools, and no new policy to write — `iap_request` is decided by the same
 | Tool | What it does |
 | --- | --- |
 | `iap_request` | One HTTP call against a configured upstream. The proxy attaches the credential. |
-| `iap_catalog` | The upstreams this agent may reach, with base URL and credential scheme. |
+| `iap_catalog` | The upstreams this agent may reach, with base URL, credential scheme and how calls are decided. |
 | `iap_skill` | One generated skill document. |
 
 ```jsonc
@@ -80,7 +80,22 @@ daemon are told two different things:
 - `upstream/<name>` — base URL, the credential *scheme* the proxy attaches, and
   the rules that apply to this agent in match order.
 
-They are readable both as MCP resources (`skill://agent-iap/…`) and through
+An upstream is listed when the agent's `targets` grant covers it and a call to
+it could succeed: either a rule names it for this agent, or none does and
+`[acl_default]` is `ask` or `allow`. Each `iap_catalog` entry says which, in
+`access` — `rules`, `ask` or `allow` — and an upstream reached through an `ask`
+default is marked *calls stop for approval* in the instructions, the
+`iap_request` description and its skill. Under a `deny` default an upstream no
+rule names is left out, since every call to it would be refused.
+
+`iap_catalog` is computed on every call, so it follows a policy reload at once.
+The `instructions` and the `iap_request` description are read when the client
+connects and may be cached for the session; the gateway has no server-to-client
+stream to send `notifications/tools/list_changed` on, so neither promises to be
+current — both name what was reachable at the time and send the agent to
+`iap_catalog` for the live list.
+
+The skill documents are readable both as MCP resources (`skill://agent-iap/…`) and through
 `iap_skill`, for clients that only do tools. A skill names the scheme —
 `header x-api-key` — because that is how an agent stops trying to set the header
 itself. The secret behind it stays in the daemon.

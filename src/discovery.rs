@@ -505,15 +505,16 @@ fn reachable_section(state: &AppState, caller: &Caller, base: &str) -> String {
 
     if upstreams.is_empty() {
         text.push_str(
-            "Nothing, today. No API in this policy is both granted to this agent \
-             and named by a rule that could allow a call, so every request would \
-             be refused. That is a policy question, not something to work around: \
+            "Nothing, today. No API in this policy is granted to this agent with \
+             a rule or a default that could let a call through, so every request \
+             would be refused. That is a policy question, not something to work around: \
              say so to whoever asked you to do this, and name this proxy.\n\n",
         );
         return text;
     }
 
-    for upstream in &upstreams {
+    for reachable in &upstreams {
+        let upstream = &reachable.upstream;
         text.push_str(&format!(
             "### `{name}`\n\n\
              - proxied at `{base}/{name}/<path>`\n\
@@ -630,13 +631,15 @@ pub fn describe(state: &AppState, caller: &Caller, base: &str) -> Value {
 
     let upstreams: Vec<Value> = skills::reachable_upstreams(state, agent)
         .iter()
-        .map(|upstream: &UpstreamConfig| {
+        .map(|reachable| {
+            let upstream: &UpstreamConfig = &reachable.upstream;
             json!({
                 "name": upstream.name,
                 "url": format!("{base}/{}", upstream.name),
                 "api_base_url": upstream.base_url,
                 "auth": upstream.auth.describe(),
                 "skill": format!("{base}{SKILL_MOUNT}/upstream/{}", upstream.name),
+                "access": reachable.access.as_str(),
             })
         })
         .collect();

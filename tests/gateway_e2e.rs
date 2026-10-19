@@ -535,8 +535,9 @@ async fn two_agents_are_told_two_different_things() {
         .to_string();
 
     assert!(mine.contains("`echo`"), "{mine}");
-    // The outsider is granted an upstream that does not exist, so the honest
-    // answer is that it can reach nothing — not a copy of somebody else's list.
+    // The outsider is granted an upstream no rule names, under a default that
+    // denies, so the honest answer is that it can reach nothing — not a copy
+    // of somebody else's list.
     assert!(!theirs.contains("`echo`"), "{theirs}");
     assert!(theirs.contains("no upstream it may address"), "{theirs}");
 }
@@ -585,6 +586,134 @@ async fn the_catalog_and_the_skills_describe_the_running_policy() {
     assert_eq!(
         read["result"]["contents"][0]["text"].as_str().unwrap(),
         text
+    );
+}
+
+/// The reported bug. `outsider` is granted `unmentioned`, no rule names it,
+/// and the default is `ask` — what `init` writes. A call to it stops on a human
+/// and goes through if approved, so a catalog that came back empty told the
+/// agent to give up on something one approval away.
+#[tokio::test]
+async fn a_granted_upstream_no_rule_names_is_listed_when_the_default_asks() {
+    let harness = spawn("\n[acl_default]\naction = \"ask\"\n").await;
+
+    let frame = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_catalog", "arguments": {} }),
+        )
+        .await;
+    let catalog = &frame["result"];
+    let upstreams = catalog["structuredContent"]["upstreams"]
+        .as_array()
+        .unwrap();
+    assert_eq!(upstreams.len(), 1, "{catalog}");
+    assert_eq!(upstreams[0]["name"], "unmentioned");
+    assert_eq!(upstreams[0]["access"], "ask");
+    let text = catalog["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("calls stop for approval"), "{text}");
+
+    // The same answer everywhere it is given, not just in the catalog.
+    let instructions = harness
+        .rpc_as("iap_outsider", "initialize", json!({}))
+        .await["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        instructions.contains("`unmentioned` (calls stop for approval)"),
+        "{instructions}"
+    );
+
+    let tools = harness
+        .rpc_as("iap_outsider", "tools/list", json!({}))
+        .await;
+    let description = tools["result"]["tools"][0]["description"].as_str().unwrap();
+    assert!(
+        description.contains("unmentioned (calls stop for approval)"),
+        "{description}"
+    );
+
+    let skill = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_skill", "arguments": { "name": "upstream/unmentioned" } }),
+        )
+        .await;
+    let skill = skill["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(skill.contains("calls stop for approval"), "{skill}");
+
+    // And `iap_request` agrees that it is a question, not a refusal: with no
+    // console attached nobody answers, so it comes back `approval_denied`
+    // from the default — never `target_not_permitted` or `policy_denied`.
+    let call = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_request", "arguments": { "upstream": "unmentioned", "path": "/v1/models" } }),
+        )
+        .await;
+    let message = call["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(message.starts_with("approval_denied"), "{message}");
+}
+
+/// Under `allow`, the catalog and `iap_request` agree the other way round: the
+/// upstream is listed, and the call to it goes through.
+#[tokio::test]
+async fn the_catalog_lists_what_an_allow_default_lets_through() {
+    let harness = spawn("\n[acl_default]\naction = \"allow\"\n").await;
+
+    let catalog = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_catalog", "arguments": {} }),
+        )
+        .await;
+    let upstreams = catalog["result"]["structuredContent"]["upstreams"]
+        .as_array()
+        .unwrap();
+    assert_eq!(upstreams.len(), 1, "{catalog}");
+    assert_eq!(upstreams[0]["name"], "unmentioned");
+    assert_eq!(upstreams[0]["access"], "allow");
+
+    let call = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_request", "arguments": { "upstream": "unmentioned", "path": "/v1/models" } }),
+        )
+        .await;
+    assert!(call["result"].get("isError").is_none(), "{call}");
+    assert_eq!(call["result"]["structuredContent"]["status"], 200);
+}
+
+/// A tool description is read at `tools/list` and may be cached for the whole
+/// session, while the policy under it can be reloaded. So even an agent that
+/// reaches nothing today is sent to `iap_catalog` rather than told, for good,
+/// that nothing is there.
+#[tokio::test]
+async fn the_request_tool_never_bakes_in_that_nothing_is_reachable() {
+    let harness = spawn("").await;
+
+    let tools = harness
+        .rpc_as("iap_outsider", "tools/list", json!({}))
+        .await;
+    let description = tools["result"]["tools"][0]["description"].as_str().unwrap();
+    assert!(
+        !description.contains("no upstream is reachable"),
+        "{description}"
+    );
+    assert!(description.contains("`iap_catalog`"), "{description}");
+
+    // A catalog entry under rules is marked as such, so `access` is always
+    // present and an agent can tell the cases apart.
+    let catalog = harness.call("iap_catalog", json!({})).await;
+    assert_eq!(
+        catalog["structuredContent"]["upstreams"][0]["access"],
+        "rules"
     );
 }
 

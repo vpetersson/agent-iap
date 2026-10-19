@@ -356,10 +356,10 @@ async fn proxy(
 fn reachable_hint(state: &AppState, agent: &crate::config::AgentConfig) -> String {
     let names: Vec<String> = crate::skills::reachable_upstreams(state, agent)
         .iter()
-        .map(|upstream| format!("`{}`", upstream.name))
+        .map(|reachable| format!("`{}`", reachable.upstream.name))
         .collect();
     match names.is_empty() {
-        true => "This agent is granted no upstream that any rule allows; `GET /` \
+        true => "This agent is granted no upstream that a rule or the default allows; `GET /` \
                  explains what that means."
             .to_string(),
         false => format!(
