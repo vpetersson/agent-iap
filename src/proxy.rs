@@ -612,6 +612,7 @@ mod tests {
             auth: crate::config::AuthConfig::None,
             headers: Default::default(),
             verify_path: None,
+            op_account: None,
         };
         let forwarded = forwarded_request_headers(
             &headers(&[
@@ -641,6 +642,7 @@ mod tests {
             auth: crate::config::AuthConfig::None,
             headers: Default::default(),
             verify_path: None,
+            op_account: None,
         };
 
         // The agent said who it was, so the upstream hears both.

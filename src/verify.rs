@@ -375,7 +375,10 @@ async fn probe_upstream(
         .apply(&upstream.name, &upstream.auth, &mut request)
         .await
     {
-        Ok(()) => report.passed(CREDENTIAL, describe_auth(&upstream.auth)),
+        Ok(()) => report.passed(
+            CREDENTIAL,
+            describe_auth(&upstream.auth) + &read_from(resolver, &upstream.auth.secret_refs()),
+        ),
         Err(error) => {
             report.noted(
                 CREDENTIAL,
@@ -693,7 +696,10 @@ async fn probe_mcp_http(
     let (status, session, body) =
         match post(&http, &injector, server, &url, None, &initialize_request()).await {
             Ok(answer) => {
-                report.passed(CREDENTIAL, describe_auth(&server.auth));
+                report.passed(
+                    CREDENTIAL,
+                    describe_auth(&server.auth) + &read_from(resolver, &server.auth.secret_refs()),
+                );
                 answer
             }
             Err(refused) => {
@@ -799,7 +805,11 @@ async fn probe_mcp_stdio(
     let injector = CredentialInjector::new(Arc::clone(resolver), crate::http_client(), None);
     let env = match injector.resolve_env(&server.env) {
         Ok(env) => {
-            report.passed(CREDENTIAL, describe_env(server));
+            let references: Vec<&str> = server.env.values().map(String::as_str).collect();
+            report.passed(
+                CREDENTIAL,
+                describe_env(server) + &read_from(resolver, &references),
+            );
             env
         }
         Err(error) => {
@@ -1363,6 +1373,34 @@ fn split_query(raw: &str) -> (String, Option<String>) {
         path => format!("/{path}"),
     };
     (path, query)
+}
+
+/// The 1Password accounts a target's credentials were read from, where the
+/// policy chose them — `op_account` on the service or under `[secrets]` —
+/// rather than the reference saying so itself. Empty when it is `op`'s
+/// default, so a policy that never names an account reads as it always has.
+fn read_from(resolver: &SecretResolver, references: &[&str]) -> String {
+    let mut accounts: Vec<String> = Vec::new();
+    for reference in references {
+        let names_its_own = crate::secrets::names_op_account(reference);
+        match resolver.op_account(reference) {
+            Some(account) if !names_its_own && !accounts.contains(&account) => {
+                accounts.push(account)
+            }
+            _ => {}
+        }
+    }
+    match accounts.as_slice() {
+        [] => String::new(),
+        accounts => format!(
+            ", from 1Password account {}",
+            accounts
+                .iter()
+                .map(|account| format!("`{account}`"))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+    }
 }
 
 /// Name the credential that was attached, by reference and never by value.

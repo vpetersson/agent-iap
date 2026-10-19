@@ -146,10 +146,12 @@ fn preload_secrets(config: &Config, resolver: &SecretResolver, fresh: bool) -> R
         .any(|(_, error)| crate::secrets::is_authorization_failure(error))
     {
         " — 1Password did not authorize the read. Unlock it, try again, and approve the prompt"
-    } else if failures
-        .iter()
-        .any(|(reference, _)| matches!(SecretRef::parse(reference), Ok(SecretRef::OnePassword(_))))
-    {
+    } else if failures.iter().any(|(reference, _)| {
+        matches!(
+            SecretRef::parse(reference),
+            Ok(SecretRef::OnePassword { .. })
+        )
+    }) {
         " — is `op` signed in?"
     } else {
         ""
@@ -170,10 +172,7 @@ fn preload_secrets(config: &Config, resolver: &SecretResolver, fresh: bool) -> R
 
 impl AppState {
     pub fn build(config: Config, audit_to_stderr: bool) -> Result<Arc<Self>> {
-        let resolver = Arc::new(
-            SecretResolver::new(config.server.op_binary.clone())
-                .with_store(config.server.secret_store_path()),
-        );
+        let resolver = Arc::new(SecretResolver::for_config(&config));
 
         // Resolve everything now: a missing key or a locked 1Password vault should
         // stop startup, not surface as a mystery 502 on the first real request.
@@ -262,6 +261,19 @@ impl AppState {
     /// therefore does not stop it either — it is refused, with the reason, and
     /// the proxy carries on serving what it was already serving.
     pub fn reload(&self, config: Config, why: crate::reload::Trigger) -> Result<Arc<Config>> {
+        // Which 1Password account a reference is read from is part of the
+        // policy, and the reads below have to be the new policy's reads. Put
+        // back if the policy is refused, so the proxy goes on reading from the
+        // accounts it is still serving.
+        let accounts = self.resolver.set_op_accounts(config.op_accounts());
+        let installed = self.install(config, why);
+        if installed.is_err() {
+            self.resolver.set_op_accounts(accounts);
+        }
+        installed
+    }
+
+    fn install(&self, config: Config, why: crate::reload::Trigger) -> Result<Arc<Config>> {
         // 1. Everything that can say no.
         preload_secrets(&config, &self.resolver, why.rereads_credentials())?;
         let rules = Acl::prepare(&config)?;
@@ -275,6 +287,7 @@ impl AppState {
         // if a later step refuses the policy, which costs one re-parse from the
         // config still in force — the safe direction.
         let current = self.config();
+        let (was_read_from, read_from) = (current.op_accounts(), config.op_accounts());
         for (target, auth) in config
             .upstreams
             .iter()
@@ -285,7 +298,13 @@ impl AppState {
                 .upstream(target)
                 .map(|upstream| &upstream.auth)
                 .or_else(|| current.mcp_server(target).map(|server| &server.auth));
-            if was.is_some_and(|was| was != auth) {
+            // Or left alone and moved to another 1Password account, which is
+            // the same reference spelling a different credential.
+            let moved = auth
+                .secret_refs()
+                .iter()
+                .any(|raw| was_read_from.account_for(raw) != read_from.account_for(raw));
+            if was.is_some_and(|was| was != auth) || moved {
                 self.injector.forget(target);
             }
         }
