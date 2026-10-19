@@ -107,7 +107,8 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 
 | Vendor | Profiles |
 | --- | --- |
-| Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets`, `google-cloud-logging`, `google-cloud-storage` — all one service account, all `service_account_jwt`, each taking an optional `--var subject=<email>` for domain-wide delegation |
+| Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets` — all one service account, all `service_account_jwt`, each taking an optional `--var subject=<email>` for domain-wide delegation |
+| Google Cloud | `google-cloud-compute`, `google-cloud-container` (GKE), `google-cloud-sql`, `google-cloud-redis` (Memorystore), `google-cloud-monitoring`, `google-cloud-resource-manager`, `google-cloud-iam`, `google-cloud-dns`, `google-cloud-pubsub`, `google-cloud-secret-manager`, `google-cloud-artifact-registry`, `google-cloud-logging`, `google-cloud-storage` — the same service-account scheme, bound by an IAM role on the project rather than delegated, and usable from gcloud ([§ Google Cloud](#google-cloud-and-gcloud)) |
 | Cloudflare | `cloudflare` (the whole `client/v4` surface, `--var account_id=…`), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
 | Asana | `asana` (REST), `asana-mcp` (the V2 MCP server, over `mcp-remote`) |
 | PostHog | `posthog` (REST), `posthog-mcp` |
@@ -302,3 +303,109 @@ file in the clear, while the token stays a reference.
   the query string too, enrolled as `query` auth: the proxy appends the key on
   the way out, so it is still never in a URL the agent wrote. v4 is a separate
   key on a separate profile, with both in the ordinary places.
+
+## Google Cloud and gcloud
+
+The `google-cloud-*` profiles are the infrastructure APIs — what you read to
+check a project against the Terraform that built it. They enrol the same
+service-account key as the Workspace profiles, but they are reached
+differently, and their notes say so:
+
+- **The grant is an IAM role on the project.** A key with no binding
+  authenticates and then 403s. Each profile names the predefined role its
+  `read` level needs; `roles/viewer` covers all of them but reads every
+  service in the project, so the per-service role is the narrower choice.
+  `write`, where it exists, needs a role that writes — and it is the role, not
+  the level, that decides how far a call reaches.
+- **Nothing is delegated.** A Cloud API authorizes the service account itself,
+  so these profiles have no `subject` variable, and `--var subject=…` is
+  refused rather than turning the token into a Workspace user's.
+- **`read` is GET plus the POSTs that only report**, each named:
+  `testIamPermissions`, `getIamPolicy`, Monitoring's `timeSeries:query` and
+  PromQL endpoints, Compute's `getHealth` and group listings. The scope is
+  the narrowest each API's discovery document accepts for its reads, and a
+  `write` level exists only where the API has a write scope narrower than
+  `cloud-platform`.
+
+| Profile | gcloud override | `read` scope | `read` role |
+| --- | --- | --- | --- |
+| `google-cloud-compute` | `compute` → `…/google-cloud-compute/compute/v1/` | `compute.readonly` | `roles/compute.viewer` |
+| `google-cloud-container` | `container` | `container.read-only` | `roles/container.viewer` |
+| `google-cloud-sql` | `sql` (not `sqladmin`) | `sqlservice.admin` | `roles/cloudsql.viewer` |
+| `google-cloud-redis` | `redis` | `redis.read-only` | `roles/redis.viewer` |
+| `google-cloud-monitoring` | `monitoring` | `monitoring.read` | `roles/monitoring.viewer` |
+| `google-cloud-resource-manager` | `cloudresourcemanager` | `cloud-platform.read-only` | `roles/browser` |
+| `google-cloud-iam` | `iam` | `cloud-platform` | `roles/iam.securityReviewer` |
+| `google-cloud-dns` | `dns` → `…/google-cloud-dns/dns/v1/` | `ndev.clouddns.readonly` | `roles/dns.reader` |
+| `google-cloud-pubsub` | `pubsub` | `pubsub` | `roles/pubsub.viewer` |
+| `google-cloud-secret-manager` | `secretmanager` | `cloud-platform` | `roles/secretmanager.viewer` |
+| `google-cloud-artifact-registry` | `artifactregistry` | `cloud-platform.read-only` | `roles/artifactregistry.reader` |
+| `google-cloud-logging` | `logging` | `logging.read` | `roles/logging.viewer` |
+| `google-cloud-storage` | `storage` → `…/google-cloud-storage/storage/v1/` | `devstorage.read_only` | `roles/storage.objectViewer` |
+
+gcloud works through the proxy with no login and no key on the agent's side.
+It reads a bearer token from a file, and the agent already has one — the token
+file from [§ The agent's token](agents.md#the-agents-token); gcloud strips the
+trailing newline:
+
+```bash
+gcloud config set auth/access_token_file ~/.config/agent-iap/token
+gcloud config set api_endpoint_overrides/container http://127.0.0.1:8080/google-cloud-container/
+gcloud config set api_endpoint_overrides/compute http://127.0.0.1:8080/google-cloud-compute/compute/v1/
+gcloud config set compute/disable_batch_request true
+```
+
+gcloud sends the file's contents as `Authorization: Bearer …`, the proxy takes
+that as the agent's token, and Google is sent the service account's in its
+place. Use the upstream's own name if it was enrolled `--as` another. The
+`CLOUDSDK_AUTH_ACCESS_TOKEN_FILE` and `CLOUDSDK_API_ENDPOINT_OVERRIDES_<API>`
+variables do the same without touching gcloud's configuration.
+
+They usually come together, and there is no bundle profile yet; enrol them
+against one key in a loop:
+
+```bash
+for api in compute container sql redis monitoring resource-manager; do
+    agent-iap profile add "google-cloud-$api" --secret op://Private/GCP/credential
+done
+```
+
+What the notes say that a 403 would not:
+
+- **Some scopes do not make a level read-only.** Cloud SQL, Pub/Sub, IAM and
+  Secret Manager have no read-only scope at all — `read` mints the same
+  `sqlservice.admin`, `pubsub` or `cloud-platform` token `write` would — and
+  Resource Manager accepts `cloud-platform.read-only` for creating and
+  deleting a lien. Where that is so, the role and the ACL are the only
+  narrowing, which is why the POSTs `read` allows are named one by one rather
+  than `POST /**`.
+- **`read` never returns a secret.** Secret Manager's payload is
+  `…/versions/<v>:access`, a GET like every read beside it, so `read` denies it
+  by name ahead of the rule that allows GETs; `roles/secretmanager.viewer`
+  lacks the permission too. Memorystore's `…/instances/<i>/authString` is the
+  same shape — a GET that returns the instance's AUTH password, callable with
+  `redis.read-only` — and is denied the same way. IAM's `:signJwt`, `:signBlob`
+  and key creation each mint something that acts as a service account outside
+  the proxy and outlives the agent's token, and are denied by name rather than
+  left to an `ask`.
+- **Pulling is not reading.** A Pub/Sub pull leases messages away from the
+  subscription's real consumer and an acknowledge removes them, so `read`
+  denies `:pull`, `:acknowledge` and `:modifyAckDeadline`.
+- **`redis.read-only` covers instances and backups only.** Clusters,
+  operations and the location list answer 403 to it, so `gcloud redis
+  operations` and `regions list` fail at `read`; `write`'s `redis.read-write`
+  scope with the role kept at `roles/redis.viewer` reads them.
+- **gcloud batches Compute requests at the proxy's root.** It derives the batch
+  URL from the endpoint's host alone — `/batch/compute/v1`, outside every
+  upstream — so set `compute/disable_batch_request`. `read` denies
+  `/batch/**`, whose sub-requests the ACL cannot see.
+- **Some things live on other hosts.** `kubectl` talks to each GKE cluster's
+  own endpoint with a Google token the agent does not hold, so a kubeconfig
+  from `get-credentials` cannot authenticate; image and package pulls go to
+  `<location>-docker.pkg.dev` and friends; regional secrets are on
+  `secretmanager.<location>.rep.googleapis.com`; short-lived service-account
+  tokens come from `iamcredentials.googleapis.com`. No profile fronts them.
+
+Service Networking has no profile: gcloud has no endpoint override for it, its
+only scope besides `cloud-platform` is `service.management`, and the peerings
+it creates are readable through `google-cloud-compute` as part of the network.
