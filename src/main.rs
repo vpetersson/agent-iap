@@ -1404,8 +1404,18 @@ fn import_secrets(config_path: &Path, dry_run: bool) -> Result<()> {
         planned.len(),
         config_path.display()
     );
+    // Built before the plan is shown, because it is what knows which
+    // 1Password account each reference is read from — the reference's own
+    // `?account=`, its service's `op_account`, or `[secrets] op_account`.
+    let resolver = agent_iap::secrets::SecretResolver::for_config(&config);
     for entry in &planned {
-        println!("  {}  →  iap://{}", entry.reference, entry.name);
+        match resolver.op_account(&entry.reference) {
+            Some(account) => println!(
+                "  {}  →  iap://{}   (from 1Password account `{account}`)",
+                entry.reference, entry.name
+            ),
+            None => println!("  {}  →  iap://{}", entry.reference, entry.name),
+        }
         for owner in &entry.owners {
             println!("      {owner}");
         }
@@ -1416,14 +1426,19 @@ fn import_secrets(config_path: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone())
-        .with_store(config.server.secret_store_path());
     let references: Vec<String> = planned
         .iter()
         .map(|entry| entry.reference.clone())
         .collect();
 
-    println!("\nReading them from 1Password — one prompt for all of them…");
+    let accounts: std::collections::HashSet<Option<String>> = references
+        .iter()
+        .map(|reference| resolver.op_account(reference))
+        .collect();
+    match accounts.len() {
+        1 => println!("\nReading them from 1Password — one prompt for all of them…"),
+        n => println!("\nReading them from 1Password — one prompt for each of the {n} accounts…"),
+    }
     let answers = resolver.resolve_all(&references);
     let failures: Vec<String> = answers
         .iter()
@@ -1509,7 +1524,7 @@ fn plan_import(config: &Config) -> Vec<Import> {
     for (owner, field, reference) in agent_iap::list::credential_sites(config) {
         if !matches!(
             agent_iap::secrets::SecretRef::parse(&reference),
-            Ok(agent_iap::secrets::SecretRef::OnePassword(_))
+            Ok(agent_iap::secrets::SecretRef::OnePassword { .. })
         ) {
             continue;
         }
@@ -2374,8 +2389,7 @@ fn check(path: &Path) -> Result<()> {
         }
     }
 
-    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone())
-        .with_store(config.server.secret_store_path());
+    let resolver = agent_iap::secrets::SecretResolver::for_config(&config);
     let references = config.secret_refs();
     if references.is_empty() {
         println!("secrets     none referenced");
@@ -2386,18 +2400,68 @@ fn check(path: &Path) -> Result<()> {
     // operator stops running (SIRI-205).
     let answers = resolver.resolve_all(&references);
     let mut failed = 0;
+    // Per 1Password account, in the order the file first needs each: how many
+    // references it is asked for, how many it answered, and whether it refused.
+    let mut accounts: Vec<(Option<String>, usize, usize, bool)> = Vec::new();
+    for (reference, answer) in references.iter().zip(&answers) {
+        if !matches!(
+            agent_iap::secrets::SecretRef::parse(reference),
+            Ok(agent_iap::secrets::SecretRef::OnePassword { .. })
+        ) {
+            continue;
+        }
+        let account = resolver.op_account(reference);
+        let at = match accounts.iter().position(|(named, ..)| *named == account) {
+            Some(at) => at,
+            None => {
+                accounts.push((account, 0, 0, false));
+                accounts.len() - 1
+            }
+        };
+        let entry = &mut accounts[at];
+        entry.1 += 1;
+        match answer {
+            Ok(()) => entry.2 += 1,
+            Err(error) => entry.3 |= agent_iap::secrets::is_authorization_failure(error),
+        }
+    }
     for (reference, answer) in references.iter().zip(answers) {
         // `display_ref` rather than the raw string, for the same reason
         // `agent-iap list` uses it: every scheme but one is a *pointer* and safe
         // on a terminal, and `literal:` is the credential itself. It is also the
         // reference as the resolver read it, so a stray space in the file is not
         // echoed back as though it were part of the vault's name.
-        let shown = agent_iap::secrets::display_ref(reference);
+        let mut shown = agent_iap::secrets::display_ref(reference);
+        // The account the policy chose for it, where the reference does not
+        // say so itself.
+        let names_its_own = agent_iap::secrets::names_op_account(reference);
+        if let (Some(account), false) = (resolver.op_account(reference), names_its_own) {
+            shown = format!("{shown}  (1Password account `{account}`)");
+        }
         match answer {
             Ok(()) => println!("secrets     ok      {shown}"),
             Err(error) => {
                 failed += 1;
                 println!("secrets     FAILED  {shown}: {error}");
+            }
+        }
+    }
+    // Only once a policy names an account: one that never does reads from
+    // whichever account `op` defaults to, exactly as it always has, and the
+    // `secrets` lines above already say everything there is to say about it.
+    if accounts.iter().any(|(account, ..)| account.is_some()) {
+        for (account, asked, answered, refused) in &accounts {
+            let named = match account {
+                Some(account) => format!("`{account}`"),
+                None => "default account".to_string(),
+            };
+            let detail = format!("{named} — {answered} of {asked} reference(s) read");
+            match (refused, answered == asked) {
+                (true, _) => println!(
+                    "1password   FAILED  {named} — not signed in, or the read was not authorized"
+                ),
+                (false, true) => println!("1password   ok      {detail}"),
+                (false, false) => println!("1password   FAILED  {detail}"),
             }
         }
     }
@@ -2569,10 +2633,7 @@ fn print_report(report: &verify::Report) {
 }
 
 fn resolver_for(config: &Config) -> Arc<SecretResolver> {
-    Arc::new(
-        SecretResolver::new(config.server.op_binary.clone())
-            .with_store(config.server.secret_store_path()),
-    )
+    Arc::new(SecretResolver::for_config(config))
 }
 
 /// Print a freshly minted token, and put it on the clipboard on the way past.

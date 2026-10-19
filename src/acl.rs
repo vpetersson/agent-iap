@@ -300,7 +300,8 @@ impl Acl {
     }
 
     /// How many rules could ever apply to a target. Used to catch a config that
-    /// grants an agent an upstream the policy never mentions, which denies.
+    /// grants an agent an upstream the policy never mentions, which leaves every
+    /// call to it to the default.
     pub fn rules_mentioning(&self, target: &str) -> usize {
         self.compiled
             .read()
@@ -327,7 +328,8 @@ impl Acl {
     /// How many rules could ever apply to this agent against this target.
     ///
     /// Zero is the answer worth seeing: a target an agent is allowed to address
-    /// but that no rule ever names falls through to the default, which denies.
+    /// but that no rule ever names falls through to the default on every call —
+    /// refused under `deny`, held for a human under `ask`.
     pub fn rules_for(&self, agent: &str, kind: Kind, target: &str) -> usize {
         self.compiled
             .read()
