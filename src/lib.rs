@@ -99,6 +99,7 @@ pub mod discovery;
 pub mod enroll;
 pub mod gate;
 pub mod gateway;
+pub mod git;
 pub mod identity;
 pub mod init;
 pub mod list;

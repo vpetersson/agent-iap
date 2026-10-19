@@ -8,11 +8,11 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use crate::secrets::SecretRef;
+use crate::secrets::{OpAccounts, SecretRef};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +21,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
@@ -363,6 +365,19 @@ fn default_redact_headers() -> Vec<String> {
     .collect()
 }
 
+/// How secret references are read, where the reference itself does not say.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// The 1Password account `op://` references are read from when neither the
+    /// reference (`?account=`) nor the upstream or MCP server it belongs to
+    /// (`op_account`) names one: a sign-in address (`my.1password.com`), an
+    /// account ID or a user ID — whatever `op --account` takes. Absent, `op`
+    /// is not told, and reads from the account it would have picked anyway.
+    #[serde(default)]
+    pub op_account: Option<String>,
+}
+
 /// A caller. Agents authenticate with a token that is *not* any upstream credential.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -408,6 +423,11 @@ pub struct UpstreamConfig {
     /// proves DNS and one that proves the credential.
     #[serde(default)]
     pub verify_path: Option<String>,
+    /// The 1Password account this upstream's `op://` references are read from,
+    /// unless a reference names its own with `?account=`. Overrides
+    /// `[secrets] op_account`.
+    #[serde(default)]
+    pub op_account: Option<String>,
 }
 
 /// Credential injection. Covers the schemes real APIs and MCP servers actually use.
@@ -637,6 +657,10 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// The 1Password account this server's `op://` references — `auth` and
+    /// `env` alike — are read from, unless a reference names its own.
+    #[serde(default)]
+    pub op_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -965,6 +989,8 @@ impl Config {
             }
         }
 
+        self.check_op_accounts()?;
+
         for (index, rule) in self.acl.iter().enumerate() {
             let label = rule.name.clone().unwrap_or_else(|| format!("acl[{index}]"));
             if !matches!(rule.kind.as_str(), "http" | "mcp" | "*") {
@@ -981,34 +1007,136 @@ impl Config {
         Ok(())
     }
 
-    /// Every secret reference in the config, for `check` and startup preloading.
-    pub fn secret_refs(&self) -> Vec<String> {
-        let mut refs = Vec::new();
+    /// Every secret reference in the file, with what holds it and the
+    /// `op_account` that holder names — `None` for everything that cannot name
+    /// one (the server's own credentials, agent tokens), which reads from
+    /// `[secrets] op_account`.
+    fn secret_sites(&self) -> Vec<(String, &str, Option<&str>)> {
+        let mut sites = Vec::new();
         if let Some(reference) = &self.server.admin_token {
-            refs.push(reference.clone());
+            sites.push(("server.admin_token".to_string(), reference.as_str(), None));
         }
-        for tls in [&self.server.tls, &self.server.admin_tls]
-            .into_iter()
-            .flatten()
-        {
-            refs.push(tls.cert.clone());
-            refs.push(tls.key.clone());
+        for (label, tls) in [
+            ("server.tls", &self.server.tls),
+            ("server.admin_tls", &self.server.admin_tls),
+        ] {
+            let Some(tls) = tls else { continue };
+            sites.push((format!("{label}.cert"), tls.cert.as_str(), None));
+            sites.push((format!("{label}.key"), tls.key.as_str(), None));
             if let Some(ca) = &tls.ca {
-                refs.push(ca.clone());
+                sites.push((format!("{label}.ca"), ca.as_str(), None));
             }
         }
         for agent in &self.agents {
             if let Some(reference) = &agent.token_ref {
-                refs.push(reference.clone());
+                sites.push((format!("agent `{}`", agent.id), reference.as_str(), None));
             }
         }
         for upstream in &self.upstreams {
-            refs.extend(upstream.auth.secret_refs().into_iter().map(str::to_string));
+            for reference in upstream.auth.secret_refs() {
+                sites.push((
+                    format!("upstream `{}`", upstream.name),
+                    reference,
+                    upstream.op_account.as_deref(),
+                ));
+            }
         }
         for server in &self.mcp_servers {
-            refs.extend(server.auth.secret_refs().into_iter().map(str::to_string));
-            refs.extend(server.env.values().cloned());
+            for reference in server
+                .auth
+                .secret_refs()
+                .into_iter()
+                .chain(server.env.values().map(String::as_str))
+            {
+                sites.push((
+                    format!("mcp server `{}`", server.name),
+                    reference,
+                    server.op_account.as_deref(),
+                ));
+            }
         }
+        sites
+    }
+
+    /// Which 1Password account each `op://` reference in this file is read
+    /// from. See `OpAccounts`.
+    pub fn op_accounts(&self) -> OpAccounts {
+        let mut accounts = OpAccounts::new(self.secrets.op_account.clone());
+        for (_, reference, account) in self.secret_sites() {
+            if let Some(account) = account {
+                accounts.assign(reference, account);
+            }
+        }
+        accounts
+    }
+
+    /// Every `op_account` names something, and no reference is read from one
+    /// account for one service and another for the next.
+    ///
+    /// The second is refused rather than settled, because the resolver keeps
+    /// one value per reference: the same `op://Private/GitHub/token` under two
+    /// upstreams naming two accounts is two credentials spelled the same way,
+    /// and whichever was read first would be served to both. `?account=` on
+    /// the reference is the way to say which one each means.
+    fn check_op_accounts(&self) -> Result<()> {
+        let named = std::iter::once(("[secrets] op_account".to_string(), &self.secrets.op_account))
+            .chain(self.upstreams.iter().map(|upstream| {
+                (
+                    format!("upstream `{}`: op_account", upstream.name),
+                    &upstream.op_account,
+                )
+            }))
+            .chain(self.mcp_servers.iter().map(|server| {
+                (
+                    format!("mcp server `{}`: op_account", server.name),
+                    &server.op_account,
+                )
+            }));
+        for (label, account) in named {
+            if account
+                .as_ref()
+                .is_some_and(|account| account.trim().is_empty())
+            {
+                bail!(
+                    "{label} is empty — name the 1Password account by its sign-in address \
+                     (`my.1password.com`), account ID or user ID, or leave it out"
+                );
+            }
+        }
+
+        let default = self.secrets.op_account.as_deref().map(str::trim);
+        let mut seen: HashMap<String, (String, Option<&str>)> = HashMap::new();
+        for (owner, reference, account) in self.secret_sites() {
+            match SecretRef::parse(reference) {
+                Ok(SecretRef::OnePassword { account: None, .. }) => {}
+                _ => continue,
+            }
+            let account = account.map(str::trim).or(default);
+            let key = reference.trim().to_string();
+            match seen.get(&key) {
+                Some((first, was)) if *was != account => bail!(
+                    "`{key}` is read from {} for {first} and from {} for {owner} — one \
+                     reference is one credential; put `?account=` on the reference to say \
+                     which account each one means",
+                    describe_account(*was),
+                    describe_account(account),
+                ),
+                Some(_) => {}
+                None => {
+                    seen.insert(key, (owner, account));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every secret reference in the config, for `check` and startup preloading.
+    pub fn secret_refs(&self) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .secret_sites()
+            .into_iter()
+            .map(|(_, reference, _)| reference.to_string())
+            .collect();
         refs.sort();
         refs.dedup();
         refs
@@ -1023,6 +1151,13 @@ pub const MIN_ASSERTION_LIFETIME_SECS: u64 = 60;
 /// an identity that outlives the work it was minted for is an agent token again.
 pub const MIN_WORKLOAD_LIFETIME_SECS: u64 = 60;
 pub const MAX_WORKLOAD_LIFETIME_SECS: u64 = 3600;
+
+fn describe_account(account: Option<&str>) -> String {
+    match account {
+        Some(account) => format!("1Password account `{account}`"),
+        None => "the default 1Password account".to_string(),
+    }
+}
 
 fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     // The password half of `<token>:token` is a scheme constant, not a
@@ -1663,5 +1798,101 @@ type = "service_account_jwt"
             .unwrap_err()
             .to_string()
             .contains("one namespace"));
+    }
+
+    /// Two `op://` services, one of them reading from a second 1Password
+    /// account, in the shape the report asked for.
+    fn two_accounts(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "{MINIMAL}\n\
+             [[upstreams]]\nname = \"company\"\nbase_url = \"https://api.example.com\"\n\
+             auth = {{ type = \"bearer\", secret = \"op://Work/API/token\" }}\n\
+             [[upstreams]]\nname = \"github-public\"\nbase_url = \"https://api.github.com\"\n\
+             op_account = \"my.1password.com\"\n\
+             auth = {{ type = \"bearer\", secret = \"op://Private/GitHub classic/token\" }}\n\
+             [[upstreams]]\nname = \"pinned\"\nbase_url = \"https://pinned.example.com\"\n\
+             op_account = \"my.1password.com\"\n\
+             auth = {{ type = \"bearer\", secret = \"op://Ops/Pinned/token?account=ops.1password.com\" }}\n\
+             {extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_account_a_reference_is_read_from_is_the_most_precise_one_named() {
+        let unset = two_accounts("");
+        unset.validate().unwrap();
+        let accounts = unset.op_accounts();
+        // Nothing named anywhere is today's behaviour: no `--account` at all.
+        assert_eq!(accounts.account_for("op://Work/API/token"), None);
+        // The upstream's `op_account`.
+        assert_eq!(
+            accounts
+                .account_for("op://Private/GitHub classic/token")
+                .as_deref(),
+            Some("my.1password.com")
+        );
+        // The reference's own `?account=`, over the upstream's.
+        assert_eq!(
+            accounts
+                .account_for("op://Ops/Pinned/token?account=ops.1password.com")
+                .as_deref(),
+            Some("ops.1password.com")
+        );
+        // Never anything for a reference 1Password does not read.
+        assert_eq!(accounts.account_for("env:ANTHROPIC_API_KEY"), None);
+
+        let global = two_accounts("[secrets]\nop_account = \"example.1password.com\"\n");
+        global.validate().unwrap();
+        let accounts = global.op_accounts();
+        assert_eq!(
+            accounts.account_for("op://Work/API/token").as_deref(),
+            Some("example.1password.com")
+        );
+        assert_eq!(
+            accounts
+                .account_for("op://Private/GitHub classic/token")
+                .as_deref(),
+            Some("my.1password.com"),
+            "the upstream's account is more precise than the file's"
+        );
+    }
+
+    #[test]
+    fn one_reference_read_from_two_accounts_is_refused_where_it_is_written() {
+        // The same spelling under a service that names another account is two
+        // credentials the resolver would serve as one.
+        let config = two_accounts(
+            "[[upstreams]]\nname = \"github-again\"\nbase_url = \"https://uploads.github.com\"\n\
+             auth = { type = \"bearer\", secret = \"op://Private/GitHub classic/token\" }\n",
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("op://Private/GitHub classic/token"),
+            "{error}"
+        );
+        assert!(error.contains("`my.1password.com`"), "{error}");
+        assert!(error.contains("the default 1Password account"), "{error}");
+        assert!(error.contains("?account="), "and how to say which: {error}");
+    }
+
+    #[test]
+    fn an_empty_op_account_is_refused_rather_than_read_as_the_default() {
+        let error = two_accounts("[secrets]\nop_account = \" \"\n")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[secrets] op_account is empty"), "{error}");
+    }
+
+    #[test]
+    fn an_unparseable_account_query_is_refused_at_load() {
+        let config: Config = toml::from_str(&format!(
+            "{MINIMAL}\n[[upstreams]]\nname = \"bad\"\nbase_url = \"https://api.example.com\"\n\
+             auth = {{ type = \"bearer\", secret = \"op://Work/API/token?account=\" }}\n"
+        ))
+        .unwrap();
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert!(error.contains("no account after it"), "{error}");
     }
 }

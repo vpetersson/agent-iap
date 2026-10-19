@@ -9,6 +9,7 @@ use agent_iap::audit;
 use agent_iap::clipboard;
 use agent_iap::config::{Action, Config};
 use agent_iap::enroll;
+use agent_iap::git;
 use agent_iap::identity;
 use agent_iap::init::{self, InitOptions, Template};
 use agent_iap::list::{Inventory, ListOptions, What};
@@ -161,6 +162,24 @@ enum Command {
         #[arg(long, env = "IAP_TOKEN", hide_env_values = true)]
         token: String,
         /// Data-plane address of the running proxy.
+        #[arg(long, env = "IAP_PROXY_URL")]
+        proxy_url: Option<String>,
+    },
+    /// Print the git settings that send `https://github.com/` through the proxy.
+    ///
+    /// `eval "$(agent-iap git-config)"` and then `git clone
+    /// https://github.com/<owner>/<repo>.git` reaches the `github-git` upstream
+    /// with the agent's token in `X-IAP-Token`. The settings are environment
+    /// variables for this shell, and the token is read from `$IAP_TOKEN` when
+    /// they are evaluated — nothing is written to `~/.gitconfig`.
+    GitConfig {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// The upstream enrolled from the `github-git` profile.
+        #[arg(long, default_value = "github-git")]
+        upstream: String,
+        /// Data-plane address of the running proxy. Defaults to `IAP_URL`, and
+        /// then to `server.listen` in the policy file.
         #[arg(long, env = "IAP_PROXY_URL")]
         proxy_url: Option<String>,
     },
@@ -1027,6 +1046,11 @@ fn main() -> Result<()> {
                 },
             ))
         }
+        Command::GitConfig {
+            config,
+            upstream,
+            proxy_url,
+        } => git_config(&config.config, upstream, proxy_url),
         Command::List {
             config,
             what,
@@ -1317,8 +1341,18 @@ fn import_secrets(config_path: &Path, dry_run: bool) -> Result<()> {
         planned.len(),
         config_path.display()
     );
+    // Built before the plan is shown, because it is what knows which
+    // 1Password account each reference is read from — the reference's own
+    // `?account=`, its service's `op_account`, or `[secrets] op_account`.
+    let resolver = agent_iap::secrets::SecretResolver::for_config(&config);
     for entry in &planned {
-        println!("  {}  →  iap://{}", entry.reference, entry.name);
+        match resolver.op_account(&entry.reference) {
+            Some(account) => println!(
+                "  {}  →  iap://{}   (from 1Password account `{account}`)",
+                entry.reference, entry.name
+            ),
+            None => println!("  {}  →  iap://{}", entry.reference, entry.name),
+        }
         for owner in &entry.owners {
             println!("      {owner}");
         }
@@ -1329,14 +1363,19 @@ fn import_secrets(config_path: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone())
-        .with_store(config.server.secret_store_path());
     let references: Vec<String> = planned
         .iter()
         .map(|entry| entry.reference.clone())
         .collect();
 
-    println!("\nReading them from 1Password — one prompt for all of them…");
+    let accounts: std::collections::HashSet<Option<String>> = references
+        .iter()
+        .map(|reference| resolver.op_account(reference))
+        .collect();
+    match accounts.len() {
+        1 => println!("\nReading them from 1Password — one prompt for all of them…"),
+        n => println!("\nReading them from 1Password — one prompt for each of the {n} accounts…"),
+    }
     let answers = resolver.resolve_all(&references);
     let failures: Vec<String> = answers
         .iter()
@@ -1422,7 +1461,7 @@ fn plan_import(config: &Config) -> Vec<Import> {
     for (owner, field, reference) in agent_iap::list::credential_sites(config) {
         if !matches!(
             agent_iap::secrets::SecretRef::parse(&reference),
-            Ok(agent_iap::secrets::SecretRef::OnePassword(_))
+            Ok(agent_iap::secrets::SecretRef::OnePassword { .. })
         ) {
             continue;
         }
@@ -2056,6 +2095,47 @@ fn list_config(path: &Path, options: &ListOptions, output: OutputArg) -> Result<
     Ok(())
 }
 
+/// `git-config`: where the proxy is, then the settings that reach it.
+///
+/// An agent is usually handed `IAP_URL` and no policy file, so the address it
+/// was given comes first. On the proxy's own host the file says where it
+/// listens — and whether the upstream named is one it fronts, which is worth
+/// saying now rather than as a `404 unknown_upstream` on the first clone.
+fn git_config(path: &Path, upstream: String, proxy_url: Option<String>) -> Result<()> {
+    let given = proxy_url.or_else(|| std::env::var("IAP_URL").ok());
+    let proxy_url = match given.filter(|url| !url.trim().is_empty()) {
+        Some(url) => url,
+        None => {
+            let config = Config::load(path).context(
+                "no proxy address — pass --proxy-url, or set IAP_URL, or run this where the \
+                 policy file is",
+            )?;
+            match config.upstream(&upstream) {
+                None => eprintln!(
+                    "warning: `{upstream}` is not an upstream in {} — \
+                     `agent-iap profile add github-git` enrols it",
+                    path.display()
+                ),
+                Some(found) if found.base_url.trim_end_matches('/') != "https://github.com" => {
+                    eprintln!(
+                        "warning: `{upstream}` fronts {}, not https://github.com",
+                        found.base_url
+                    )
+                }
+                Some(_) => {}
+            }
+            let scheme = tls::scheme(config.server.tls.is_some());
+            format!("{scheme}://{}", config.server.listen)
+        }
+    };
+    let entries = git::entries(&git::GitConfigOptions {
+        proxy_url,
+        upstream,
+    })?;
+    print!("{}", git::render_env(&entries, &git::existing_keys()));
+    Ok(())
+}
+
 fn check(path: &Path) -> Result<()> {
     // Before anything that can fail. This is the command an operator runs when
     // they are working out why something behaves the way it does, and "which
@@ -2191,8 +2271,7 @@ fn check(path: &Path) -> Result<()> {
         }
     }
 
-    let resolver = agent_iap::secrets::SecretResolver::new(config.server.op_binary.clone())
-        .with_store(config.server.secret_store_path());
+    let resolver = agent_iap::secrets::SecretResolver::for_config(&config);
     let references = config.secret_refs();
     if references.is_empty() {
         println!("secrets     none referenced");
@@ -2203,18 +2282,68 @@ fn check(path: &Path) -> Result<()> {
     // operator stops running (SIRI-205).
     let answers = resolver.resolve_all(&references);
     let mut failed = 0;
+    // Per 1Password account, in the order the file first needs each: how many
+    // references it is asked for, how many it answered, and whether it refused.
+    let mut accounts: Vec<(Option<String>, usize, usize, bool)> = Vec::new();
+    for (reference, answer) in references.iter().zip(&answers) {
+        if !matches!(
+            agent_iap::secrets::SecretRef::parse(reference),
+            Ok(agent_iap::secrets::SecretRef::OnePassword { .. })
+        ) {
+            continue;
+        }
+        let account = resolver.op_account(reference);
+        let at = match accounts.iter().position(|(named, ..)| *named == account) {
+            Some(at) => at,
+            None => {
+                accounts.push((account, 0, 0, false));
+                accounts.len() - 1
+            }
+        };
+        let entry = &mut accounts[at];
+        entry.1 += 1;
+        match answer {
+            Ok(()) => entry.2 += 1,
+            Err(error) => entry.3 |= agent_iap::secrets::is_authorization_failure(error),
+        }
+    }
     for (reference, answer) in references.iter().zip(answers) {
         // `display_ref` rather than the raw string, for the same reason
         // `agent-iap list` uses it: every scheme but one is a *pointer* and safe
         // on a terminal, and `literal:` is the credential itself. It is also the
         // reference as the resolver read it, so a stray space in the file is not
         // echoed back as though it were part of the vault's name.
-        let shown = agent_iap::secrets::display_ref(reference);
+        let mut shown = agent_iap::secrets::display_ref(reference);
+        // The account the policy chose for it, where the reference does not
+        // say so itself.
+        let names_its_own = agent_iap::secrets::names_op_account(reference);
+        if let (Some(account), false) = (resolver.op_account(reference), names_its_own) {
+            shown = format!("{shown}  (1Password account `{account}`)");
+        }
         match answer {
             Ok(()) => println!("secrets     ok      {shown}"),
             Err(error) => {
                 failed += 1;
                 println!("secrets     FAILED  {shown}: {error}");
+            }
+        }
+    }
+    // Only once a policy names an account: one that never does reads from
+    // whichever account `op` defaults to, exactly as it always has, and the
+    // `secrets` lines above already say everything there is to say about it.
+    if accounts.iter().any(|(account, ..)| account.is_some()) {
+        for (account, asked, answered, refused) in &accounts {
+            let named = match account {
+                Some(account) => format!("`{account}`"),
+                None => "default account".to_string(),
+            };
+            let detail = format!("{named} — {answered} of {asked} reference(s) read");
+            match (refused, answered == asked) {
+                (true, _) => println!(
+                    "1password   FAILED  {named} — not signed in, or the read was not authorized"
+                ),
+                (false, true) => println!("1password   ok      {detail}"),
+                (false, false) => println!("1password   FAILED  {detail}"),
             }
         }
     }
@@ -2386,10 +2515,7 @@ fn print_report(report: &verify::Report) {
 }
 
 fn resolver_for(config: &Config) -> Arc<SecretResolver> {
-    Arc::new(
-        SecretResolver::new(config.server.op_binary.clone())
-            .with_store(config.server.secret_store_path()),
-    )
+    Arc::new(SecretResolver::for_config(config))
 }
 
 /// Print a freshly minted token, and put it on the clipboard on the way past.

@@ -5,7 +5,7 @@
 //! itself stays safe to commit — and are resolved inside this process only.
 
 use anyhow::{bail, Context, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
@@ -48,7 +48,15 @@ pub enum SecretRef {
     /// `file:/run/secrets/anthropic`
     File(PathBuf),
     /// `op://Private/Anthropic/credential` — resolved with the 1Password CLI.
-    OnePassword(String),
+    ///
+    /// `reference` is what `op` is handed: the reference with any `?account=`
+    /// taken off, and every other query parameter — 1Password's own
+    /// `?attribute=otp`, `?ssh-format=openssh` — left on. `account` is the
+    /// 1Password account the reference named for itself, if it named one.
+    OnePassword {
+        reference: String,
+        account: Option<String>,
+    },
     /// `iap://github-readonly` — a credential agent-iap keeps itself, in its
     /// own store rather than in the policy file. See `store`.
     Managed(String),
@@ -78,7 +86,8 @@ impl SecretRef {
             }
             Ok(SecretRef::File(PathBuf::from(rest)))
         } else if reference.starts_with("op://") {
-            Ok(SecretRef::OnePassword(reference.to_string()))
+            let (reference, account) = split_op_account(reference)?;
+            Ok(SecretRef::OnePassword { reference, account })
         } else if let Some(rest) = reference.strip_prefix("iap://") {
             // A name, not a credential — so the same trimming the other
             // pointers get, and the same validation `secret set` applied when
@@ -138,6 +147,131 @@ pub fn display_ref(raw: &str) -> String {
     }
 }
 
+/// Take `?account=` off a 1Password reference, and keep everything else.
+///
+/// The account is agent-iap's to read and not `op`'s: handed through, it would
+/// be taken for a field query and the read would fail on a field nobody asked
+/// for. 1Password's own parameters are the opposite — `?attribute=otp` and
+/// `?ssh-format=openssh` change what `op` returns — so they stay, in the order
+/// they were written.
+fn split_op_account(reference: &str) -> Result<(String, Option<String>)> {
+    let Some((path, query)) = reference.split_once('?') else {
+        return Ok((reference.to_string(), None));
+    };
+    let mut account = None;
+    let mut kept = Vec::new();
+    for param in query.split('&') {
+        let value = match param.split_once('=') {
+            Some(("account", value)) => value,
+            None if param == "account" => "",
+            _ => {
+                kept.push(param);
+                continue;
+            }
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            bail!(
+                "`{path}` has `?account=` with no account after it — name the 1Password account \
+                 by its sign-in address (`my.1password.com`), account ID or user ID"
+            );
+        }
+        if account.replace(value.to_string()).is_some() {
+            bail!(
+                "`{path}` names `?account=` more than once; a reference is read from one account"
+            );
+        }
+    }
+    let reference = match kept.is_empty() {
+        true => path.to_string(),
+        false => format!("{path}?{}", kept.join("&")),
+    };
+    Ok((reference, account))
+}
+
+/// Does `raw` name its 1Password account itself, with `?account=`?
+///
+/// Output that says which account a reference was read from says it only where
+/// the policy chose — the reference already says so where it did not.
+pub fn names_op_account(raw: &str) -> bool {
+    matches!(
+        SecretRef::parse(raw),
+        Ok(SecretRef::OnePassword {
+            account: Some(_),
+            ..
+        })
+    )
+}
+
+/// Which 1Password account each `op://` reference is read from.
+///
+/// Most precise first: the reference's own `?account=`, then the `op_account`
+/// of the upstream or MCP server it belongs to, then `[secrets] op_account`.
+/// Nothing at all is today's behaviour — no `--account`, and `op` picks the
+/// account it would have picked anyway.
+///
+/// Keyed by the reference rather than by where it sits, because that is what
+/// the resolver is asked about. `Config::validate` refuses a reference that
+/// would need two different accounts depending on which service used it, so
+/// one answer per reference is always the right answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpAccounts {
+    default: Option<String>,
+    targets: HashMap<String, String>,
+}
+
+impl OpAccounts {
+    /// `default` is `[secrets] op_account`, for every reference nothing more
+    /// specific speaks for.
+    pub fn new(default: Option<String>) -> Self {
+        OpAccounts {
+            default: default.filter(|account| !account.trim().is_empty()),
+            targets: HashMap::new(),
+        }
+    }
+
+    /// Read `raw` from `account` unless it names an account itself — the
+    /// `op_account` of the service that uses it.
+    pub fn assign(&mut self, raw: &str, account: &str) {
+        self.targets
+            .insert(raw.trim().to_string(), account.trim().to_string());
+    }
+
+    /// The account `raw` is read from, or `None` for "whichever `op` defaults
+    /// to" — and always `None` for anything that is not an `op://` reference.
+    pub fn account_for(&self, raw: &str) -> Option<String> {
+        match SecretRef::parse(raw) {
+            Ok(SecretRef::OnePassword {
+                account: Some(account),
+                ..
+            }) => Some(account),
+            Ok(SecretRef::OnePassword { account: None, .. }) => self
+                .targets
+                .get(raw.trim())
+                .or(self.default.as_ref())
+                .cloned(),
+            _ => None,
+        }
+    }
+}
+
+/// The account, said the way an error says it. Empty for the default one,
+/// so a policy that never names an account reads exactly as it always did.
+fn in_account(account: Option<&str>) -> String {
+    match account {
+        Some(account) => format!(" for 1Password account `{account}`"),
+        None => String::new(),
+    }
+}
+
+/// `--account <account>` for `op`, or nothing.
+fn account_args(account: Option<&str>) -> Vec<&str> {
+    match account {
+        Some(account) => vec!["--account", account],
+        None => vec![],
+    }
+}
+
 fn redact_for_error(raw: &str) -> String {
     // Never echo a possible credential back into logs or error strings.
     match raw.split_once(':') {
@@ -150,6 +284,10 @@ fn redact_for_error(raw: &str) -> String {
 pub struct SecretResolver {
     cache: Mutex<HashMap<String, Secret>>,
     op_bin: String,
+    /// Which 1Password account each `op://` reference is read from. Swapped
+    /// on reload, which is why it is behind a lock rather than fixed at
+    /// construction.
+    accounts: RwLock<OpAccounts>,
     /// Where `iap://` references are read from. Defaults to the store this
     /// machine uses, so every existing caller gets one without being changed —
     /// the path is only named by a test, which must not read the operator's.
@@ -199,6 +337,17 @@ fn spawn_op(command: &mut Command) -> std::io::Result<std::process::Child> {
 /// and the rest of the list says why it is a list of one.
 const NOT_ASKED_AGAIN: &str = "not read — 1Password refused this read and was not asked again";
 
+/// The same, naming the account that refused. "Not signed in" is about one
+/// account now, and a policy reading from two needs to know which.
+fn not_asked_again(account: Option<&str>) -> String {
+    match account {
+        Some(account) => format!(
+            "not read — 1Password account `{account}` refused this read and was not asked again"
+        ),
+        None => NOT_ASKED_AGAIN.to_string(),
+    }
+}
+
 /// Did 1Password decline to answer *at all*, as opposed to answering about a
 /// reference?
 ///
@@ -234,7 +383,46 @@ impl SecretResolver {
         SecretResolver {
             cache: Mutex::new(HashMap::new()),
             op_bin: op_bin.into(),
+            accounts: RwLock::new(OpAccounts::default()),
             store: crate::store::Store::at(crate::store::Store::default_path()),
+        }
+    }
+
+    /// The resolver a policy file describes: its `op` binary, its store, and
+    /// the 1Password account each of its references is read from.
+    pub fn for_config(config: &crate::config::Config) -> Self {
+        SecretResolver::new(config.server.op_binary.clone())
+            .with_store(config.server.secret_store_path())
+            .with_op_accounts(config.op_accounts())
+    }
+
+    /// Read `op://` references from the accounts `accounts` names.
+    pub fn with_op_accounts(self, accounts: OpAccounts) -> Self {
+        *self.accounts.write() = accounts;
+        self
+    }
+
+    /// Point this resolver at a reloaded policy's accounts, and hand back the
+    /// ones it had, so a reload that is refused can put them back.
+    pub fn set_op_accounts(&self, accounts: OpAccounts) -> OpAccounts {
+        std::mem::replace(&mut *self.accounts.write(), accounts)
+    }
+
+    /// The 1Password account `raw` is read from, if it is an `op://`
+    /// reference read from anything but `op`'s default.
+    pub fn op_account(&self, raw: &str) -> Option<String> {
+        self.accounts.read().account_for(raw)
+    }
+
+    /// What a value is cached under: the reference, and for one read from a
+    /// named account, the account too. A reload that moves a reference to
+    /// another account must not be answered with the value the old account
+    /// gave — the spelling in the file did not change, but the credential
+    /// behind it did.
+    fn key(&self, raw: &str) -> String {
+        match self.op_account(raw) {
+            Some(account) => format!("{raw}\u{0}{account}"),
+            None => raw.to_string(),
         }
     }
 
@@ -252,7 +440,8 @@ impl SecretResolver {
 
     /// Seed the cache directly. Used by tests and by `--standalone` bootstrapping.
     pub fn preset(&self, raw: &str, value: Secret) {
-        self.cache.lock().insert(raw.to_string(), value);
+        let key = self.key(raw);
+        self.cache.lock().insert(key, value);
     }
 
     /// Re-read a reference from its source and replace the cached value with
@@ -273,7 +462,8 @@ impl SecretResolver {
     /// refuses does not also evict a credential the proxy is still serving.
     pub fn refresh(&self, raw: &str) -> Result<Secret> {
         let secret = self.read(raw)?;
-        self.cache.lock().insert(raw.to_string(), secret.clone());
+        let key = self.key(raw);
+        self.cache.lock().insert(key, secret.clone());
         Ok(secret)
     }
 
@@ -397,12 +587,47 @@ impl SecretResolver {
     ///   cause, and "which of your eight is the broken one" is not a question a
     ///   policy file should have to be bisected to answer. Sequential, and it
     ///   stops at the first refusal, for the reason above.
+    ///
+    /// A policy reading from more than one 1Password account is one batch per
+    /// account: `op` reads from one account per process, and `--account` is
+    /// how it is told which. The accounts are asked one after another, in the
+    /// order the file first names them, and a refusal stops the account that
+    /// refused — being signed out of one account says nothing about another.
     fn read_onepassword_pass(
         &self,
         references: &[String],
         fresh: bool,
     ) -> HashMap<String, Result<(), String>> {
         let wanted = self.onepassword_wanted(references, fresh);
+        let mut answers = HashMap::new();
+        for (account, group) in self.by_account(&wanted) {
+            answers.extend(self.read_onepassword_account(&group, account.as_deref()));
+        }
+        answers
+    }
+
+    /// `references` split by the 1Password account each is read from, the
+    /// accounts in the order they first appear and the references in theirs.
+    fn by_account<'a>(&self, references: &[&'a str]) -> Vec<(Option<String>, Vec<&'a str>)> {
+        let accounts = self.accounts.read();
+        let mut groups: Vec<(Option<String>, Vec<&'a str>)> = Vec::new();
+        for raw in references {
+            let account = accounts.account_for(raw);
+            match groups.iter_mut().find(|(group, _)| *group == account) {
+                Some((_, group)) => group.push(raw),
+                None => groups.push((account, vec![raw])),
+            }
+        }
+        groups
+    }
+
+    /// One account's share of a pass: one `op inject` if it can be, one `op
+    /// read` each if it cannot, and nothing more once that account refused.
+    fn read_onepassword_account(
+        &self,
+        wanted: &[&str],
+        account: Option<&str>,
+    ) -> HashMap<String, Result<(), String>> {
         let mut answers = HashMap::new();
         if wanted.is_empty() {
             return answers;
@@ -411,10 +636,11 @@ impl SecretResolver {
         // One reference is already one process, and `op read` says more about
         // it than `op inject` would.
         if wanted.len() > 1 {
-            match self.read_onepassword_together(&wanted) {
+            match self.read_onepassword_together(wanted, account) {
                 Ok(values) => {
+                    let keys: Vec<String> = wanted.iter().map(|raw| self.key(raw)).collect();
                     let mut cache = self.cache.lock();
-                    for (raw, value) in wanted.iter().zip(values) {
+                    for ((raw, key), value) in wanted.iter().zip(keys).zip(values) {
                         // The one answer `op read` calls an error rather than a
                         // value, kept an error here.
                         if value.expose().is_empty() {
@@ -424,7 +650,7 @@ impl SecretResolver {
                             );
                             continue;
                         }
-                        cache.insert((*raw).to_string(), value);
+                        cache.insert(key, value);
                         answers.insert((*raw).to_string(), Ok(()));
                     }
                     return answers;
@@ -435,6 +661,7 @@ impl SecretResolver {
                         tracing::warn!(
                             %error,
                             references = wanted.len(),
+                            account = account.unwrap_or("(default)"),
                             "1Password would not authorize this read; not asking again for it"
                         );
                         // The reason once, on the first line, and the rest
@@ -444,7 +671,7 @@ impl SecretResolver {
                         for (at, raw) in wanted.iter().enumerate() {
                             let answer = match at {
                                 0 => error.clone(),
-                                _ => NOT_ASKED_AGAIN.to_string(),
+                                _ => not_asked_again(account),
                             };
                             answers.insert((*raw).to_string(), Err(answer));
                         }
@@ -458,6 +685,7 @@ impl SecretResolver {
                     tracing::warn!(
                         %error,
                         references = wanted.len(),
+                        account = account.unwrap_or("(default)"),
                         "could not read the 1Password references together; \
                          falling back to one `op read` each"
                     );
@@ -466,14 +694,15 @@ impl SecretResolver {
         }
 
         let mut refused: Option<String> = None;
-        for raw in &wanted {
+        for raw in wanted {
             if refused.is_some() {
-                answers.insert((*raw).to_string(), Err(NOT_ASKED_AGAIN.to_string()));
+                answers.insert((*raw).to_string(), Err(not_asked_again(account)));
                 continue;
             }
             match self.read(raw) {
                 Ok(value) => {
-                    self.cache.lock().insert((*raw).to_string(), value);
+                    let key = self.key(raw);
+                    self.cache.lock().insert(key, value);
                     answers.insert((*raw).to_string(), Ok(()));
                 }
                 Err(error) => {
@@ -494,16 +723,15 @@ impl SecretResolver {
     /// question — and in the order the file named them, which is the order the
     /// failures come back in.
     fn onepassword_wanted<'a>(&self, references: &'a [String], fresh: bool) -> Vec<&'a str> {
-        let cache = self.cache.lock();
         let mut seen = HashSet::new();
         let mut wanted = Vec::new();
         for raw in references {
-            if !matches!(SecretRef::parse(raw), Ok(SecretRef::OnePassword(_))) {
+            if !matches!(SecretRef::parse(raw), Ok(SecretRef::OnePassword { .. })) {
                 continue;
             }
             // Cache-first means this one is not going near `op`, so it is not
             // part of the question being asked.
-            if !fresh && cache.contains_key(raw.as_str()) {
+            if !fresh && self.cache.lock().contains_key(&self.key(raw)) {
                 continue;
             }
             if seen.insert(raw.as_str()) {
@@ -524,26 +752,41 @@ impl SecretResolver {
     /// not a thing that happens. Anything unexpected in the shape of the answer
     /// is an error rather than a guess: a mis-split here would hand one
     /// service's credential to another.
-    fn read_onepassword_together(&self, references: &[&str]) -> Result<Vec<Secret>> {
+    fn read_onepassword_together(
+        &self,
+        references: &[&str],
+        account: Option<&str>,
+    ) -> Result<Vec<Secret>> {
         use std::io::Write;
 
         let marker = format!("--{}--", uuid::Uuid::new_v4().simple());
         let template = references
             .iter()
-            // The trimmed reference, for the same reason `read` uses it: the
-            // whitespace around one is a typo, not part of the field's name.
-            .map(|raw| format!("{{{{ {} }}}}", raw.trim()))
-            .collect::<Vec<_>>()
+            // The reference as `op` knows it: trimmed, for the same reason
+            // `read` trims it — the whitespace around one is a typo, not part
+            // of the field's name — and without the `?account=` that is this
+            // process's business, which `--account` carries instead.
+            .map(|raw| match SecretRef::parse(raw) {
+                Ok(SecretRef::OnePassword { reference, .. }) => {
+                    Ok(format!("{{{{ {reference} }}}}"))
+                }
+                _ => Err(anyhow::anyhow!(
+                    "`{}` is not a 1Password reference",
+                    display_ref(raw)
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?
             .join(&marker);
 
         let mut child = spawn_op(
             Command::new(&self.op_bin)
                 .arg("inject")
+                .args(account_args(account))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped()),
         )
-        .with_context(|| format!("running `{} inject`", self.op_bin))?;
+        .with_context(|| format!("running `{} inject`{}", self.op_bin, in_account(account)))?;
         let mut stdin = child
             .stdin
             .take()
@@ -564,7 +807,12 @@ impl SecretResolver {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("`op inject` failed ({}): {}", output.status, stderr.trim());
+            bail!(
+                "`op inject` failed{} ({}): {}",
+                in_account(account),
+                output.status,
+                stderr.trim()
+            );
         }
         // A process that says it succeeded on a template it did not get is a
         // different problem, and this is where it surfaces.
@@ -596,11 +844,12 @@ impl SecretResolver {
     /// Resolve a raw reference string, returning a cached value when there is
     /// one. Blocking: 1Password shells out to `op`.
     pub fn resolve(&self, raw: &str) -> Result<Secret> {
-        if let Some(hit) = self.cache.lock().get(raw) {
+        let key = self.key(raw);
+        if let Some(hit) = self.cache.lock().get(&key) {
             return Ok(hit.clone());
         }
         let secret = self.read(raw)?;
-        self.cache.lock().insert(raw.to_string(), secret.clone());
+        self.cache.lock().insert(key, secret.clone());
         Ok(secret)
     }
 
@@ -619,16 +868,19 @@ impl SecretResolver {
                     .with_context(|| format!("reading secret file `{}`", path.display()))?;
                 Secret::new(value.trim_end_matches(['\n', '\r']).to_string())
             }
-            SecretRef::OnePassword(reference) => self.resolve_onepassword(&reference)?,
+            SecretRef::OnePassword { reference, .. } => {
+                self.resolve_onepassword(&reference, self.op_account(raw).as_deref())?
+            }
             SecretRef::Managed(name) => self.store.get(&name)?,
             SecretRef::Literal(value) => Secret::new(value),
         })
     }
 
-    fn resolve_onepassword(&self, reference: &str) -> Result<Secret> {
+    fn resolve_onepassword(&self, reference: &str, account: Option<&str>) -> Result<Secret> {
         let child = spawn_op(
             Command::new(&self.op_bin)
                 .args(["read", "--no-newline", reference])
+                .args(account_args(account))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped()),
@@ -646,7 +898,8 @@ impl SecretResolver {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
-                "`op read {reference}` failed ({}): {}",
+                "`op read {reference}` failed{} ({}): {}",
+                in_account(account),
                 output.status,
                 stderr.trim()
             );
@@ -658,7 +911,10 @@ impl SecretResolver {
             .to_string();
 
         if value.is_empty() {
-            bail!("`op read {reference}` returned an empty value");
+            bail!(
+                "`op read {reference}` returned an empty value{}",
+                in_account(account)
+            );
         }
         Ok(Secret::new(value))
     }
@@ -667,6 +923,13 @@ impl SecretResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_password(reference: &str) -> SecretRef {
+        SecretRef::OnePassword {
+            reference: reference.into(),
+            account: None,
+        }
+    }
 
     #[test]
     fn parses_every_supported_scheme() {
@@ -680,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             SecretRef::parse("op://Private/Anthropic/credential").unwrap(),
-            SecretRef::OnePassword("op://Private/Anthropic/credential".into())
+            one_password("op://Private/Anthropic/credential")
         );
         assert_eq!(
             SecretRef::parse("literal:hunter2").unwrap(),
@@ -699,11 +962,7 @@ mod tests {
             // vault / item / section / field, the four-segment form
             "op://development/aws/Access Keys/access_key_id",
         ] {
-            assert_eq!(
-                SecretRef::parse(raw).unwrap(),
-                SecretRef::OnePassword(raw.into()),
-                "`{raw}`"
-            );
+            assert_eq!(SecretRef::parse(raw).unwrap(), one_password(raw), "`{raw}`");
             assert_eq!(display_ref(raw), raw);
         }
     }
@@ -722,7 +981,7 @@ mod tests {
         ] {
             assert_eq!(
                 SecretRef::parse(raw).unwrap(),
-                SecretRef::OnePassword(wanted.into()),
+                one_password(wanted),
                 "`{raw}`"
             );
             assert_eq!(display_ref(raw), wanted, "`{raw}`");
@@ -1337,6 +1596,241 @@ mod tests {
             resolver.resolve(&reference).unwrap().expose(),
             "v1",
             "a failed refresh leaves the last good value in place"
+        );
+    }
+
+    #[test]
+    fn the_account_is_taken_off_a_reference_and_every_other_parameter_kept() {
+        for (raw, reference, account) in [
+            (
+                "op://Private/GitHub/token",
+                "op://Private/GitHub/token",
+                None,
+            ),
+            (
+                "op://Private/GitHub/token?account=my.1password.com",
+                "op://Private/GitHub/token",
+                Some("my.1password.com"),
+            ),
+            // 1Password's own parameters change what `op` returns, so they
+            // reach it — in the order they were written.
+            (
+                "op://Private/GitHub/one-time password?attribute=otp",
+                "op://Private/GitHub/one-time password?attribute=otp",
+                None,
+            ),
+            (
+                "op://Private/Deploy key/private key?account=ABCDEF123&ssh-format=openssh",
+                "op://Private/Deploy key/private key?ssh-format=openssh",
+                Some("ABCDEF123"),
+            ),
+            (
+                " op://Private/GitHub/token?attribute=otp&account=my.1password.com ",
+                "op://Private/GitHub/token?attribute=otp",
+                Some("my.1password.com"),
+            ),
+        ] {
+            assert_eq!(
+                SecretRef::parse(raw).unwrap(),
+                SecretRef::OnePassword {
+                    reference: reference.into(),
+                    account: account.map(str::to_string),
+                },
+                "`{raw}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_parameter_that_names_no_single_account_is_refused() {
+        for raw in [
+            "op://Private/GitHub/token?account=",
+            "op://Private/GitHub/token?account",
+            "op://Private/GitHub/token?account=a.1password.com&account=b.1password.com",
+        ] {
+            assert!(SecretRef::parse(raw).is_err(), "`{raw}`");
+        }
+    }
+
+    #[test]
+    fn the_reference_names_its_account_over_the_policy_and_the_policy_over_the_default() {
+        let mut accounts = OpAccounts::new(Some("default.1password.com".into()));
+        accounts.assign("op://Private/GitHub/token", "my.1password.com");
+        accounts.assign(
+            "op://Ops/Pinned/token?account=ops.1password.com",
+            "my.1password.com",
+        );
+
+        assert_eq!(
+            accounts
+                .account_for(" op://Private/GitHub/token ")
+                .as_deref(),
+            Some("my.1password.com")
+        );
+        assert_eq!(
+            accounts
+                .account_for("op://Ops/Pinned/token?account=ops.1password.com")
+                .as_deref(),
+            Some("ops.1password.com")
+        );
+        assert_eq!(
+            accounts.account_for("op://Work/API/token").as_deref(),
+            Some("default.1password.com")
+        );
+        assert_eq!(accounts.account_for("env:HOME"), None);
+        assert_eq!(
+            OpAccounts::new(None).account_for("op://Work/API/token"),
+            None
+        );
+    }
+
+    /// A stand-in `op` that writes down its whole command line, and answers
+    /// with the account it was told to read from — so a value read from the
+    /// wrong account is visibly the wrong value.
+    #[cfg(unix)]
+    fn account_aware_op(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let op = dir.join("op");
+        let calls = dir.join("op-calls");
+        std::fs::write(
+            &op,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> {calls}\n\
+                 account=default\n\
+                 command=$1; shift\n\
+                 reference=\n\
+                 while [ $# -gt 0 ]; do\n\
+                   case \"$1\" in\n\
+                   --account) account=$2; shift 2 ;;\n\
+                   --no-newline) shift ;;\n\
+                   *) reference=$1; shift ;;\n\
+                   esac\n\
+                 done\n\
+                 case \"$account\" in\n\
+                 locked.example.com) echo '[ERROR] account is not signed in' >&2; exit 1 ;;\n\
+                 esac\n\
+                 case \"$command\" in\n\
+                 read) printf '%s@%s' \"$reference\" \"$account\" ;;\n\
+                 inject) sed -E \"s/\\{{\\{{ ([^}}]*) \\}}\\}}/\\1@$account/g\" ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+                calls = calls.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (op, calls)
+    }
+
+    /// The report: most credentials in the company account, one in a personal
+    /// one. One pass is one `op inject` per account, each told which, and every
+    /// value comes back from the account it was meant to.
+    #[cfg(unix)]
+    #[test]
+    fn references_in_two_accounts_are_one_batch_per_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (op, calls) = account_aware_op(dir.path());
+        let mut accounts = OpAccounts::new(None);
+        accounts.assign("op://Private/Pinned/token", "my.1password.com");
+        let resolver = SecretResolver::new(op.to_str().unwrap()).with_op_accounts(accounts);
+
+        let references: Vec<String> = [
+            "op://Work/one/token",
+            "op://Private/GitHub classic/token?account=my.1password.com",
+            "op://Work/two/token",
+            "op://Private/Pinned/token",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let answers = resolver.refresh_all(&references);
+        assert!(answers.iter().all(Result::is_ok), "{answers:?}");
+
+        assert_eq!(
+            invocations(&calls),
+            vec!["inject", "inject --account my.1password.com"],
+            "one process per account, in the order the file first names them"
+        );
+        for (raw, wanted) in [
+            (&references[0], "op://Work/one/token@default"),
+            (
+                &references[1],
+                "op://Private/GitHub classic/token@my.1password.com",
+            ),
+            (&references[2], "op://Work/two/token@default"),
+            (&references[3], "op://Private/Pinned/token@my.1password.com"),
+        ] {
+            assert_eq!(resolver.resolve(raw).unwrap().expose(), wanted, "`{raw}`");
+        }
+
+        // One reference alone is `op read`, told its account the same way.
+        let single = "op://Private/Other/token?account=my.1password.com";
+        assert_eq!(
+            resolver.resolve(single).unwrap().expose(),
+            "op://Private/Other/token@my.1password.com"
+        );
+        assert_eq!(
+            invocations(&calls).last().map(String::as_str),
+            Some("read --no-newline op://Private/Other/token --account my.1password.com")
+        );
+    }
+
+    /// Being signed out of one account says nothing about another: the
+    /// account that refused is named, and is the only one that stops.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_names_its_account_and_stops_only_that_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (op, calls) = account_aware_op(dir.path());
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+
+        let references: Vec<String> = [
+            "op://Work/one/token",
+            "op://Private/a/token?account=locked.example.com",
+            "op://Work/two/token",
+            "op://Private/b/token?account=locked.example.com",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let answers = resolver.refresh_all(&references);
+
+        assert!(answers[0].is_ok(), "{:?}", answers[0]);
+        assert!(answers[2].is_ok(), "{:?}", answers[2]);
+        let first = answers[1].as_ref().unwrap_err();
+        assert!(first.contains("`locked.example.com`"), "{first}");
+        assert!(is_authorization_failure(first), "{first}");
+        assert_eq!(
+            answers[3].as_ref().unwrap_err(),
+            &not_asked_again(Some("locked.example.com"))
+        );
+        assert_eq!(
+            invocations(&calls),
+            vec!["inject", "inject --account locked.example.com"],
+            "the refusing account was asked once, and nothing was retried one by one"
+        );
+    }
+
+    /// A reload that moves a reference to another account is a different
+    /// credential under the same spelling, and must not be served the value
+    /// the old account gave.
+    #[cfg(unix)]
+    #[test]
+    fn a_value_is_cached_per_account_not_only_per_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (op, _) = account_aware_op(dir.path());
+        let resolver = SecretResolver::new(op.to_str().unwrap());
+        let raw = "op://Private/GitHub/token";
+        assert_eq!(
+            resolver.resolve(raw).unwrap().expose(),
+            "op://Private/GitHub/token@default"
+        );
+
+        let mut accounts = OpAccounts::new(None);
+        accounts.assign(raw, "my.1password.com");
+        resolver.set_op_accounts(accounts);
+        assert_eq!(
+            resolver.resolve(raw).unwrap().expose(),
+            "op://Private/GitHub/token@my.1password.com"
         );
     }
 }

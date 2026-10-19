@@ -49,7 +49,10 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
     } else {
         reachable
             .iter()
-            .map(|upstream| format!("`{}`", upstream.name))
+            .map(|reachable| match reachable.access.note() {
+                Some(note) => format!("`{}` ({note})", reachable.upstream.name),
+                None => format!("`{}`", reachable.upstream.name),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -58,7 +61,9 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
         "agent-iap is an identity-aware proxy. Call third-party APIs through \
          `iap_request` instead of over the network directly: it holds the \
          credentials, so you never need one and should never ask for one.\n\n\
-         Reachable from here: {names}.\n\n\
+         Reachable from here when this session started: {names}. The policy \
+         can change while you run, so `iap_catalog` is the current list — \
+         check it again before concluding something is out of reach.\n\n\
          Two things change how you should behave:\n\n\
          1. Every call is checked against a policy and written to an audit log. \
          A refusal comes back as a tool error naming the rule that refused it. \
@@ -83,8 +88,8 @@ pub fn instructions(state: &AppState, agent: &AgentConfig) -> String {
 /// Every skill this agent may read, overview first.
 pub fn catalog(state: &AppState, agent: &AgentConfig) -> Vec<Skill> {
     let mut skills = vec![overview(state, agent)];
-    for upstream in reachable_upstreams(state, agent) {
-        skills.push(upstream_skill(state, agent, &upstream.name));
+    for reachable in reachable_upstreams(state, agent) {
+        skills.push(upstream_skill(state, agent, &reachable.upstream.name));
     }
     skills
 }
@@ -99,22 +104,85 @@ pub fn find(state: &AppState, agent: &AgentConfig, wanted: &str) -> Option<Skill
         .find(|skill| skill.name == short)
 }
 
-/// The upstreams this agent could reach, in policy-file order.
+/// How calls to one reachable upstream are decided, as far as an agent needs
+/// to know before making one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// At least one rule can name this agent and this upstream, so the rules
+    /// decide — and the upstream's skill lists them.
+    Rules,
+    /// No rule names it, and the default is `ask`: every call stops on a human
+    /// and goes through if they approve it.
+    Ask,
+    /// No rule names it, and the default is `allow`.
+    Allow,
+}
+
+impl Access {
+    /// The word the catalog's structured entry carries.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Access::Rules => "rules",
+            Access::Ask => "ask",
+            Access::Allow => "allow",
+        }
+    }
+
+    /// A short clause for prose that lists upstreams, or `None` when the rules
+    /// decide and the upstream's skill already says how.
+    pub(crate) fn note(self) -> Option<&'static str> {
+        match self {
+            Access::Rules => None,
+            Access::Ask => Some("calls stop for approval"),
+            Access::Allow => Some("allowed by the policy's default"),
+        }
+    }
+}
+
+/// One upstream this agent could reach, and how calls to it are decided.
+#[derive(Debug, Clone)]
+pub(crate) struct Reachable {
+    pub upstream: crate::config::UpstreamConfig,
+    pub access: Access,
+}
+
+/// How calls from this agent to this upstream are decided, or `None` when they
+/// cannot succeed at all.
 ///
-/// "Could" is the `targets` list plus the existence of a rule that can name the
-/// target. A target no rule ever mentions falls through to a default that
-/// denies, so listing it would advertise a call that cannot succeed.
-pub(crate) fn reachable_upstreams(
-    state: &AppState,
-    agent: &AgentConfig,
-) -> Vec<crate::config::UpstreamConfig> {
+/// The `targets` grant comes first: an upstream outside it is refused before
+/// the ACL is asked. Inside it, a rule that names the target means the rules
+/// decide. A target no rule names falls through to `[acl_default]` on every
+/// call — which refuses under `deny`, but under `ask` holds the call for a
+/// human and under `allow` lets it through. Only the first is unreachable;
+/// leaving the other two out would tell an agent nothing is there while
+/// `iap_request` to it succeeds.
+pub(crate) fn access_for(state: &AppState, agent: &AgentConfig, upstream: &str) -> Option<Access> {
+    if !crate::identity::agent_may_address(agent, upstream) {
+        return None;
+    }
+    if state.acl.rules_for(&agent.id, Kind::Http, upstream) > 0 {
+        return Some(Access::Rules);
+    }
+    match state.acl.default_action() {
+        Action::Deny => None,
+        Action::Ask => Some(Access::Ask),
+        Action::Allow => Some(Access::Allow),
+    }
+}
+
+/// The upstreams this agent could reach, in policy-file order. See
+/// [`access_for`] for what "could" means.
+pub(crate) fn reachable_upstreams(state: &AppState, agent: &AgentConfig) -> Vec<Reachable> {
     state
         .config()
         .upstreams
         .iter()
-        .filter(|upstream| crate::identity::agent_may_address(agent, &upstream.name))
-        .filter(|upstream| state.acl.rules_for(&agent.id, Kind::Http, &upstream.name) > 0)
-        .cloned()
+        .filter_map(|upstream| {
+            access_for(state, agent, &upstream.name).map(|access| Reachable {
+                upstream: upstream.clone(),
+                access,
+            })
+        })
         .collect()
 }
 
@@ -141,6 +209,13 @@ fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
          You get the upstream's status code, its headers and its body. A `4xx` \
          from the upstream is the upstream's answer, and it comes back as a \
          normal result — it is not the proxy refusing you.\n\n\
+         A textual body (JSON, XML, `text/*`, …) arrives as `body`. Anything \
+         else — an archive, an image, a PDF, bytes that are not UTF-8 — arrives \
+         base64-encoded as `body_base64` instead, and there is no `body`. Decode \
+         it to get the exact bytes; never treat it as text. Pass \
+         `\"response_encoding\": \"base64\"` to get `body_base64` whatever the \
+         content type. A body larger than the proxy's limit is cut at that many \
+         bytes and the result says `truncated`.\n\n\
          ## When you are refused\n\n\
          A refusal is a tool error whose message names the rule. The codes:\n\n\
          - `policy_denied` — the ACL says no. Final. The rule name is in the \
@@ -174,14 +249,20 @@ fn overview(state: &AppState, agent: &AgentConfig) -> Skill {
     text.push_str("\n\n## What you can reach\n\n");
     if upstreams.is_empty() {
         text.push_str(
-            "Nothing. No upstream in this policy is both granted to this agent \
-             and named by a rule. `iap_request` will refuse every call until an \
-             operator changes that.",
+            "Nothing. No upstream in this policy is granted to this agent with a \
+             rule or a default that could let a call through. `iap_request` will \
+             refuse every call until an operator changes that.",
         );
     } else {
-        for upstream in &upstreams {
+        for reachable in &upstreams {
+            let upstream = &reachable.upstream;
+            let note = reachable
+                .access
+                .note()
+                .map(|note| format!("; {note}"))
+                .unwrap_or_default();
             text.push_str(&format!(
-                "- `{}` — {} (`{}`)\n",
+                "- `{}` — {} (`{}`{note})\n",
                 upstream.name,
                 upstream.base_url,
                 skill_name_for(&upstream.name)
@@ -229,6 +310,22 @@ fn upstream_skill(state: &AppState, agent: &AgentConfig, name: &str) -> Skill {
             }
         }
         None => text.push_str("This upstream is no longer in the policy file.\n\n"),
+    }
+
+    // Said before the table, because the table's "None" reads as a dead end
+    // and under an `ask` default it is the opposite.
+    match access_for(state, agent, name) {
+        Some(Access::Ask) => text.push_str(
+            "Access: no rule names this upstream for you, so every call falls \
+             through to the default, which is `ask` — calls stop for approval by \
+             a human, and go through if they allow it. If the operator turns an \
+             approval into a standing rule, it will be listed below.\n\n",
+        ),
+        Some(Access::Allow) => text.push_str(
+            "Access: no rule names this upstream for you, so every call falls \
+             through to the default, which is `allow`.\n\n",
+        ),
+        Some(Access::Rules) | None => {}
     }
 
     text.push_str(&rules_table(state, agent, name, "##"));
@@ -286,7 +383,10 @@ pub(crate) fn rules_table(
             "None. Every call to this upstream falls through to the default, \
              which is ",
         );
-        text.push_str(&format!("`{}`.\n", state.acl.default_action()));
+        text.push_str(&match state.acl.default_action() {
+            Action::Ask => "`ask` — calls stop for approval.\n".to_string(),
+            other => format!("`{other}`.\n"),
+        });
         return text;
     }
 
@@ -325,8 +425,18 @@ mod tests {
     use std::sync::Arc;
 
     fn state() -> Arc<AppState> {
+        state_with_default("deny")
+    }
+
+    /// The same policy under a different `[acl_default]`, which is the whole
+    /// difference between a granted-but-unnamed upstream being unreachable and
+    /// being one approval away.
+    fn state_with_default(default: &str) -> Arc<AppState> {
         let config: Config = toml::from_str(&format!(
             r#"
+[acl_default]
+action = "{default}"
+
 [audit]
 path = "/dev/null"
 stderr = false
@@ -395,16 +505,106 @@ action = "allow"
     }
 
     #[test]
-    fn an_upstream_no_rule_mentions_is_not_advertised() {
+    fn an_upstream_no_rule_mentions_is_not_advertised_under_a_deny_default() {
         // `grounded` has no `targets` list, so it may address anything — but
-        // `unmentioned` falls through to a default that denies. Documenting it
-        // would be documenting a call that cannot succeed.
+        // `unmentioned` falls through to this policy's default, which denies.
+        // Documenting it would be documenting a call that cannot succeed.
         let state = state();
         let names: Vec<String> = catalog(&state, &agent(&state, "grounded"))
             .into_iter()
             .map(|skill| skill.name)
             .collect();
         assert_eq!(names, ["using-this-gateway", "upstream/anthropic"]);
+    }
+
+    fn reachable(state: &AppState, id: &str) -> Vec<(String, Access)> {
+        reachable_upstreams(state, &agent(state, id))
+            .into_iter()
+            .map(|reachable| (reachable.upstream.name, reachable.access))
+            .collect()
+    }
+
+    #[test]
+    fn a_granted_upstream_no_rule_names_is_dropped_only_when_the_default_denies() {
+        let deny = state_with_default("deny");
+        assert_eq!(
+            reachable(&deny, "grounded"),
+            [("anthropic".to_string(), Access::Rules)]
+        );
+
+        // The reported bug: under `ask` a call to `unmentioned` stops on a
+        // human and goes through if approved, so leaving it out told the agent
+        // nothing was there while `iap_request` to it succeeded.
+        let ask = state_with_default("ask");
+        assert_eq!(
+            reachable(&ask, "grounded"),
+            [
+                ("anthropic".to_string(), Access::Rules),
+                ("unmentioned".to_string(), Access::Ask),
+            ]
+        );
+
+        let allow = state_with_default("allow");
+        assert_eq!(
+            reachable(&allow, "grounded"),
+            [
+                ("anthropic".to_string(), Access::Rules),
+                ("unmentioned".to_string(), Access::Allow),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_permissive_default_never_reaches_past_the_targets_grant() {
+        // `claude` is granted `anthropic` only. The default decides calls the
+        // rules do not, but a target outside the grant is refused before the
+        // ACL is asked anything, so no default can make it reachable.
+        for default in ["deny", "ask", "allow"] {
+            let state = state_with_default(default);
+            assert_eq!(
+                reachable(&state, "claude"),
+                [("anthropic".to_string(), Access::Rules)],
+                "under `{default}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upstream_reached_through_an_ask_default_says_calls_stop_for_approval() {
+        let state = state_with_default("ask");
+        let agent = agent(&state, "grounded");
+
+        let text = instructions(&state, &agent);
+        assert!(
+            text.contains("`unmentioned` (calls stop for approval)"),
+            "{text}"
+        );
+        // A rule-governed upstream needs no such note; its skill has the rules.
+        assert!(text.contains("`anthropic`, "), "{text}");
+
+        let overview = find(&state, &agent, "using-this-gateway").unwrap();
+        assert!(
+            overview.text.contains("calls stop for approval"),
+            "{}",
+            overview.text
+        );
+
+        let skill = find(&state, &agent, "upstream/unmentioned").unwrap();
+        assert!(
+            skill.text.contains("calls stop for approval"),
+            "{}",
+            skill.text
+        );
+        assert!(skill.text.contains("which is `ask`"), "{}", skill.text);
+    }
+
+    #[test]
+    fn the_instructions_point_at_the_catalog_for_the_current_list() {
+        // Instructions are read once, at `initialize`, and a client may keep
+        // them for the whole session. They must not read as the last word.
+        let state = state();
+        let text = instructions(&state, &agent(&state, "claude"));
+        assert!(text.contains("`iap_catalog` is the current list"), "{text}");
     }
 
     #[test]
@@ -462,7 +662,8 @@ action = "allow"
     fn an_agent_that_can_reach_nothing_is_told_so_plainly() {
         let state = state();
         // A policy-file agent with a `targets` list naming an upstream that no
-        // rule covers: the honest answer is "nothing", not an empty list.
+        // rule covers, under a default that denies: the honest answer is
+        // "nothing", not an empty list.
         let mut config = (*state.config().agent("claude").unwrap()).clone();
         config.id = "walled".into();
         config.targets = vec!["unmentioned".into()];

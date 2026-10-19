@@ -281,6 +281,47 @@ error still names the line of the file to fix rather than leaving you to bisect
 the policy. That fallback is logged at `warn`, because the visible consequence
 of it is more dialogues. It stops at the first refusal too.
 
+### More than one 1Password account
+
+By default every `op://` reference is read from whichever account `op` picks on
+its own — nothing is passed to it, exactly as before. A policy that needs a
+second account says which references live there, most precise first:
+
+```toml
+[secrets]
+op_account = "company.1password.com"   # every reference nothing below names
+
+[[upstreams]]
+name = "github-public"
+base_url = "https://api.github.com"
+op_account = "my.1password.com"         # this upstream's references (also on [[mcp_servers]])
+auth = { type = "bearer", secret = "op://Private/GitHub classic/token" }
+
+[[upstreams]]
+name = "pinned"
+base_url = "https://api.example.com"
+# The reference's own `?account=` beats both.
+auth = { type = "bearer", secret = "op://Ops/Pinned/token?account=ops.1password.com" }
+```
+
+An account is whatever `op --account` takes: the sign-in address, the account
+ID or the user ID (`op account list` shows all three). `?account=` is
+agent-iap's and is taken off before the reference reaches `op`, which is told
+`--account` instead; 1Password's own parameters — `?attribute=otp`,
+`?ssh-format=openssh` — are passed through untouched, alongside it or not.
+
+The batching above is per account: a read that needs two accounts is two `op`
+invocations, one `--account` each, in the order the file first names them. A
+refusal names the account that refused and stops that account's reads only —
+being signed out of one says nothing about the other.
+
+One reference is one credential, so the same `op://…` spelling read from two
+accounts by two services is refused when the file loads; put `?account=` on
+each to say which one each means. `agent-iap check` names the account each
+reference is read from, and once a policy names any account, prints one
+`1password` line per account saying whether it answered. `secret import` reads
+each reference from its own account in the same way.
+
 ### Getting off the vault entirely
 
 Batching makes each *process* one dialogue. It cannot make them none, because a

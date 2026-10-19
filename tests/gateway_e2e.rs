@@ -9,7 +9,7 @@
 use agent_iap::config::Config;
 use agent_iap::state::AppState;
 use axum::extract::Request;
-use axum::routing::any;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -17,6 +17,13 @@ use std::sync::Arc;
 
 const AGENT_TOKEN: &str = "iap_agent_token";
 const UPSTREAM_KEY: &str = "sk-upstream-real";
+
+/// What the mock upstream serves as a download: the head of a gzip stream,
+/// whose second byte is not valid UTF-8 and so cannot survive being read as
+/// text.
+const GZIP_BYTES: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xfe, 0x80, 0x00,
+];
 
 /// A stand-in upstream that reports exactly what it was sent.
 async fn spawn_upstream() -> SocketAddr {
@@ -43,9 +50,18 @@ async fn spawn_upstream() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, Router::new().fallback(any(echo)))
-            .await
-            .unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/models/tarball",
+                get(|| async {
+                    (
+                        [(http::header::CONTENT_TYPE, "application/x-gzip")],
+                        GZIP_BYTES,
+                    )
+                }),
+            )
+            .fallback(any(echo));
+        axum::serve(listener, app).await.unwrap();
     });
     addr
 }
@@ -387,6 +403,57 @@ async fn an_upstreams_own_error_is_a_result_not_a_refusal() {
 }
 
 #[tokio::test]
+async fn a_binary_download_arrives_byte_for_byte_as_base64() {
+    use base64::Engine;
+    let harness = spawn("").await;
+
+    let result = harness
+        .call(
+            "iap_request",
+            json!({ "upstream": "echo", "path": "/v1/models/tarball" }),
+        )
+        .await;
+    assert!(result.get("isError").is_none(), "{result}");
+    let structured = &result["structuredContent"];
+    assert!(structured.get("body").is_none(), "{structured}");
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(structured["body_base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, GZIP_BYTES);
+}
+
+#[tokio::test]
+async fn base64_can_be_asked_for_and_an_unknown_encoding_is_refused() {
+    use base64::Engine;
+    let harness = spawn("").await;
+
+    let result = harness
+        .call(
+            "iap_request",
+            json!({ "upstream": "echo", "path": "/v1/models", "response_encoding": "base64" }),
+        )
+        .await;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(result["structuredContent"]["body_base64"].as_str().unwrap())
+        .unwrap();
+    let echoed: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(echoed["path"], "/v1/models");
+
+    let result = harness
+        .call(
+            "iap_request",
+            json!({ "upstream": "echo", "path": "/v1/models", "response_encoding": "hex" }),
+        )
+        .await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("response_encoding"));
+}
+
+#[tokio::test]
 async fn the_gateway_refuses_an_unknown_token_and_records_it() {
     let harness = spawn("").await;
 
@@ -468,8 +535,9 @@ async fn two_agents_are_told_two_different_things() {
         .to_string();
 
     assert!(mine.contains("`echo`"), "{mine}");
-    // The outsider is granted an upstream that does not exist, so the honest
-    // answer is that it can reach nothing — not a copy of somebody else's list.
+    // The outsider is granted an upstream no rule names, under a default that
+    // denies, so the honest answer is that it can reach nothing — not a copy
+    // of somebody else's list.
     assert!(!theirs.contains("`echo`"), "{theirs}");
     assert!(theirs.contains("no upstream it may address"), "{theirs}");
 }
@@ -518,6 +586,134 @@ async fn the_catalog_and_the_skills_describe_the_running_policy() {
     assert_eq!(
         read["result"]["contents"][0]["text"].as_str().unwrap(),
         text
+    );
+}
+
+/// The reported bug. `outsider` is granted `unmentioned`, no rule names it,
+/// and the default is `ask` — what `init` writes. A call to it stops on a human
+/// and goes through if approved, so a catalog that came back empty told the
+/// agent to give up on something one approval away.
+#[tokio::test]
+async fn a_granted_upstream_no_rule_names_is_listed_when_the_default_asks() {
+    let harness = spawn("\n[acl_default]\naction = \"ask\"\n").await;
+
+    let frame = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_catalog", "arguments": {} }),
+        )
+        .await;
+    let catalog = &frame["result"];
+    let upstreams = catalog["structuredContent"]["upstreams"]
+        .as_array()
+        .unwrap();
+    assert_eq!(upstreams.len(), 1, "{catalog}");
+    assert_eq!(upstreams[0]["name"], "unmentioned");
+    assert_eq!(upstreams[0]["access"], "ask");
+    let text = catalog["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("calls stop for approval"), "{text}");
+
+    // The same answer everywhere it is given, not just in the catalog.
+    let instructions = harness
+        .rpc_as("iap_outsider", "initialize", json!({}))
+        .await["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        instructions.contains("`unmentioned` (calls stop for approval)"),
+        "{instructions}"
+    );
+
+    let tools = harness
+        .rpc_as("iap_outsider", "tools/list", json!({}))
+        .await;
+    let description = tools["result"]["tools"][0]["description"].as_str().unwrap();
+    assert!(
+        description.contains("unmentioned (calls stop for approval)"),
+        "{description}"
+    );
+
+    let skill = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_skill", "arguments": { "name": "upstream/unmentioned" } }),
+        )
+        .await;
+    let skill = skill["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(skill.contains("calls stop for approval"), "{skill}");
+
+    // And `iap_request` agrees that it is a question, not a refusal: with no
+    // console attached nobody answers, so it comes back `approval_denied`
+    // from the default — never `target_not_permitted` or `policy_denied`.
+    let call = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_request", "arguments": { "upstream": "unmentioned", "path": "/v1/models" } }),
+        )
+        .await;
+    let message = call["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(message.starts_with("approval_denied"), "{message}");
+}
+
+/// Under `allow`, the catalog and `iap_request` agree the other way round: the
+/// upstream is listed, and the call to it goes through.
+#[tokio::test]
+async fn the_catalog_lists_what_an_allow_default_lets_through() {
+    let harness = spawn("\n[acl_default]\naction = \"allow\"\n").await;
+
+    let catalog = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_catalog", "arguments": {} }),
+        )
+        .await;
+    let upstreams = catalog["result"]["structuredContent"]["upstreams"]
+        .as_array()
+        .unwrap();
+    assert_eq!(upstreams.len(), 1, "{catalog}");
+    assert_eq!(upstreams[0]["name"], "unmentioned");
+    assert_eq!(upstreams[0]["access"], "allow");
+
+    let call = harness
+        .rpc_as(
+            "iap_outsider",
+            "tools/call",
+            json!({ "name": "iap_request", "arguments": { "upstream": "unmentioned", "path": "/v1/models" } }),
+        )
+        .await;
+    assert!(call["result"].get("isError").is_none(), "{call}");
+    assert_eq!(call["result"]["structuredContent"]["status"], 200);
+}
+
+/// A tool description is read at `tools/list` and may be cached for the whole
+/// session, while the policy under it can be reloaded. So even an agent that
+/// reaches nothing today is sent to `iap_catalog` rather than told, for good,
+/// that nothing is there.
+#[tokio::test]
+async fn the_request_tool_never_bakes_in_that_nothing_is_reachable() {
+    let harness = spawn("").await;
+
+    let tools = harness
+        .rpc_as("iap_outsider", "tools/list", json!({}))
+        .await;
+    let description = tools["result"]["tools"][0]["description"].as_str().unwrap();
+    assert!(
+        !description.contains("no upstream is reachable"),
+        "{description}"
+    );
+    assert!(description.contains("`iap_catalog`"), "{description}");
+
+    // A catalog entry under rules is marked as such, so `access` is always
+    // present and an agent can tell the cases apart.
+    let catalog = harness.call("iap_catalog", json!({})).await;
+    assert_eq!(
+        catalog["structuredContent"]["upstreams"][0]["access"],
+        "rules"
     );
 }
 

@@ -127,3 +127,117 @@ fn check_never_puts_an_inline_credential_on_the_terminal() {
         "check leaked the credential: {printed}"
     );
 }
+
+/// One policy, two 1Password accounts: the company one by default and a
+/// personal one for a single upstream — the setup the report could not write.
+///
+/// The stand-in `op` writes down its whole command line and answers with the
+/// account it was told to read from, so a credential read from the wrong
+/// account would come back visibly wrong.
+#[test]
+fn references_in_two_1password_accounts_are_read_from_each_with_its_own_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let op = dir.path().join("op");
+    let calls = dir.path().join("op-calls");
+    std::fs::write(
+        &op,
+        format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{calls}'\n\
+             account=default\n\
+             command=$1; shift\n\
+             reference=\n\
+             while [ $# -gt 0 ]; do\n\
+               case \"$1\" in\n\
+               --account) account=$2; shift 2 ;;\n\
+               --no-newline) shift ;;\n\
+               *) reference=$1; shift ;;\n\
+               esac\n\
+             done\n\
+             case \"$command\" in\n\
+             read) printf '%s@%s' \"$reference\" \"$account\" ;;\n\
+             *) exit 2 ;;\n\
+             esac\n",
+            calls = calls.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = dir.path().join("iap.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[server]
+listen = "127.0.0.1:0"
+admin_listen = "127.0.0.1:0"
+op_binary = "{op}"
+
+[secrets]
+op_account = "company.example.com"
+
+[acl_default]
+action = "deny"
+
+[[upstreams]]
+name = "company"
+base_url = "https://api.example.com"
+auth = {{ type = "bearer", secret = "op://Work/API/token" }}
+
+[[upstreams]]
+name = "github-public"
+base_url = "https://api.github.com"
+auth = {{ type = "bearer", secret = "op://Private/GitHub classic/token?account=my.1password.com" }}
+"#,
+            op = op.display(),
+        ),
+    )
+    .unwrap();
+
+    let output = check(&path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // One reference per account is one `op read` per account, each told which.
+    let mut invocations: Vec<String> = std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    invocations.sort();
+    assert_eq!(
+        invocations,
+        vec![
+            "read --no-newline op://Private/GitHub classic/token --account my.1password.com",
+            "read --no-newline op://Work/API/token --account company.example.com",
+        ],
+        "`?account=` is agent-iap's, so it reaches `op` as `--account` and not in the reference"
+    );
+
+    // Both resolved, and `check` says which account each one needed.
+    assert!(
+        stdout.contains(
+            "secrets     ok      op://Work/API/token  (1Password account `company.example.com`)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "secrets     ok      op://Private/GitHub classic/token?account=my.1password.com"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1password   ok      `company.example.com` — 1 of 1 reference(s) read"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1password   ok      `my.1password.com` — 1 of 1 reference(s) read"),
+        "{stdout}"
+    );
+}

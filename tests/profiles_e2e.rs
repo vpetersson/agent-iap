@@ -1472,3 +1472,197 @@ async fn sbomify_publish_uploads_and_releases_and_can_do_nothing_else() {
         );
     }
 }
+
+// ---- git over HTTPS -------------------------------------------------------
+
+/// How git calls the proxy: no `Authorization` of its own unless it was handed
+/// one, and the agent token in `X-IAP-Token`, where `git-config` puts it.
+async fn call_as_git(harness: &Harness, method: &str, path: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+            format!("http://{}{path}", harness.proxy),
+        )
+        .header("x-iap-token", AGENT_TOKEN)
+        .header("content-type", "application/x-git-upload-pack-request")
+        .body("0000")
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// The issue in one test: the agent sends its token as `X-IAP-Token`, and
+/// github.com is sent `x-access-token:<PAT>` as HTTP Basic on the fetch.
+#[tokio::test]
+async fn github_git_fetches_as_x_access_token_and_read_refuses_a_push() {
+    std::env::set_var("TEST_GITHUB_GIT_TOKEN", "github_pat_real");
+    let upstream = spawn_upstream().await;
+    let harness = harness_from_profiles(
+        &[("github-git", options("env:TEST_GITHUB_GIT_TOKEN"))],
+        upstream,
+    )
+    .await;
+    let expected = format!("Basic {}", base64_encode("x-access-token:github_pat_real"));
+
+    let (status, seen) = call_as_git(
+        &harness,
+        "GET",
+        "/github-git/o/r.git/info/refs?service=git-upload-pack",
+    )
+    .await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["path"], "/o/r.git/info/refs");
+    // The service is in the query, which the rules cannot see and the proxy
+    // must not drop: without it github.com answers the dumb protocol, which it
+    // does not serve.
+    assert_eq!(seen["query"], "service=git-upload-pack");
+    assert_eq!(seen["authorization"], expected);
+
+    let (status, seen) = call_as_git(&harness, "POST", "/github-git/o/r.git/git-upload-pack").await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["method"], "POST");
+    assert_eq!(seen["path"], "/o/r.git/git-upload-pack");
+    assert_eq!(seen["authorization"], expected);
+    assert!(seen["x-iap-token"].is_null(), "the agent's token travelled");
+
+    // `read` is the default level, and a push stops on the rule that says so.
+    let (status, body) =
+        call_as_git(&harness, "POST", "/github-git/o/r.git/git-receive-pack").await;
+    assert_eq!(status, 403);
+    refused_by(&body, "github-git-push");
+}
+
+#[tokio::test]
+async fn github_git_write_pushes_and_a_named_repository_is_the_only_one() {
+    std::env::set_var("TEST_GITHUB_GIT_TOKEN_W", "github_pat_write");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_GITHUB_GIT_TOKEN_W");
+    opts.access = Some("write".into());
+    opts.vars = vec!["repo=acme/api".into()];
+    let harness = harness_from_profiles(&[("github-git", opts)], upstream).await;
+
+    let (status, seen) = call_as_git(
+        &harness,
+        "POST",
+        "/github-git/acme/api.git/git-receive-pack",
+    )
+    .await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["path"], "/acme/api.git/git-receive-pack");
+
+    // Another repository of the same owner falls past every rule to the
+    // default, which nobody is attached to answer: it never reaches GitHub.
+    let (status, body) =
+        call_as_git(&harness, "POST", "/github-git/acme/web.git/git-upload-pack").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "another repository was fetched: {body}"
+    );
+}
+
+/// Answers git's ref advertisement for `/o/r.git`, and only to the credential
+/// the profile says github.com wants, so a real `git` succeeding against it is
+/// the proof that the whole chain — `git-config`, the proxy, the profile —
+/// joins up.
+async fn spawn_git_upstream(expected_authorization: String) -> SocketAddr {
+    use axum::response::IntoResponse;
+    let handler = move |request: Request| {
+        let expected = expected_authorization.clone();
+        async move {
+            let authorization = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let leaked = request.headers().contains_key("x-iap-token");
+            if authorization != expected || leaked {
+                return (http::StatusCode::UNAUTHORIZED, Vec::new()).into_response();
+            }
+            if request.uri().path() != "/o/r.git/info/refs"
+                || request.uri().query() != Some("service=git-upload-pack")
+            {
+                return (http::StatusCode::NOT_FOUND, Vec::new()).into_response();
+            }
+            let pkt = |line: &str| format!("{:04x}{line}", line.len() + 4);
+            let body = format!(
+                "{}0000{}0000",
+                pkt("# service=git-upload-pack\n"),
+                pkt(&format!("{} refs/heads/main\0agent=mock\n", "a".repeat(40))),
+            );
+            (
+                [(
+                    "content-type",
+                    "application/x-git-upload-pack-advertisement",
+                )],
+                body,
+            )
+                .into_response()
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(any(handler)))
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+/// A real `git`, configured by nothing but `eval "$(agent-iap git-config)"`,
+/// asked for `https://github.com/o/r.git`.
+#[tokio::test]
+async fn git_reaches_github_through_the_proxy_with_only_git_config() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no git on PATH");
+        return;
+    }
+    std::env::set_var("TEST_GITHUB_GIT_TOKEN_LS", "github_pat_ls");
+    let expected = format!("Basic {}", base64_encode("x-access-token:github_pat_ls"));
+    let upstream = spawn_git_upstream(expected).await;
+    let harness = harness_from_profiles(
+        &[("github-git", options("env:TEST_GITHUB_GIT_TOKEN_LS"))],
+        upstream,
+    )
+    .await;
+
+    let home = tempfile::tempdir().unwrap();
+    let script = format!(
+        "eval \"$('{}' git-config --proxy-url http://{})\" && git ls-remote https://github.com/o/r.git",
+        env!("CARGO_BIN_EXE_agent-iap"),
+        harness.proxy
+    );
+    let output = tokio::process::Command::new("sh")
+        .args(["-c", &script])
+        // Nothing of the developer's own git configuration takes part.
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("IAP_PROXY_URL")
+        .env_remove("IAP_URL")
+        .env("IAP_TOKEN", AGENT_TOKEN)
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        format!("{}\trefs/heads/main", "a".repeat(40)),
+        "{stderr}"
+    );
+}

@@ -66,7 +66,7 @@ stripe  https://api.stripe.com  bearer  op://Private/Stripe/key    none
 `RULES` counts the rules that could ever reach that target as this agent, so
 `none` is the interesting value: `stripe` is in the agent's `targets`, which
 reads like a grant, but no rule names it — every call falls through to the
-default and is denied.
+default: denied under `deny`, held for approval under `ask`.
 
 `--output json` gives the same inventory to something other than a human. All of
 it reads only the policy file: no running daemon, no call to 1Password, and
@@ -236,6 +236,48 @@ on `/health`, `agent-iap mcp --server github` exchanges its agent token for one
 scoped to `github` alone, renews it two minutes before it lapses, and keeps the
 agent token for nothing but asking again.
 
+## Git
+
+Git is a program rather than an SDK with a base URL, so it is pointed at the
+proxy through its own configuration. With a `github-git` upstream enrolled
+([§ Profiles](profiles.md)) and in the agent's `targets`:
+
+```bash
+agent-iap profile add github-git --secret op://Private/GitHub/token   # on the proxy's host
+
+export IAP_TOKEN=iap_...                  # the agent's own token
+export IAP_URL=http://127.0.0.1:8080
+eval "$(agent-iap git-config)"
+git clone https://github.com/acme/api.git # unchanged — it goes through the proxy
+```
+
+`git-config` writes nothing; it prints environment variables for that `eval`:
+
+```bash
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0='url.http://127.0.0.1:8080/github-git/.insteadOf'
+export GIT_CONFIG_VALUE_0='https://github.com/'
+export GIT_CONFIG_KEY_1='http.http://127.0.0.1:8080/github-git/.extraHeader'
+export GIT_CONFIG_VALUE_1="X-IAP-Token: ${IAP_TOKEN:?IAP_TOKEN is not set}"
+```
+
+The first rewrites every `https://github.com/` URL to the upstream, so the
+agent never needs to know the proxied address. The second sends the agent's
+token on requests to that prefix and nowhere else, in `X-IAP-Token` because git
+sends an `Authorization` of its own when it has one; the proxy drops it and
+github.com gets the profile's `x-access-token:<PAT>`. The agent token is read
+from `$IAP_TOKEN` when the line is evaluated, so it lives in that shell's
+environment and is not written into `~/.gitconfig`. Variables already in
+`GIT_CONFIG_COUNT` are kept, and evaluating it twice does not send the header
+twice.
+
+The address is `--proxy-url` (or `IAP_PROXY_URL`), then `IAP_URL`, then
+`server.listen` in the policy file — where it also says if the upstream is not
+in the file. `--upstream` names one enrolled under another name. Only
+`https://github.com/` remotes are rewritten; an `ssh://` or `git@github.com:`
+remote goes around the proxy and has no credential. A push is the profile's
+`write` level, and is buffered up to `server.max_body_bytes`.
+
 ## Zero state
 
 An agent handed a token and an address has everything it needs and no way to
@@ -297,8 +339,9 @@ same way.
 
 Nothing here discloses more than the agent could learn by making one refused
 call. The document is built per agent, so an agent granted a target no rule
-names is told it can reach nothing. Credential *schemes* are named; credentials
-are not. Without a token the root says what this is and how to authenticate, and
+names is told it can reach nothing when the default is `deny`, and that calls to
+it stop for approval when the default is `ask`. Credential *schemes* are named;
+credentials are not. Without a token the root says what this is and how to authenticate, and
 nothing about the policy.
 
 Reading it is an audit event. An anonymous read is not: it names no agent, no

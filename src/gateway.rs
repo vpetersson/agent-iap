@@ -208,8 +208,13 @@ fn initialize(state: &AppState, caller: &Caller) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
-            // Neither list changes while the process runs — the policy file is
-            // read once at startup — so there is no `listChanged` to promise.
+            // What an agent may reach does change while the process runs — a
+            // reload swaps the policy under a live session — but this transport
+            // has no channel to say so: there is no server-to-client stream and
+            // no session to address one to. So no `listChanged` is promised.
+            // Instead nothing served once and cached by a client claims to be
+            // final: the instructions and `iap_request`'s description both
+            // defer to `iap_catalog`, which is computed on every call.
             "tools": {},
             "resources": {},
         },
@@ -223,18 +228,30 @@ fn initialize(state: &AppState, caller: &Caller) -> Value {
 }
 
 fn tools_list(state: &AppState, caller: &Caller) -> Value {
-    let reachable: Vec<String> = skills::catalog(state, caller.agent())
+    let reachable: Vec<String> = skills::reachable_upstreams(state, caller.agent())
         .into_iter()
-        .filter_map(|skill| skill.name.strip_prefix("upstream/").map(str::to_string))
+        .map(|reachable| match reachable.access.note() {
+            Some(note) => format!("{} ({note})", reachable.upstream.name),
+            None => reachable.upstream.name,
+        })
         .collect();
 
     // Naming them in the description rather than as an `enum`: a model that
     // guesses a name it was not given gets the proxy's refusal, which explains
     // itself, instead of a client-side schema rejection, which does not.
+    //
+    // Never "nothing is reachable", though. A client may keep this description
+    // for the whole session, and the policy can be reloaded under it — a
+    // cached absolute would outlive the grant that made it false. `iap_catalog`
+    // is computed per call, so that is where the description sends the agent.
     let upstreams = if reachable.is_empty() {
-        "no upstream is reachable by this agent".to_string()
+        "named by `iap_catalog`, which has the current list — call it first".to_string()
     } else {
-        format!("one of: {}", reachable.join(", "))
+        format!(
+            "one of: {} — or call `iap_catalog` for the current list, which can \
+             change while you run",
+            reachable.join(", ")
+        )
     };
 
     json!({ "tools": [
@@ -245,7 +262,10 @@ fn tools_list(state: &AppState, caller: &Caller) -> Value {
                 "Perform an HTTP request against one of the APIs this proxy fronts. The \
                  proxy holds the credential and attaches it — never send one. Every call \
                  is policy-checked and audited, and some may be held for human approval. \
-                 Upstream is {upstreams}. Read `using-this-gateway` via iap_skill first."
+                 Upstream is {upstreams}. A textual response comes back as `body`; \
+                 anything else (an archive, an image, bytes that are not UTF-8) comes back \
+                 base64-encoded as `body_base64` instead — decode it, never read it as \
+                 text. Read `using-this-gateway` via iap_skill first."
             ),
             "inputSchema": {
                 "type": "object",
@@ -279,6 +299,14 @@ fn tools_list(state: &AppState, caller: &Caller) -> Value {
                             "Extra request headers. Credential headers are ignored — the \
                              proxy sets those.",
                     },
+                    "response_encoding": {
+                        "type": "string",
+                        "enum": ["auto", "base64"],
+                        "description":
+                            "`auto` (the default) returns a textual response as `body` and \
+                             anything else as `body_base64`. `base64` always returns \
+                             `body_base64`, for when the bytes must arrive exactly.",
+                    },
                 },
                 "required": ["upstream", "path"],
             },
@@ -288,6 +316,8 @@ fn tools_list(state: &AppState, caller: &Caller) -> Value {
                     "status": { "type": "integer" },
                     "headers": { "type": "object" },
                     "body": { "type": "string" },
+                    "body_base64": { "type": "string" },
+                    "truncated": { "type": "boolean" },
                 },
                 "required": ["status"],
             },
@@ -410,32 +440,38 @@ fn catalog_result(state: &AppState, caller: &Caller) -> Value {
     let mut entries = Vec::new();
     let mut text = String::new();
 
-    for skill in skills::catalog(state, agent) {
-        let Some(name) = skill.name.strip_prefix("upstream/") else {
-            continue;
-        };
-        let Some(upstream) = state.config().upstream(name).cloned() else {
-            continue;
-        };
+    for reachable in skills::reachable_upstreams(state, agent) {
+        let upstream = reachable.upstream;
+        let name = &upstream.name;
+        let skill = format!("upstream/{name}");
+        let note = reachable
+            .access
+            .note()
+            .map(|note| format!("; {note}"))
+            .unwrap_or_default();
         text.push_str(&format!(
-            "- `{}` — {} (credential: {}; skill: `{}`)\n",
+            "- `{}` — {} (credential: {}; skill: `{}`{note})\n",
             name,
             upstream.base_url,
             upstream.auth.describe(),
-            skill.name,
+            skill,
         ));
         entries.push(json!({
             "name": name,
             "base_url": upstream.base_url,
             "auth": upstream.auth.describe(),
-            "skill": skill.name,
+            "skill": skill,
+            // `rules` when the ACL names this upstream for this agent, else the
+            // default every call falls through to: `ask` or `allow`. A `deny`
+            // default with no rule is not listed at all.
+            "access": reachable.access.as_str(),
         }));
     }
 
     if entries.is_empty() {
         text = "This agent may not reach any upstream through this proxy. Either it \
-                has no `targets` grant, or no ACL rule names the upstreams it has. An \
-                operator has to change the policy file."
+                has no `targets` grant, or the upstreams it has are named by no ACL \
+                rule and the default denies. An operator has to change the policy file."
             .to_string();
     } else {
         text = format!(
@@ -481,6 +517,15 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
         .to_uppercase()
         .parse()
         .map_err(|_| format!("`{method}` is not an HTTP method"))?;
+    let force_base64 = match string_arg(arguments, "response_encoding").as_deref() {
+        None | Some("auto") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return Err(format!(
+                "`response_encoding` must be `auto` or `base64` — `{other}` is neither"
+            ))
+        }
+    };
 
     let mut record = AuditRecord::new("http", "request");
     record.agent = agent.id.clone();
@@ -625,7 +670,87 @@ async fn request(state: &AppState, caller: &Caller, arguments: &Value) -> Result
         headers,
         bytes,
         truncated,
+        force_base64,
     ))
+}
+
+/// The body as the agent will receive it.
+enum Body {
+    Text(String),
+    Base64(String),
+}
+
+/// Text when the response is text, base64 otherwise.
+///
+/// Decoding lossily would be wrong in the worst way: a tarball's gzip magic
+/// `1f 8b` arrives as `1f U+FFFD`, the archive will not unpack, and nothing
+/// says why. So bytes are only ever handed over as text when they are text —
+/// a textual content type (or none) *and* valid UTF-8 — and otherwise as
+/// base64, which is exact. An agent that asked for base64 gets it regardless.
+fn encode_response(
+    content_type: Option<&str>,
+    bytes: Vec<u8>,
+    truncated: bool,
+    force_base64: bool,
+) -> Body {
+    use base64::Engine;
+    let base64 =
+        |bytes: &[u8]| Body::Base64(base64::engine::general_purpose::STANDARD.encode(bytes));
+
+    if force_base64 || !content_type.is_none_or(is_textual) {
+        return base64(&bytes);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Body::Text(text),
+        Err(error) => {
+            let utf8 = error.utf8_error();
+            // The cap can land in the middle of a multi-byte character. That
+            // is a cut, not binary: keep the text and drop the partial
+            // character, which was never going to arrive whole anyway.
+            if truncated && utf8.error_len().is_none() {
+                let mut bytes = error.into_bytes();
+                bytes.truncate(utf8.valid_up_to());
+                return Body::Text(String::from_utf8(bytes).unwrap_or_default());
+            }
+            base64(error.as_bytes())
+        }
+    }
+}
+
+/// Whether a content type names text. A charset parameter settles it; past
+/// that, `text/*` and the structured-text formats APIs actually answer in.
+fn is_textual(content_type: &str) -> bool {
+    let mut parts = content_type.split(';');
+    let essence = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    if parts.any(|parameter| {
+        parameter
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("charset=")
+    }) {
+        return true;
+    }
+    let Some((kind, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    kind == "text"
+        || ["+json", "+xml", "+yaml"]
+            .iter()
+            .any(|suffix| subtype.ends_with(suffix))
+        || matches!(
+            subtype,
+            "json"
+                | "xml"
+                | "yaml"
+                | "x-yaml"
+                | "x-ndjson"
+                | "ndjson"
+                | "javascript"
+                | "ecmascript"
+                | "x-www-form-urlencoded"
+                | "graphql"
+                | "csv"
+        )
 }
 
 fn response_result(
@@ -634,8 +759,13 @@ fn response_result(
     headers: Value,
     bytes: Vec<u8>,
     truncated: bool,
+    force_base64: bool,
 ) -> Value {
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE.as_str())
+        .and_then(Value::as_str);
+    let length = bytes.len();
+    let body = encode_response(content_type, bytes, truncated, force_base64);
 
     let mut text = String::new();
     // A 2xx body speaks for itself. Anything else needs the status said out
@@ -647,10 +777,18 @@ fn response_result(
             status.as_u16()
         ));
     }
-    if body.is_empty() {
-        text.push_str(&format!("(empty body, HTTP {})", status.as_u16()));
-    } else {
-        text.push_str(&body);
+    match &body {
+        _ if length == 0 => {
+            text.push_str(&format!("(empty body, HTTP {})", status.as_u16()));
+        }
+        Body::Text(body) => text.push_str(body),
+        Body::Base64(encoded) => {
+            text.push_str(&format!(
+                "(binary body, {length} bytes of {}, base64-encoded below and as \
+                 `body_base64` — decode it before use)\n\n{encoded}",
+                content_type.unwrap_or("unknown content type"),
+            ));
+        }
     }
     if truncated {
         text.push_str(
@@ -662,7 +800,10 @@ fn response_result(
     let mut structured = Map::new();
     structured.insert("status".into(), json!(status.as_u16()));
     structured.insert("headers".into(), headers);
-    structured.insert("body".into(), json!(body));
+    match body {
+        Body::Text(body) => structured.insert("body".into(), json!(body)),
+        Body::Base64(encoded) => structured.insert("body_base64".into(), json!(encoded)),
+    };
     if truncated {
         structured.insert("truncated".into(), json!(true));
     }
@@ -917,6 +1058,7 @@ base_url = "https://example.invalid"
             json!({}),
             b"{\"error\":\"nope\"}".to_vec(),
             false,
+            false,
         );
         let text = result["content"][0]["text"].as_str().unwrap();
 
@@ -929,9 +1071,144 @@ base_url = "https://example.invalid"
 
     #[test]
     fn a_truncated_body_says_so_in_both_the_text_and_the_structure() {
-        let result = response_result("echo", StatusCode::OK, json!({}), b"abc".to_vec(), true);
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({}),
+            b"abc".to_vec(),
+            true,
+            false,
+        );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("truncated"), "{text}");
+        assert_eq!(result["structuredContent"]["truncated"], true);
+    }
+
+    fn decoded(result: &Value) -> Vec<u8> {
+        use base64::Engine;
+        let encoded = result["structuredContent"]["body_base64"].as_str().unwrap();
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_binary_body_arrives_as_base64_byte_for_byte() {
+        // The start of a gzip stream: `8b` is not UTF-8, and lossy decoding
+        // used to turn it into U+FFFD.
+        let gzip = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0x00];
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({ "content-type": "application/x-gzip" }),
+            gzip.clone(),
+            false,
+            false,
+        );
+
+        assert_eq!(decoded(&result), gzip);
+        assert!(result["structuredContent"].get("body").is_none());
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("body_base64"), "{text}");
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_base64_whatever_the_content_type_claims() {
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({ "content-type": "text/plain" }),
+            vec![b'a', 0xff, b'b'],
+            false,
+            false,
+        );
+        assert_eq!(decoded(&result), vec![b'a', 0xff, b'b']);
+    }
+
+    #[test]
+    fn a_non_textual_content_type_is_base64_even_when_the_bytes_would_decode() {
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({ "content-type": "application/octet-stream" }),
+            b"plain ascii".to_vec(),
+            false,
+            false,
+        );
+        assert_eq!(decoded(&result), b"plain ascii".to_vec());
+    }
+
+    #[test]
+    fn text_still_arrives_as_body() {
+        for content_type in [
+            None,
+            Some("application/json"),
+            Some("application/vnd.github+json"),
+            Some("text/html; charset=utf-8"),
+            Some("application/x-custom; charset=utf-8"),
+        ] {
+            let headers = match content_type {
+                Some(value) => json!({ "content-type": value }),
+                None => json!({}),
+            };
+            let result = response_result(
+                "echo",
+                StatusCode::OK,
+                headers,
+                "{\"name\":\"café\"}".as_bytes().to_vec(),
+                false,
+                false,
+            );
+            assert_eq!(
+                result["structuredContent"]["body"], "{\"name\":\"café\"}",
+                "{content_type:?}"
+            );
+            assert!(result["structuredContent"].get("body_base64").is_none());
+        }
+    }
+
+    #[test]
+    fn base64_can_be_asked_for_outright() {
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({ "content-type": "application/json" }),
+            b"{}".to_vec(),
+            false,
+            true,
+        );
+        assert_eq!(decoded(&result), b"{}".to_vec());
+        assert!(result["structuredContent"].get("body").is_none());
+    }
+
+    #[test]
+    fn a_cap_that_splits_a_character_leaves_text_as_text() {
+        // `é` is two bytes; the cap kept only the first.
+        let mut bytes = "caf".as_bytes().to_vec();
+        bytes.push(0xc3);
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({ "content-type": "text/plain" }),
+            bytes,
+            true,
+            false,
+        );
+        assert_eq!(result["structuredContent"]["body"], "caf");
+        assert_eq!(result["structuredContent"]["truncated"], true);
+    }
+
+    #[test]
+    fn a_truncated_binary_body_is_the_capped_bytes_exactly() {
+        let result = response_result(
+            "echo",
+            StatusCode::OK,
+            json!({ "content-type": "image/png" }),
+            vec![0x89, b'P', b'N', b'G'],
+            true,
+            false,
+        );
+        assert_eq!(decoded(&result), vec![0x89, b'P', b'N', b'G']);
         assert_eq!(result["structuredContent"]["truncated"], true);
     }
 }
