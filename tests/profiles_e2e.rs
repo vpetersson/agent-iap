@@ -1416,3 +1416,59 @@ fn a_google_profile_takes_the_user_to_act_as_as_a_variable() {
     assert!(!written.contains("subject"), "{written}");
     drop(dir);
 }
+
+/// `publish` is the CI path: upload an SBOM, file it into a release. The token
+/// reaches sbomify on the API's own prefix, and the calls a CI bot has no
+/// business making — minting itself a token, editing a product, deleting —
+/// never leave the proxy.
+#[tokio::test]
+async fn sbomify_publish_uploads_and_releases_and_can_do_nothing_else() {
+    std::env::set_var("TEST_SBOMIFY_PAT", "sbomify-real-pat");
+    let upstream = spawn_upstream().await;
+    let mut v2 = options("env:TEST_SBOMIFY_PAT");
+    v2.access = Some("publish".into());
+    let mut v1 = options("env:TEST_SBOMIFY_PAT");
+    v1.access = Some("publish".into());
+    let harness = harness_from_profiles(&[("sbomify", v2), ("sbomify-v1", v1)], upstream).await;
+
+    for (method, path, upstream_path) in [
+        ("GET", "/sbomify/workspaces/", "/api/v2/workspaces/"),
+        (
+            "POST",
+            "/sbomify/artifacts/cyclonedx/abc123",
+            "/api/v2/artifacts/cyclonedx/abc123",
+        ),
+        (
+            "POST",
+            "/sbomify/artifacts/abc123/releases",
+            "/api/v2/artifacts/abc123/releases",
+        ),
+        (
+            "POST",
+            "/sbomify-v1/sboms/artifact/cyclonedx/abc123",
+            "/api/v1/sboms/artifact/cyclonedx/abc123",
+        ),
+    ] {
+        let (status, seen) = call(&harness, method, path).await;
+        assert_eq!(status, 200, "`{method} {path}` was refused at `publish`");
+        assert_eq!(seen["path"], upstream_path);
+        assert_eq!(seen["authorization"], "Bearer sbomify-real-pat");
+    }
+
+    // `ask` with nobody watching resolves to a denial, which is the safe end.
+    for (method, path) in [
+        ("POST", "/sbomify/auth/oidc/github/exchange"),
+        ("POST", "/sbomify-v1/auth/oidc/github/exchange"),
+        ("PATCH", "/sbomify/products/abc123"),
+        ("POST", "/sbomify/workspaces/k3y/invitations"),
+        ("DELETE", "/sbomify/artifacts/abc123"),
+        ("GET", "/sbomify-v1/internal/domains"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "`{method} {path}` was allowed at `publish`");
+        assert!(
+            body["path"].is_null(),
+            "`{method} {path}` reached sbomify from `publish`: {body}"
+        );
+    }
+}

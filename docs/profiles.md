@@ -63,7 +63,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Six levels exist for reasons that are not about permissions:
+Seven levels exist for reasons that are not about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
   parks everything else for a human. The ACL cannot tell a reasonable POST from
@@ -90,6 +90,15 @@ Six levels exist for reasons that are not about permissions:
   memberships, webhooks, exports — left to prompt. The question an operator is
   answering is not "may it write" but "may it write to tasks", and `write` is
   the level that cannot tell the two apart.
+- **`sbomify`** splits its writes by sbomify's own roles rather than by verb.
+  `--access triage` is the operator: every read plus recording a triage
+  decision on a vulnerability. `--access publish` is the CI bot: every read
+  plus uploading an SBOM, its provenance and signature, and filing it into a
+  release. Products, components, workspace settings, members and billing
+  prompt at both, and DELETE is refused. `write` still asks before a plan
+  change or a GitHub OIDC binding, because one bills and the other is a
+  standing publish grant to a repository the proxy never sees. `sbomify-v1`
+  has the same four levels on v1's paths.
 
 ## What is in the catalog
 
@@ -106,6 +115,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
+| sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths) |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Object storage | `s3` (`--var region=…`), `r2` (`--var account_id=…`), `s3-compatible` (`--var host=…` — MinIO, B2, Wasabi, Spaces, Ceph, …) — all `aws_sigv4`, all needing `--var access_key_id=…` and `--var bucket=…` |
 | Others | `anthropic`, `openai`, `xai`, `github`, `linear`, `slack`, `stripe` |
@@ -209,6 +219,21 @@ file in the clear, while the token stays a reference.
   same rules at your own host. The release does: an endpoint your version
   predates 404s rather than being denied, which is why the `triage` rules name
   the project-scoped issue path as well as the organization-wide one.
+- **An sbomify token can mint another, so that call never goes through.**
+  `POST /auth/oidc/github/exchange` trades a GitHub Actions OIDC token for a
+  fresh sbomify token and returns it. Through this proxy that is a credential
+  handed to the agent, so both sbomify profiles deny it at every level,
+  `write` included, along with `/user/**` (account export and deletion). The
+  token itself acts as its owner, so their workspace role still applies under
+  the ACL, and it can be pinned to one workspace and given an action list when
+  it is created, which holds even where the ACL is wide. Two limits the ACL
+  cannot fix: publishing a product or component to the Trust Center is a
+  field in the same `PATCH` that renames it, so the narrow levels prompt for
+  both, and `POST /artifacts/upload-file/…` is session-only, so a token gets a
+  401 there and CI uploads go to `/artifacts/cyclonedx/<component>` or
+  `/artifacts/spdx/<component>`. v1 has been deprecated since 26 August 2026
+  with no sunset date yet; it also mounts `/internal`, which `sbomify-v1`
+  denies.
 - **A Spotify token is app-only, and expires in an hour.** Spotify issues no
   long-lived API key: every call carries an OAuth access token. So `spotify` is
   the one profile whose credential the proxy *spends* rather than forwards — it
