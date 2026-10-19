@@ -24,6 +24,23 @@ it:
     "headers": { "Authorization": "Bearer iap_..." } } } }
 ```
 
+Better, keep the token out of the client's configuration and in the token file
+([§ The agent's token](agents.md#the-agents-token)), and let the client read it
+when it connects. In Claude Code that is `headersHelper`, a command whose stdout
+is the headers as JSON; `agent-iap headers` prints exactly that:
+
+```json
+{ "mcpServers": { "iap": {
+    "type": "http",
+    "url": "http://127.0.0.1:8080/_iap/mcp",
+    "headersHelper": "agent-iap headers" } } }
+```
+
+Then the MCP client and the programs the agent runs — git through
+`agent-iap git-credential`, anything else through `$(cat
+~/.config/agent-iap/token)` — share one source, and a rotated token reaches
+both without editing either.
+
 For a client that only spawns commands, `agent-iap gateway` is the same server on
 stdio — a thin relay to the daemon, holding no credential but the agent's token:
 
@@ -33,6 +50,9 @@ stdio — a thin relay to the daemon, holding no credential but the agent's toke
     "args": ["gateway", "--config", "/etc/agent-iap/iap.toml"],
     "env": { "IAP_TOKEN": "iap_..." } } } }
 ```
+
+Leave `env` out and `gateway` reads the token file instead, as every command
+an agent runs does.
 
 Three tools, and no new policy to write — `iap_request` is decided by the same
 `kind = "http"` rules the proxy already uses, through the same function:
@@ -66,12 +86,18 @@ built from the running policy, for the agent that asked — two agents on one
 daemon are told two different things:
 
 - The `initialize` response's `instructions` field: what this proxy is, that
-  credentials are never the agent's to hold, that refusals are final and
-  approvals are slow.
-- `using-this-gateway` — how to call, how to read each refusal code, and what
-  is recorded.
-- `upstream/<name>` — base URL, the credential *scheme* the proxy attaches, and
-  the rules that apply to this agent in match order.
+  `iap_request` needs no credential, that refusals are final and approvals are
+  slow — and that programs (git, SDKs, `curl`) use the HTTP gateway at the
+  address the agent reached, with its token from `$IAP_TOKEN` or the token
+  file, as the intended route rather than a way around the proxy.
+- `using-this-gateway` — how to call, how to read each refusal code, what is
+  recorded, and the HTTP gateway for programs: address, `Authorization:
+  Bearer` or `X-IAP-Token`, and where the token is.
+- `upstream/<name>` — base URL, the credential *scheme* the proxy attaches,
+  the proxied address for a program, and the rules that apply to this agent in
+  match order. An upstream fronting `https://github.com` also carries the git
+  invocation, `eval "$(agent-iap git-config …)" && git clone …`
+  ([§ Git](agents.md#git)).
 
 They are readable both as MCP resources (`skill://agent-iap/…`) and through
 `iap_skill`, for clients that only do tools. A skill names the scheme —

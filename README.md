@@ -249,8 +249,9 @@ export ANTHROPIC_AUTH_TOKEN=iap_...        # the token from step 2, not your API
 ```
 
 Git has no base URL to set, so `eval "$(agent-iap git-config)"` points
-`https://github.com/` at a `github-git` upstream instead — see
-[§ Git](docs/agents.md#git).
+`https://github.com/` at a `github-git` upstream instead, with
+`agent-iap git-credential` handing git the agent token when the proxy asks for
+it — see [§ Git](docs/agents.md#git).
 
 Or, for an agent rather than an SDK, give it the proxy as an MCP server and let
 it discover the rest — what it can reach, and how to call it, come back from the
@@ -261,6 +262,18 @@ policy itself. See [§ MCP](docs/mcp.md):
     "type": "http",
     "url": "http://127.0.0.1:8080/_iap/mcp",
     "headers": { "Authorization": "Bearer iap_..." } } } }
+```
+
+Or keep the token in `~/.config/agent-iap/token` (mode `0600`) and let the
+client read it, so the MCP connection and the git the agent runs share one
+source ([§ The agent's token](docs/agents.md#the-agents-token)) — in Claude
+Code:
+
+```json
+{ "mcpServers": { "iap": {
+    "type": "http",
+    "url": "http://127.0.0.1:8080/_iap/mcp",
+    "headersHelper": "agent-iap headers" } } }
 ```
 
 Or hand it the address and the token and nothing else. `GET /` on the proxy
@@ -363,6 +376,11 @@ What it does not give you, and you should know before relying on it:
   a stolen one is worth having and makes a second holder detectable. Neither
   binds a token to a channel, so anyone holding a copy is that agent for as long
   as it lives. That is what mTLS would buy, and it is not built yet.
+- **The agent's token is the agent's to read.** The token file and
+  `IAP_TOKEN` are how its git and its MCP client authenticate, and the gateway's
+  skills tell it where they are, so anything running as that user can present
+  it. It is worth what the ACL lets that agent do, against this proxy only;
+  workload identity is what makes a copy taken from there short-lived.
 - **Workload scopes are the agent's own declaration.** They narrow; they never
   widen. An agent that asks for everything it is entitled to has a token as broad
   as its ACL entry — short-lived and revocable, but not narrow. Treat it as

@@ -114,6 +114,16 @@ impl Rejection {
         response
             .headers_mut()
             .insert("x-iap-decision", self.code.parse().unwrap());
+        // A request with no token at all is challenged for Basic, because that
+        // is what makes git ask its credential helper for one (`agent-iap
+        // git-credential`). Without the challenge curl, under git, has no
+        // scheme to answer with and the fetch ends at this 401.
+        if self.code == "missing_credentials" {
+            response.headers_mut().insert(
+                http::header::WWW_AUTHENTICATE,
+                http::HeaderValue::from_static("Basic realm=\"agent-iap\""),
+            );
+        }
         response
     }
 }
@@ -374,10 +384,37 @@ pub(crate) fn extract_token(headers: &HeaderMap) -> Option<String> {
         return Some(value.trim().to_string());
     }
     let authorization = headers.get("authorization")?.to_str().ok()?;
+    if let Some(token) = basic_password(authorization) {
+        return Some(token);
+    }
     let token = authorization
         .strip_prefix("Bearer ")
         .or_else(|| authorization.strip_prefix("bearer "))
         .unwrap_or(authorization);
+    Some(token.trim().to_string())
+}
+
+/// The token in `Authorization: Basic base64(<anything>:<token>)`, which is
+/// how a program that only knows user and password sends it — git's credential
+/// helper above all. The user name is not read: the token alone says who is
+/// calling. A password left empty reads the user name instead, for a client
+/// that puts the token there.
+///
+/// It is the agent's own token arriving another way, never a credential for an
+/// upstream: `Authorization` is in [`IAP_HEADERS`], so it stops here whatever
+/// scheme it used, and the upstream's own is attached in its place.
+fn basic_password(authorization: &str) -> Option<String> {
+    use base64::Engine;
+    let (scheme, encoded) = authorization.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    let (user, password) = decoded.split_once(':').unwrap_or((&decoded, ""));
+    let token = if password.is_empty() { user } else { password };
     Some(token.trim().to_string())
 }
 
@@ -565,6 +602,44 @@ mod tests {
             Some("iap_abc")
         );
         assert_eq!(extract_token(&HeaderMap::new()), None);
+    }
+
+    /// Git's credential helper answers with a user name and a password, and
+    /// git sends them as Basic.
+    #[test]
+    fn the_token_can_arrive_as_the_password_of_basic() {
+        use base64::Engine;
+        let basic = |pair: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            )
+        };
+        for (pair, expected) in [
+            ("agent-iap:iap_abc", "iap_abc"),
+            ("whoever:iap_abc", "iap_abc"),
+            ("iap_abc:", "iap_abc"),
+            ("iap_abc", "iap_abc"),
+        ] {
+            assert_eq!(
+                extract_token(&headers(&[("authorization", &basic(pair))])).as_deref(),
+                Some(expected),
+                "{pair}"
+            );
+        }
+        assert_eq!(
+            extract_token(&headers(&[(
+                "authorization",
+                &basic("x:iap_abc").replace("Basic", "basic")
+            )]))
+            .as_deref(),
+            Some("iap_abc")
+        );
+        // Not base64: read as it stands, and refused as a token nobody holds.
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "Basic !!!")])).as_deref(),
+            Some("Basic !!!")
+        );
     }
 
     #[test]

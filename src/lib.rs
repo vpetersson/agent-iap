@@ -89,6 +89,7 @@ pub fn http_client() -> reqwest::Client {
 
 pub mod acl;
 pub mod admin;
+pub mod agent_token;
 pub mod approval;
 pub mod audit;
 pub mod bell;

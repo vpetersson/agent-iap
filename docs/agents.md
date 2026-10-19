@@ -236,6 +236,38 @@ on `/health`, `agent-iap mcp --server github` exchanges its agent token for one
 scoped to `github` alone, renews it two minutes before it lapses, and keeps the
 agent token for nothing but asking again.
 
+## The agent's token
+
+`iap_request` over MCP needs no credential, but the programs an agent runs —
+git, an SDK, `curl` — reach the same upstreams over the HTTP gateway, and that
+takes the agent's own token. The commands an agent runs (`git-config`,
+`git-credential`, `headers`, `gateway`, `mcp`) read it from the first of:
+
+1. `--token`, or `IAP_TOKEN`;
+2. `--token-file`, or `IAP_TOKEN_FILE`;
+3. `token` in the config directory — `~/.config/agent-iap/token`, or under
+   `$XDG_CONFIG_HOME` or `IAP_CONFIG_DIR` when those are set.
+
+```bash
+mkdir -p ~/.config/agent-iap
+(umask 077; printf '%s\n' 'iap_...' > ~/.config/agent-iap/token)
+```
+
+A file is the better home. An agent's tool shell is often not a login shell,
+so a token exported from a shell profile is simply not in it; the file is there
+for every process, the MCP client's header helper and git read the same one
+([§ MCP](mcp.md#the-gateway)), and a rotated token is picked up by the next
+command without restarting anything. A file anybody but its owner may read or
+write is refused, with the `chmod` that fixes it. The variable still wins, so a
+setup that exports it works as before.
+
+The gateway's `instructions` and `using-this-gateway` skill tell an MCP agent
+the same thing: the gateway's address, the two headers, where the token is, and
+that using it for those programs is intended rather than a way around the
+proxy. Without that, an agent told only that it holds no credential concludes
+it has none — and looking for one in its own configuration is, rightly, what an
+agent's credential-exploration guard stops.
+
 ## Git
 
 Git is a program rather than an SDK with a base URL, so it is pointed at the
@@ -245,8 +277,7 @@ proxy through its own configuration. With a `github-git` upstream enrolled
 ```bash
 agent-iap profile add github-git --secret op://Private/GitHub/token   # on the proxy's host
 
-export IAP_TOKEN=iap_...                  # the agent's own token
-export IAP_URL=http://127.0.0.1:8080
+export IAP_URL=http://127.0.0.1:8080      # and the token in ~/.config/agent-iap/token
 eval "$(agent-iap git-config)"
 git clone https://github.com/acme/api.git # unchanged — it goes through the proxy
 ```
@@ -254,22 +285,34 @@ git clone https://github.com/acme/api.git # unchanged — it goes through the pr
 `git-config` writes nothing; it prints environment variables for that `eval`:
 
 ```bash
-export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_COUNT=3
 export GIT_CONFIG_KEY_0='url.http://127.0.0.1:8080/github-git/.insteadOf'
 export GIT_CONFIG_VALUE_0='https://github.com/'
-export GIT_CONFIG_KEY_1='http.http://127.0.0.1:8080/github-git/.extraHeader'
-export GIT_CONFIG_VALUE_1="X-IAP-Token: ${IAP_TOKEN:?IAP_TOKEN is not set}"
+export GIT_CONFIG_KEY_1='credential.http://127.0.0.1:8080/github-git/.helper'
+export GIT_CONFIG_VALUE_1=''
+export GIT_CONFIG_KEY_2='credential.http://127.0.0.1:8080/github-git/.helper'
+export GIT_CONFIG_VALUE_2='!'\''/usr/local/bin/agent-iap'\'' git-credential --proxy-url '\''http://127.0.0.1:8080'\'''
 ```
 
 The first rewrites every `https://github.com/` URL to the upstream, so the
-agent never needs to know the proxied address. The second sends the agent's
-token on requests to that prefix and nowhere else, in `X-IAP-Token` because git
-sends an `Authorization` of its own when it has one; the proxy drops it and
-github.com gets the profile's `x-access-token:<PAT>`. The agent token is read
-from `$IAP_TOKEN` when the line is evaluated, so it lives in that shell's
-environment and is not written into `~/.gitconfig`. Variables already in
-`GIT_CONFIG_COUNT` are kept, and evaluating it twice does not send the header
-twice.
+agent never needs to know the proxied address. The other two make
+`agent-iap git-credential` git's credential helper for that prefix and nothing
+else: the empty one clears the helpers configured before it, so a
+`credential.helper = store` of your own is never handed the agent token to
+write to `~/.git-credentials`. When the proxy answers git's first request with
+`401` and a Basic challenge, git asks the helper, which answers with the token
+from `$IAP_TOKEN` or the token file as the password — and only when git is
+talking to the proxy's own address. The proxy takes the token from Basic as it
+does from `Authorization: Bearer`, drops it, and github.com gets the profile's
+`x-access-token:<PAT>`.
+
+No setting holds the token, which is what makes the other form safe:
+`agent-iap git-config --global | sh` writes the same three settings into
+`~/.gitconfig`, so every later shell has them without an `eval` — the form to
+use when each of an agent's tool calls is a fresh shell. Running either twice
+leaves one copy. `git-config` reads the token once itself, so a missing or
+world-readable token file is an error there rather than a `401` on the first
+clone, and a `--token-file` it was given is written into the helper.
 
 The address is `--proxy-url` (or `IAP_PROXY_URL`), then `IAP_URL`, then
 `server.listen` in the policy file — where it also says if the upstream is not
@@ -277,6 +320,11 @@ in the file. `--upstream` names one enrolled under another name. Only
 `https://github.com/` remotes are rewritten; an `ssh://` or `git@github.com:`
 remote goes around the proxy and has no credential. A push is the profile's
 `write` level, and is buffered up to `server.max_body_bytes`.
+
+Git sends the first request of each command without a credential, because it
+asks the helper only when challenged. That request is refused as
+`missing_credentials` and is in the audit log like every refusal: one line from
+`<anonymous>` per git command, just before the calls it then makes as the agent.
 
 ## Zero state
 
