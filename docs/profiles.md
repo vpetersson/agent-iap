@@ -115,7 +115,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
-| sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths) |
+| sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths), and `sbomify-self-hosted` / `sbomify-v1-self-hosted` for staging or an install of your own (`--var host=…`, `--var scheme=http` for a plain-HTTP one) |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Object storage | `s3` (`--var region=…`), `r2` (`--var account_id=…`), `s3-compatible` (`--var host=…` — MinIO, B2, Wasabi, Spaces, Ceph, …) — all `aws_sigv4`, all needing `--var access_key_id=…` and `--var bucket=…` |
 | GitHub | `github` (the REST API), `github-git` (`git clone`, `fetch` and `push` over HTTPS, `--var repo=owner/name` to narrow it) |
@@ -255,6 +255,10 @@ file in the clear, while the token stays a reference.
   `/artifacts/spdx/<component>`. v1 has been deprecated since 26 August 2026
   with no sunset date yet; it also mounts `/internal`, which `sbomify-v1`
   denies.
+  Staging and self-hosted installs use `sbomify-self-hosted` or
+  `sbomify-v1-self-hosted`: the same rules and probe at `--var host=…`, with a
+  token from that install. Enrol them `--as sbomify-staging` (or similar) to
+  keep them next to production.
 - **A Spotify token is app-only, and expires in an hour.** Spotify issues no
   long-lived API key: every call carries an OAuth access token. So `spotify` is
   the one profile whose credential the proxy *spends* rather than forwards — it

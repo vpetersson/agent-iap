@@ -239,7 +239,10 @@ verify_path = "/accounts/3f1c…/tokens/verify"
 enrolment, on `v` in the console, and on an `upstream verify` months later. An
 explicit `--path` still wins. An upstream carrying none falls back to the
 profile whose base URL matches it, so nothing has to be re-enrolled to become
-verifiable.
+verifiable. A self-hosted profile, whose host is entirely yours
+(`{scheme}://{host}/api/0`), is never matched that way: it would claim every
+upstream whose path ends the same, and probe an unrelated API at the wrong
+route. Its upstreams carry the `verify_path` their enrolment wrote.
 
 Profiles write it for the services that have somewhere safe to send it, and
 `agent-iap profile show` says which those are:
