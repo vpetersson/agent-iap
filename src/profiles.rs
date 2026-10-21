@@ -1922,6 +1922,58 @@ fn sentry_rest_access() -> Vec<Access> {
     ]
 }
 
+/// What `read`, `post` and `write` mean for a Discourse forum.
+fn discourse_access() -> Vec<Access> {
+    // The admin panel is all GETs too, and it is where a forum keeps what it
+    // does not show its members: email addresses, IP logs, staff action logs,
+    // and backups you can download. A key belonging to an admin reaches all of
+    // it, so a read level that allowed `GET /**` would hand an agent every
+    // member's email address. Matched first, so the blanket rules below never
+    // see it. `/logs` is Logster, the error log, which is admin-only as well.
+    const ADMIN: &[&str] = &["/admin", "/admin/**", "/logs", "/logs/**"];
+    // Every route answers with and without `.json`; the API documents the
+    // suffix and a client may well leave it off.
+    const POSTS: &[&str] = &["/posts", "/posts.json"];
+    const UPLOADS: &[&str] = &["/uploads", "/uploads.json"];
+    const POST_ACTIONS: &[&str] = &["/post_actions", "/post_actions.json"];
+    vec![
+        access(
+            "read",
+            "GET across the forum, minus the admin panel, which prompts",
+            &[],
+            vec![
+                rule("admin", &["*"], ADMIN, "ask"),
+                rule("reads", &["GET"], &["/**"], "allow"),
+            ],
+        ),
+        access(
+            "post",
+            "reads, plus creating topics and replies, editing posts, liking and \
+             uploading; DELETE denied, the admin panel and anything else prompts",
+            &[],
+            vec![
+                rule("admin", &["*"], ADMIN, "ask"),
+                rule("reads", &["GET"], &["/**"], "allow"),
+                // A new topic, a reply and a private message are all this one
+                // POST — the body's `archetype` and `target_recipients` tell
+                // them apart, and no path rule can.
+                rule("posts", &["POST"], POSTS, "allow"),
+                rule("edits", &["PUT"], &["/posts/*"], "allow"),
+                rule("likes", &["POST"], POST_ACTIONS, "allow"),
+                rule("uploads", &["POST"], UPLOADS, "allow"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every method across the whole API, the admin panel included",
+            &[],
+            vec![rule("all", &["*"], &["/**"], "allow")],
+        ),
+    ]
+}
+
 /// The same three levels for the MCP server, so `--access triage` means the
 /// same thing whichever of the four Sentry profiles it is given to.
 fn sentry_mcp_access() -> Vec<Access> {
@@ -3065,6 +3117,65 @@ pub fn catalog() -> Vec<Profile> {
             ],
             note: None,
             probe: None,
+        },
+        // ---------------- Discourse ----------------
+        Profile {
+            id: "discourse".into(),
+            title: "Discourse API".into(),
+            vendor: "Discourse".into(),
+            summary: "Topics, posts, categories, users and search on a Discourse forum — \
+                      yours, or one hosted for you."
+                .into(),
+            default_name: "discourse".into(),
+            credential: Credential {
+                about: "an API key from the forum's admin panel (Admin → Advanced → API \
+                        keys) with *User Level* set to **Single User** — an All Users key \
+                        needs an `Api-Username` header this profile does not send"
+                    .into(),
+                url: "https://meta.discourse.org/t/create-and-configure-an-api-key/230124"
+                    .into(),
+            },
+            vars: vec![
+                v(
+                    "host",
+                    "your forum's host, e.g. `forum.example.com` or `example.discourse.group` \
+                     — no scheme, no path; a port goes here too (`localhost:4200`)",
+                    None,
+                ),
+                v(
+                    "scheme",
+                    "`https`, or `http` for a forum that terminates TLS nowhere — the key \
+                     crosses that wire in a header",
+                    Some("https"),
+                ),
+            ],
+            service: Service::Http {
+                base_url: "{scheme}://{host}".into(),
+                auth: AuthTemplate::Header {
+                    header: "Api-Key".into(),
+                    prefix: None,
+                },
+            },
+            access: discourse_access(),
+            note: Some(
+                "Every Discourse forum is its own host, hosted by Discourse or not, so there \
+                 is no default: `--var host=…` is the forum's address, and a second forum is \
+                 a second enrolment `--as` another name. The key goes upstream as `Api-Key` \
+                 and acts as the user it was created for, so a Single User key needs nothing \
+                 else. An All Users key acts as whoever an `Api-Username` header names — \
+                 every account on the forum, the agent's choice — and without that header \
+                 it is anonymous; enrol one by hand with `upstream add --auth header \
+                 --header Api-Key --set-header Api-Username=…` if you really mean it. The \
+                 ACL decides which paths an agent reaches; the key's Granular scopes, where \
+                 you set them, decide what the forum lets that user do. A key belonging to \
+                 an admin reaches the admin panel, which every level but `write` prompts \
+                 for. Routes answer JSON with a `.json` suffix or `Accept: \
+                 application/json`, and HTML otherwise."
+                    .into(),
+            ),
+            // The user the key acts as. A Single User key gets 200 here; a key
+            // the forum does not recognise is refused before routing.
+            probe: Some("/session/current.json".into()),
         },
         // ---------------- Graylog ----------------
         Profile {
@@ -5793,6 +5904,34 @@ mod tests {
         assert!(host_is_a_var("{scheme}://{host}/api/v2"));
         assert!(!host_is_a_var("https://{region}.posthog.com"));
         assert!(!host_is_a_var("https://app.sbomify.com/api/v2"));
+    }
+
+    /// Discourse has no hosted default: every forum is its own host, and the
+    /// key goes in `Api-Key`, not `Authorization`.
+    #[test]
+    fn discourse_needs_a_host_and_sends_the_key_as_api_key() {
+        let profile = get("discourse").unwrap();
+        assert!(resolve_vars(&profile, &[]).is_err(), "no host was demanded");
+        let vars = resolve_vars(&profile, &["host=forum.example.com".into()]).unwrap();
+        let service = substitute_service(&profile.service, &vars, "").unwrap();
+        assert_eq!(service.endpoint(), "https://forum.example.com");
+        match build_auth(&service, "env:KEY", &vars, &[]).unwrap() {
+            AuthSpec::Header { header, prefix, .. } => {
+                assert_eq!(header, "Api-Key");
+                assert_eq!(prefix, None);
+            }
+            other => panic!("discourse enrolled as {other:?}"),
+        }
+        // Any forum at all would otherwise be probed as Discourse.
+        assert_eq!(probe_for("https://forum.example.com"), None);
+        // The admin panel comes before the blanket GET in every level that
+        // has one, or first-match would let it through.
+        for level in &profile.access {
+            if let Some(reads) = level.rules.iter().position(|r| r.suffix == "reads") {
+                let admin = level.rules.iter().position(|r| r.suffix == "admin");
+                assert!(admin.is_some_and(|admin| admin < reads), "`{}`", level.name);
+            }
+        }
     }
 
     #[test]

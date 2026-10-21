@@ -46,6 +46,7 @@ async fn spawn_upstream() -> SocketAddr {
             "method": request.method().as_str(),
             "authorization": header("authorization"),
             "x-api-key": header("x-api-key"),
+            "api-key": header("api-key"),
             "x-iap-token": header("x-iap-token"),
         }))
     }
@@ -2052,4 +2053,58 @@ async fn sbomify_staging_is_the_hosted_profile_at_another_host() {
         body["path"].is_null(),
         "the token exchange reached staging: {body}"
     );
+}
+
+/// A Discourse forum is wherever its operator put it, and an agent posting to
+/// it never reaches the admin panel or deletes anything without a human.
+#[tokio::test]
+async fn discourse_posts_to_the_forum_it_was_pointed_at_and_not_its_admin_panel() {
+    std::env::set_var("TEST_DISCOURSE_KEY", "discourse-single-user-key");
+    let (dir, path) = minimal_policy();
+    let mut opts = options("env:TEST_DISCOURSE_KEY");
+    opts.vars = vec!["host=forum.example.com".into()];
+    profiles::add(&path, &profiles::get("discourse").unwrap(), &opts).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("base_url = \"https://forum.example.com\""),
+        "{written}"
+    );
+    assert!(
+        written.contains("verify_path = \"/session/current.json\""),
+        "{written}"
+    );
+    drop(dir);
+
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_DISCOURSE_KEY");
+    opts.access = Some("post".into());
+    opts.vars = vec!["host=forum.example.com".into()];
+    let harness = harness_from_profiles(&[("discourse", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/discourse/latest.json").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/latest.json");
+    assert_eq!(seen["api-key"], "discourse-single-user-key");
+    assert!(seen["authorization"].is_null(), "{seen}");
+
+    for (method, path) in [
+        ("POST", "/discourse/posts.json"),
+        ("PUT", "/discourse/posts/42.json"),
+        ("POST", "/discourse/post_actions.json"),
+    ] {
+        let (status, _) = call(&harness, method, path).await;
+        assert_eq!(status, 200, "`post` refused {method} {path}");
+    }
+
+    // Admin GETs are where member emails live, so even a read prompts — and
+    // with nobody at the console, a prompt is a denial.
+    for (method, path) in [
+        ("GET", "/discourse/admin/users/list/active.json"),
+        ("DELETE", "/discourse/t/7.json"),
+        ("PUT", "/discourse/t/7/status.json"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "{method} {path} went through");
+        assert!(body["path"].is_null(), "{method} {path} reached the forum");
+    }
 }
