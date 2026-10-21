@@ -259,7 +259,7 @@ pub fn probe_for(base_url: &str) -> Option<String> {
         let Service::Http { base_url, .. } = &profile.service else {
             return None;
         };
-        if host_is_only_a_var(base_url) {
+        if host_is_a_var(base_url) {
             return None;
         }
         if !is_the_same_service(base_url.trim_end_matches('/'), wanted) {
@@ -269,17 +269,20 @@ pub fn probe_for(base_url: &str) -> Option<String> {
     })
 }
 
-/// Whether a base-URL template's host is a single `{var}` and nothing else —
-/// `https://{host}/api`, but not `https://{region}.posthog.com`.
-fn host_is_only_a_var(template: &str) -> bool {
-    let rest = template
-        .split_once("://")
-        .map_or(template, |(_, rest)| rest);
-    let host = rest.split('/').next().unwrap_or(rest);
-    host.len() > 2
-        && host.starts_with('{')
-        && host.ends_with('}')
-        && !host[1..host.len() - 1].contains(['{', '}'])
+/// Whether a base URL template leaves the whole host to the caller —
+/// `{scheme}://{host}/api/v2`.
+///
+/// Such a template matches every host there is, so as a fallback it would
+/// claim any upstream whose path happens to end the same way — an unrelated
+/// API at `/api/v2` verified against sbomify's `/workspaces/`, and reported
+/// broken for answering 404. Upstreams enrolled from one of these profiles
+/// carry the `verify_path` the enrolment wrote and never need the fallback.
+fn host_is_a_var(template: &str) -> bool {
+    let Some((_, rest)) = template.split_once("://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    host.starts_with('{') && host.ends_with('}') && host.matches('{').count() == 1
 }
 
 /// Whether an enrolled base URL is the one this profile writes.
@@ -1924,6 +1927,58 @@ fn sentry_rest_access() -> Vec<Access> {
     ]
 }
 
+/// What `read`, `post` and `write` mean for a Discourse forum.
+fn discourse_access() -> Vec<Access> {
+    // The admin panel is all GETs too, and it is where a forum keeps what it
+    // does not show its members: email addresses, IP logs, staff action logs,
+    // and backups you can download. A key belonging to an admin reaches all of
+    // it, so a read level that allowed `GET /**` would hand an agent every
+    // member's email address. Matched first, so the blanket rules below never
+    // see it. `/logs` is Logster, the error log, which is admin-only as well.
+    const ADMIN: &[&str] = &["/admin", "/admin/**", "/logs", "/logs/**"];
+    // Every route answers with and without `.json`; the API documents the
+    // suffix and a client may well leave it off.
+    const POSTS: &[&str] = &["/posts", "/posts.json"];
+    const UPLOADS: &[&str] = &["/uploads", "/uploads.json"];
+    const POST_ACTIONS: &[&str] = &["/post_actions", "/post_actions.json"];
+    vec![
+        access(
+            "read",
+            "GET across the forum, minus the admin panel, which prompts",
+            &[],
+            vec![
+                rule("admin", &["*"], ADMIN, "ask"),
+                rule("reads", &["GET"], &["/**"], "allow"),
+            ],
+        ),
+        access(
+            "post",
+            "reads, plus creating topics and replies, editing posts, liking and \
+             uploading; DELETE denied, the admin panel and anything else prompts",
+            &[],
+            vec![
+                rule("admin", &["*"], ADMIN, "ask"),
+                rule("reads", &["GET"], &["/**"], "allow"),
+                // A new topic, a reply and a private message are all this one
+                // POST — the body's `archetype` and `target_recipients` tell
+                // them apart, and no path rule can.
+                rule("posts", &["POST"], POSTS, "allow"),
+                rule("edits", &["PUT"], &["/posts/*"], "allow"),
+                rule("likes", &["POST"], POST_ACTIONS, "allow"),
+                rule("uploads", &["POST"], UPLOADS, "allow"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every method across the whole API, the admin panel included",
+            &[],
+            vec![rule("all", &["*"], &["/**"], "allow")],
+        ),
+    ]
+}
+
 /// The same three levels for the MCP server, so `--access triage` means the
 /// same thing whichever of the four Sentry profiles it is given to.
 fn sentry_mcp_access() -> Vec<Access> {
@@ -2528,6 +2583,61 @@ fn anthias_access() -> Vec<Access> {
             ],
         ),
     ]
+}
+
+/// A hosted sbomify profile pointed at a host the caller names — a staging
+/// deployment or an install of their own.
+///
+/// Same paths, same levels and same probe: the deployment decides the host,
+/// not the API, and a level that meant something different on staging would
+/// be one nobody could test against before production.
+fn sbomify_self_hosted(hosted: Profile, id: &str) -> Profile {
+    let Service::Http { base_url, auth } = hosted.service else {
+        unreachable!("the hosted sbomify profiles are HTTP");
+    };
+    let path = base_url
+        .strip_prefix("https://app.sbomify.com")
+        .expect("the hosted sbomify profiles front app.sbomify.com");
+    Profile {
+        id: id.into(),
+        title: hosted
+            .title
+            .replacen("sbomify API", "sbomify API, self-hosted", 1),
+        summary: format!("{} On staging or an install of your own.", hosted.summary),
+        credential: Credential {
+            about: "a personal access token from *that* install, under workspace settings → \
+                    Tokens — an app.sbomify.com token is not valid anywhere else"
+                .into(),
+            url: "https://github.com/sbomify/sbomify/blob/master/docs/deployment.md".into(),
+        },
+        vars: vec![
+            v(
+                "host",
+                "your sbomify host, e.g. `sbomify.example.com` or a staging host — no \
+                 scheme, no `/api/…`; a port goes here too (`localhost:8000`)",
+                None,
+            ),
+            v(
+                "scheme",
+                "`https`, or `http` for an install that terminates TLS nowhere — the \
+                 token crosses that wire in a header",
+                Some("https"),
+            ),
+        ],
+        service: Service::Http {
+            base_url: format!("{{scheme}}://{{host}}{path}"),
+            auth,
+        },
+        note: hosted.note.map(|note| {
+            format!(
+                "The same API and the same rules as `{}`, at the host you name. What \
+                 answers is that install's release, not app.sbomify.com's: an endpoint \
+                 it predates is a 404 rather than a denial. {note}",
+                hosted.id
+            )
+        }),
+        ..hosted
+    }
 }
 
 pub fn catalog() -> Vec<Profile> {
@@ -3201,6 +3311,65 @@ pub fn catalog() -> Vec<Profile> {
             note: None,
             probe: None,
         },
+        // ---------------- Discourse ----------------
+        Profile {
+            id: "discourse".into(),
+            title: "Discourse API".into(),
+            vendor: "Discourse".into(),
+            summary: "Topics, posts, categories, users and search on a Discourse forum — \
+                      yours, or one hosted for you."
+                .into(),
+            default_name: "discourse".into(),
+            credential: Credential {
+                about: "an API key from the forum's admin panel (Admin → Advanced → API \
+                        keys) with *User Level* set to **Single User** — an All Users key \
+                        needs an `Api-Username` header this profile does not send"
+                    .into(),
+                url: "https://meta.discourse.org/t/create-and-configure-an-api-key/230124"
+                    .into(),
+            },
+            vars: vec![
+                v(
+                    "host",
+                    "your forum's host, e.g. `forum.example.com` or `example.discourse.group` \
+                     — no scheme, no path; a port goes here too (`localhost:4200`)",
+                    None,
+                ),
+                v(
+                    "scheme",
+                    "`https`, or `http` for a forum that terminates TLS nowhere — the key \
+                     crosses that wire in a header",
+                    Some("https"),
+                ),
+            ],
+            service: Service::Http {
+                base_url: "{scheme}://{host}".into(),
+                auth: AuthTemplate::Header {
+                    header: "Api-Key".into(),
+                    prefix: None,
+                },
+            },
+            access: discourse_access(),
+            note: Some(
+                "Every Discourse forum is its own host, hosted by Discourse or not, so there \
+                 is no default: `--var host=…` is the forum's address, and a second forum is \
+                 a second enrolment `--as` another name. The key goes upstream as `Api-Key` \
+                 and acts as the user it was created for, so a Single User key needs nothing \
+                 else. An All Users key acts as whoever an `Api-Username` header names — \
+                 every account on the forum, the agent's choice — and without that header \
+                 it is anonymous; enrol one by hand with `upstream add --auth header \
+                 --header Api-Key --set-header Api-Username=…` if you really mean it. The \
+                 ACL decides which paths an agent reaches; the key's Granular scopes, where \
+                 you set them, decide what the forum lets that user do. A key belonging to \
+                 an admin reaches the admin panel, which every level but `write` prompts \
+                 for. Routes answer JSON with a `.json` suffix or `Accept: \
+                 application/json`, and HTML otherwise."
+                    .into(),
+            ),
+            // The user the key acts as. A Single User key gets 200 here; a key
+            // the forum does not recognise is refused before routing.
+            probe: Some("/session/current.json".into()),
+        },
         // ---------------- Graylog ----------------
         Profile {
             id: "graylog".into(),
@@ -3751,9 +3920,8 @@ pub fn catalog() -> Vec<Profile> {
                  to the Trust Center is a field in an ordinary `PATCH`, the same call that \
                  renames it, so `triage` and `publish` prompt for both. A path without its \
                  trailing slash gets a 301 rather than an answer — `/workspaces/`, not \
-                 `/workspaces`. A self-hosted install is the same API at your own host: \
-                 enrol with `--dry-run` and change `base_url`. v1 is a separate profile, \
-                 `sbomify-v1`."
+                 `/workspaces`. Staging or an install of your own is \
+                 `sbomify-self-hosted`. v1 is a separate profile, `sbomify-v1`."
                     .into(),
             ),
             // Every plan, every role, and a 401 for a garbage token — unlike the
@@ -4369,6 +4537,18 @@ pub fn catalog() -> Vec<Profile> {
         profiles.push(cloudflare_mcp(slug, host, title, summary));
     }
     profiles.extend(google_cloud_profiles());
+    // Staging, or an install of your own, is the same API at another host.
+    for (hosted, id) in [
+        ("sbomify", "sbomify-self-hosted"),
+        ("sbomify-v1", "sbomify-v1-self-hosted"),
+    ] {
+        let hosted = profiles
+            .iter()
+            .find(|profile| profile.id == hosted)
+            .expect("the hosted sbomify profiles are in the catalog")
+            .clone();
+        profiles.push(sbomify_self_hosted(hosted, id));
+    }
 
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     profiles
@@ -6041,6 +6221,68 @@ mod tests {
             write("GET", "/auth/oidc/github/bindings").as_deref(),
             Some("allow")
         );
+    }
+
+    /// The self-hosted profiles are the hosted ones with the host left to the
+    /// caller — and because that host could be anything, they never claim an
+    /// upstream by URL, or every `/api/v2` API would be probed at `/workspaces/`.
+    #[test]
+    fn self_hosted_sbomify_is_the_hosted_api_and_claims_no_other_upstream() {
+        for (hosted, id, path) in [
+            ("sbomify", "sbomify-self-hosted", "/api/v2"),
+            ("sbomify-v1", "sbomify-v1-self-hosted", "/api/v1"),
+        ] {
+            let hosted = get(hosted).unwrap();
+            let profile = get(id).unwrap();
+            assert_eq!(profile.endpoint(), format!("{{scheme}}://{{host}}{path}"));
+            assert_eq!(profile.probe, hosted.probe, "`{id}`");
+            assert_eq!(profile.default_name, hosted.default_name, "`{id}`");
+            let levels = |p: &Profile| {
+                p.access
+                    .iter()
+                    .map(|l| (l.name.clone(), format!("{:?}", l.rules)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(levels(&profile), levels(&hosted), "`{id}`");
+            assert!(resolve_vars(&profile, &[]).is_err(), "`{id}` needs a host");
+        }
+        assert_eq!(probe_for("https://api.example.com/api/v2"), None);
+        assert_eq!(probe_for("https://sbomify.example.com/api/v1"), None);
+        assert_eq!(
+            probe_for("https://app.sbomify.com/api/v2").as_deref(),
+            Some("/workspaces/")
+        );
+        assert!(host_is_a_var("{scheme}://{host}/api/v2"));
+        assert!(!host_is_a_var("https://{region}.posthog.com"));
+        assert!(!host_is_a_var("https://app.sbomify.com/api/v2"));
+    }
+
+    /// Discourse has no hosted default: every forum is its own host, and the
+    /// key goes in `Api-Key`, not `Authorization`.
+    #[test]
+    fn discourse_needs_a_host_and_sends_the_key_as_api_key() {
+        let profile = get("discourse").unwrap();
+        assert!(resolve_vars(&profile, &[]).is_err(), "no host was demanded");
+        let vars = resolve_vars(&profile, &["host=forum.example.com".into()]).unwrap();
+        let service = substitute_service(&profile.service, &vars, "").unwrap();
+        assert_eq!(service.endpoint(), "https://forum.example.com");
+        match build_auth(&service, "env:KEY", &vars, &[]).unwrap() {
+            AuthSpec::Header { header, prefix, .. } => {
+                assert_eq!(header, "Api-Key");
+                assert_eq!(prefix, None);
+            }
+            other => panic!("discourse enrolled as {other:?}"),
+        }
+        // Any forum at all would otherwise be probed as Discourse.
+        assert_eq!(probe_for("https://forum.example.com"), None);
+        // The admin panel comes before the blanket GET in every level that
+        // has one, or first-match would let it through.
+        for level in &profile.access {
+            if let Some(reads) = level.rules.iter().position(|r| r.suffix == "reads") {
+                let admin = level.rules.iter().position(|r| r.suffix == "admin");
+                assert!(admin.is_some_and(|admin| admin < reads), "`{}`", level.name);
+            }
+        }
     }
 
     #[test]

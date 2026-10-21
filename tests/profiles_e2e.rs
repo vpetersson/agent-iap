@@ -46,6 +46,7 @@ async fn spawn_upstream() -> SocketAddr {
             "method": request.method().as_str(),
             "authorization": header("authorization"),
             "x-api-key": header("x-api-key"),
+            "api-key": header("api-key"),
             "x-iap-token": header("x-iap-token"),
         }))
     }
@@ -2064,4 +2065,121 @@ async fn the_header_helper_reads_the_same_token_file() {
     ))
     .await;
     assert!(stdout.contains("Bearer iap_from_env"), "{stdout}");
+}
+
+/// Staging next to production: the self-hosted profiles are the hosted ones at
+/// a host the operator names, with the same probe and the same rules.
+#[tokio::test]
+async fn sbomify_staging_is_the_hosted_profile_at_another_host() {
+    std::env::set_var("TEST_SBOMIFY_STAGING", "sbomify-staging-pat");
+    let (dir, path) = minimal_policy();
+
+    profiles::add(
+        &path,
+        &profiles::get("sbomify").unwrap(),
+        &options("env:TEST_SBOMIFY_STAGING"),
+    )
+    .unwrap();
+    for (id, name, host) in [
+        (
+            "sbomify-self-hosted",
+            "sbomify-staging",
+            "staging.sbomify.example.com",
+        ),
+        ("sbomify-v1-self-hosted", "sbomify-local", "localhost:8000"),
+    ] {
+        let mut opts = options("env:TEST_SBOMIFY_STAGING");
+        opts.name = Some(name.into());
+        opts.vars = vec![format!("host={host}")];
+        if host.starts_with("localhost") {
+            opts.vars.push("scheme=http".into());
+        }
+        profiles::add(&path, &profiles::get(id).unwrap(), &opts).unwrap();
+    }
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    for base_url in [
+        "https://app.sbomify.com/api/v2",
+        "https://staging.sbomify.example.com/api/v2",
+        "http://localhost:8000/api/v1",
+    ] {
+        assert!(
+            written.contains(&format!("base_url = \"{base_url}\"")),
+            "{written}"
+        );
+    }
+    assert_eq!(written.matches("verify_path = \"/workspaces/\"").count(), 3);
+    drop(dir);
+
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SBOMIFY_STAGING");
+    opts.access = Some("publish".into());
+    opts.vars = vec!["host=staging.sbomify.example.com".into()];
+    let harness = harness_from_profiles(&[("sbomify-self-hosted", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "POST", "/sbomify/artifacts/cyclonedx/abc123").await;
+    assert_eq!(status, 200, "an upload was refused on staging");
+    assert_eq!(seen["path"], "/api/v2/artifacts/cyclonedx/abc123");
+    assert_eq!(seen["authorization"], "Bearer sbomify-staging-pat");
+
+    let (status, body) = call(&harness, "POST", "/sbomify/auth/oidc/github/exchange").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "the token exchange reached staging: {body}"
+    );
+}
+
+/// A Discourse forum is wherever its operator put it, and an agent posting to
+/// it never reaches the admin panel or deletes anything without a human.
+#[tokio::test]
+async fn discourse_posts_to_the_forum_it_was_pointed_at_and_not_its_admin_panel() {
+    std::env::set_var("TEST_DISCOURSE_KEY", "discourse-single-user-key");
+    let (dir, path) = minimal_policy();
+    let mut opts = options("env:TEST_DISCOURSE_KEY");
+    opts.vars = vec!["host=forum.example.com".into()];
+    profiles::add(&path, &profiles::get("discourse").unwrap(), &opts).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("base_url = \"https://forum.example.com\""),
+        "{written}"
+    );
+    assert!(
+        written.contains("verify_path = \"/session/current.json\""),
+        "{written}"
+    );
+    drop(dir);
+
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_DISCOURSE_KEY");
+    opts.access = Some("post".into());
+    opts.vars = vec!["host=forum.example.com".into()];
+    let harness = harness_from_profiles(&[("discourse", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/discourse/latest.json").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/latest.json");
+    assert_eq!(seen["api-key"], "discourse-single-user-key");
+    assert!(seen["authorization"].is_null(), "{seen}");
+
+    for (method, path) in [
+        ("POST", "/discourse/posts.json"),
+        ("PUT", "/discourse/posts/42.json"),
+        ("POST", "/discourse/post_actions.json"),
+    ] {
+        let (status, _) = call(&harness, method, path).await;
+        assert_eq!(status, 200, "`post` refused {method} {path}");
+    }
+
+    // Admin GETs are where member emails live, so even a read prompts — and
+    // with nobody at the console, a prompt is a denial.
+    for (method, path) in [
+        ("GET", "/discourse/admin/users/list/active.json"),
+        ("DELETE", "/discourse/t/7.json"),
+        ("PUT", "/discourse/t/7/status.json"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "{method} {path} went through");
+        assert!(body["path"].is_null(), "{method} {path} reached the forum");
+    }
 }
