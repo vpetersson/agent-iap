@@ -248,6 +248,11 @@ impl Profile {
 /// A probe still holding a `{var}` is skipped: it was never expanded, so the
 /// path would be nonsense. Those upstreams need the real `verify_path` the
 /// enrolment writes.
+///
+/// So is a self-hosted profile whose host is nothing but a variable. Its base
+/// URL names no vendor — `{scheme}://{host}/api` is Anthias's, and also the
+/// shape of every Graylog upstream there is — so matching on it would claim
+/// other services' upstreams and probe them at a path they do not have.
 pub fn probe_for(base_url: &str) -> Option<String> {
     let wanted = base_url.trim_end_matches('/');
     catalog().into_iter().find_map(|profile| {
@@ -2392,6 +2397,194 @@ fn sbomify_access(paths: &SbomifyPaths) -> Vec<Access> {
     ]
 }
 
+/// The Screenly v4 resources that make up what plays: content, its grouping,
+/// the playlists it is scheduled in, and the labels that point playlists at
+/// screens. Both spellings, because v4.1 is a superset served beside v4 rather
+/// than a replacement for it — the CLI still calls `/v4/…` for most of these —
+/// and a rule naming one version would be one version wide.
+const SCREENLY_CONTENT: &[&str] = &[
+    "/v4/assets",
+    "/v4/asset-groups",
+    "/v4/playlists",
+    "/v4/playlist-items",
+    "/v4/labels",
+    "/v4/labels/screens",
+    "/v4/labels/playlists",
+    "/v4.1/assets",
+    "/v4.1/asset-groups",
+    "/v4.1/playlists",
+    "/v4.1/playlist-items",
+    "/v4.1/labels",
+    "/v4.1/labels/screens",
+    "/v4.1/labels/playlists",
+];
+
+/// What `read`, `content` and `write` mean for the Screenly REST API.
+///
+/// The decision an operator is making is not "may it write" but "may it change
+/// what is on the screens, or the fleet itself". `content` is the first:
+/// assets, playlists and labels. Pairing a screen (`POST /screens`) claims a
+/// device for the account and bills for it, deleting one releases it, and
+/// sharing a playlist hands it to another team — those prompt, and a DELETE
+/// outside content is refused.
+fn screenly_rest_access() -> Vec<Access> {
+    let reads = || rule("reads", &["GET"], &["/**"], "allow");
+    vec![
+        access("read", "GET across the whole API", &[], vec![reads()]),
+        access(
+            "content",
+            "reads, plus creating and editing assets, playlists and labels; their \
+             DELETEs prompt, any other DELETE is denied, anything else prompts",
+            &[],
+            vec![
+                reads(),
+                rule("content", &["POST", "PATCH"], SCREENLY_CONTENT, "allow"),
+                rule("content-deletes", &["DELETE"], SCREENLY_CONTENT, "ask"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every method",
+            &[],
+            vec![rule("all", &["*"], &["/**"], "allow")],
+        ),
+    ]
+}
+
+/// What `read`, `content` and `write` mean for the Screenly CLI's MCP server:
+/// the same split as the REST levels, on the tools that make those calls.
+fn screenly_mcp_access() -> Vec<Access> {
+    // `edge_app_list_settings` and `edge_app_list_instances` are reads too.
+    const READS: &[&str] = &["*_list", "*_list_*", "*_get"];
+    // Every create and update on content, and linking a label to a screen or a
+    // playlist, which is how a playlist reaches a screen at all. Not the
+    // shared-playlist tools, and not `edge_app_publish_from_html`, which
+    // creates and deploys an app in one call.
+    const CONTENT: &[&str] = &[
+        "asset_create",
+        "asset_update",
+        "asset_group_create",
+        "asset_group_update",
+        "playlist_create",
+        "playlist_update",
+        "playlist_item_create",
+        "playlist_item_update",
+        "label_create",
+        "label_update",
+        "label_link_*",
+        "label_unlink_*",
+    ];
+    vec![
+        access(
+            "read",
+            "the list and get tools; everything else prompts",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "content",
+            "also creating and editing assets, playlists and labels; deletes, sharing \
+             and publishing an Edge App prompt",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("content", &["tools/call"], CONTENT, "allow"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every tool the server exposes",
+            &[],
+            vec![rule("tools", &["tools/call"], &["**"], "allow")],
+        ),
+    ]
+}
+
+/// `http` or `https`, and nothing that would expand into a base URL the
+/// proxy cannot dial — refused where it is typed rather than at the first call.
+fn http_scheme(value: &str) -> std::result::Result<(), String> {
+    match value {
+        "http" | "https" => Ok(()),
+        _ => Err("expected `https`, or `http` for a device without TLS".into()),
+    }
+}
+
+/// What `read`, `content` and `write` mean for an Anthias player's API.
+///
+/// Rules name v2 only. The v1 surfaces (`/v1`, `/v1.1`, `/v1.2`) are kept by
+/// Anthias for old integrations and fall through to `acl_default`, so nothing
+/// here grants them by accident — except at `write`, which is every method on
+/// every path, and therefore names v1's shutdown and recover alongside v2's.
+fn anthias_access() -> Vec<Access> {
+    // `GET /v2/assets/control/<command>` switches what is on the screen — a
+    // GET with a side effect. It also overlaps `/v2/assets/*/content` at
+    // `control/content`, so it has to be decided before the reads are.
+    const PLAYBACK: &[&str] = &["/v2/assets/control/*"];
+    const READS: &[&str] = &[
+        "/v2/assets",
+        "/v2/assets/*",
+        "/v2/assets/*/content",
+        "/v2/device_settings",
+        "/v2/info",
+        "/v2/integrations",
+        "/v2/network/ip-addresses",
+    ];
+    // Settings can change the username and password this proxy holds, or turn
+    // authentication off; shutdown leaves a device only a power cycle brings
+    // back; recover replaces everything on it with the contents of an upload.
+    const DEVICE: &[&str] = &[
+        "/v2/device_settings",
+        "/v2/shutdown",
+        "/v2/recover",
+        "/v1/shutdown",
+        "/v1/recover",
+    ];
+    let reads = || rule("reads", &["GET"], READS, "allow");
+    vec![
+        access(
+            "read",
+            "assets, settings and system information; switching what is on screen prompts",
+            &[],
+            vec![rule("playback", &["GET"], PLAYBACK, "ask"), reads()],
+        ),
+        access(
+            "content",
+            "reads, playback, and adding, editing and reordering assets; deleting one \
+             prompts, and so does anything touching the device",
+            &[],
+            vec![
+                rule("playback", &["GET"], PLAYBACK, "allow"),
+                reads(),
+                rule(
+                    "assets",
+                    &["POST"],
+                    &["/v2/assets", "/v2/assets/order", "/v2/file_asset"],
+                    "allow",
+                ),
+                rule("asset-edits", &["PUT", "PATCH"], &["/v2/assets/*"], "allow"),
+                rule("asset-deletes", &["DELETE"], &["/v2/assets/*"], "ask"),
+                rule("other", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every method, except changing settings, shutting down or restoring a backup, \
+             which prompt",
+            &[],
+            vec![
+                rule("device", &["PATCH", "POST"], DEVICE, "ask"),
+                rule("all", &["*"], &["/**"], "allow"),
+            ],
+        ),
+    ]
+}
+
 /// A hosted sbomify profile pointed at a host the caller names — a staging
 /// deployment or an install of their own.
 ///
@@ -3772,6 +3965,157 @@ pub fn catalog() -> Vec<Profile> {
                     .into(),
             ),
             probe: Some("/workspaces/".into()),
+        },
+        // ---------------- Screenly ----------------
+        Profile {
+            id: "screenly".into(),
+            title: "Screenly API (v4)".into(),
+            vendor: "Screenly".into(),
+            summary: "Screens, assets, playlists, labels and Edge Apps on a Screenly account."
+                .into(),
+            default_name: "screenly".into(),
+            credential: Credential {
+                about: "an API token (Account → Security → API tokens)".into(),
+                url: "https://login.screenlyapp.com/manage/account/security".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.screenlyapp.com".into(),
+                auth: AuthTemplate::Header {
+                    header: "authorization".into(),
+                    // `Token`, not `Bearer`. The reference calls the scheme
+                    // "Bearer" and then documents `Authorization: Token
+                    // <token>`; the CLI sends `Token`, and that is the spelling
+                    // to trust.
+                    prefix: Some("Token ".into()),
+                },
+            },
+            access: screenly_rest_access(),
+            note: Some(
+                "The API is PostgREST: a call names its rows in the query string — \
+                 `PATCH /v4/assets?id=eq.<id>` — and rules match the path and never the query, \
+                 so the ACL can say *which kind* of object an agent may change but not *which \
+                 one*. A PATCH or DELETE without a filter is a statement about every row the \
+                 token can see; Screenly decides what that does, not this proxy, which is why \
+                 `content` prompts for its DELETEs rather than allowing them. The version is \
+                 part of the path — `/v4/…` and `/v4.1/…` are served side by side and the \
+                 rules name both. `/v3/…` is still live too (`/v3/me`, Edge App deploys): its GETs \
+                 are reads like any other, and nothing below `write` allows it more. Pairing a \
+                 screen is `POST /v4/screens` with its PIN and adds a billed device to the \
+                 account, so `content` prompts for it. Edge App secrets are write-only: \
+                 Screenly answers a GET on them with a 405."
+                    .into(),
+            ),
+            // The call the CLI makes to check a token at `screenly login`. A
+            // garbage token is a 401 here, and a good one on an account with
+            // no screens is a 200 with an empty list.
+            probe: Some("/v4/screens?limit=1".into()),
+        },
+        Profile {
+            id: "screenly-mcp".into(),
+            title: "Screenly MCP server".into(),
+            vendor: "Screenly".into(),
+            summary: "The Screenly CLI's built-in MCP server — screens, assets, playlists, \
+                      labels and Edge Apps as tools."
+                .into(),
+            default_name: "screenly-mcp".into(),
+            credential: Credential {
+                about: "an API token — the same one the `screenly` profile takes".into(),
+                url: "https://login.screenlyapp.com/manage/account/security".into(),
+            },
+            vars: vec![],
+            service: Service::McpStdio {
+                command: "screenly".into(),
+                args: vec!["mcp".into()],
+                env: vec![("API_TOKEN".into(), "{secret}".into())],
+            },
+            access: screenly_mcp_access(),
+            note: Some(
+                "Screenly has no hosted MCP endpoint: the server is `screenly mcp`, so the \
+                 Screenly CLI has to be installed where the proxy runs. The token reaches the \
+                 child as `API_TOKEN`, from the same `--secret` reference every other profile \
+                 takes, and the child calls Screenly with it directly — the proxy rules on and \
+                 logs every JSON-RPC message, but it is not between the child and Screenly. \
+                 `edge_app_publish_from_html` creates an Edge App, deploys it and makes an \
+                 instance in one call, and remembers what it made in `~/.screenly.d` on the \
+                 machine running the child; below `write` it prompts. For a credential the \
+                 proxy itself attaches, use the `screenly` REST profile."
+                    .into(),
+            ),
+            probe: None,
+        },
+        // ---------------- Anthias ----------------
+        Profile {
+            id: "anthias".into(),
+            title: "Anthias API (v2)".into(),
+            vendor: "Screenly".into(),
+            summary: "One self-hosted Anthias player: its assets and playlist, settings and \
+                      system information."
+                .into(),
+            default_name: "anthias".into(),
+            credential: Credential {
+                about: "the password set under Settings → Authentication on the device — the \
+                        username goes beside it as `--var username=…`"
+                    .into(),
+                url: "https://anthias.screenly.io/api/".into(),
+            },
+            vars: vec![
+                v(
+                    "host",
+                    "the player's address, e.g. `anthias.local` or `192.168.1.20` — add \
+                     `:8000` for a development install; no scheme, no `/api`",
+                    None,
+                ),
+                v(
+                    "username",
+                    "the username set beside the password under Settings → Authentication. \
+                     Names the account rather than proving it, so it goes in the file in \
+                     the clear.",
+                    None,
+                ),
+                Var {
+                    check: Some(http_scheme),
+                    ..v(
+                        "scheme",
+                        "`https` for a device with TLS enabled (`bin/enable_ssl.sh`), or \
+                         `http` for a stock install — the password then crosses that \
+                         network in a header",
+                        Some("https"),
+                    )
+                },
+            ],
+            service: Service::Http {
+                base_url: "{scheme}://{host}/api".into(),
+                auth: AuthTemplate::Basic {
+                    username_var: "username".into(),
+                },
+            },
+            access: anthias_access(),
+            note: Some(
+                "Authentication is off on a new Anthias device, and while it is off the device \
+                 ignores the credential: every call succeeds, `verify` proves only that the \
+                 player answered, and anything else on its network can drive it without \
+                 coming through this proxy. Turn it on under Settings → Authentication first. \
+                 Then a wrong password is a 401, and a request with no credential at all is a \
+                 302 to `/login/` rather than a 401. A stock install serves plain HTTP on port \
+                 80, so it needs `--var scheme=http`; the default is `https`, which only a \
+                 device set up with `bin/enable_ssl.sh` answers. Anthias logs HTTP Basic as \
+                 deprecated, but it is the only credential its API takes outside a browser \
+                 session today. One upstream fronts one player: add the profile once per \
+                 device with `--as anthias-<where>`. `GET /v2/assets/control/<command>` \
+                 changes what is on the screen, so `read` prompts for it. Changing settings \
+                 can change the very username and password this proxy holds, or switch \
+                 authentication off, so no level allows it without asking, and the same \
+                 goes for shutdown and restoring a backup. The Screenly migration and import endpoints under \
+                 `/v2/integrations` take another service's token in the request body, which \
+                 the agent would have to hold; they prompt below `write`. Rules name v2; the \
+                 v1, v1.1 and v1.2 surfaces fall through to the default below `write`."
+                    .into(),
+            ),
+            // Authenticated on a device with auth on — a 401 for a wrong
+            // password — and cheap enough to call: no side effect, unlike the
+            // unauthenticated `/v2/network/ip-addresses`.
+            probe: Some("/v2/info".into()),
         },
         // ---------------- Common neighbours ----------------
         Profile {
@@ -5671,6 +6015,13 @@ mod tests {
     /// is `/artifacts/cyclonedx/*`, and its metadata enrichment one segment
     /// deeper is a different rule.
     fn sbomify_decides(id: &str, level: &str, method: &str, path: &str) -> Option<String> {
+        decides(id, level, method, path)
+    }
+
+    /// The action of the first rule in `level` that matches, or `None` when the
+    /// request falls through to `acl_default`. For an MCP profile the method is
+    /// `tools/call` and the path is the tool's name.
+    fn decides(id: &str, level: &str, method: &str, path: &str) -> Option<String> {
         let profile = get(id).unwrap();
         let level = profile.find_access(level).unwrap();
         level
@@ -5946,5 +6297,225 @@ mod tests {
         let profile = get("graylog").unwrap();
         assert!(resolve_vars(&profile, &[]).is_err());
         assert!(resolve_vars(&profile, &["host=g.example.com".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn screenly_authenticates_as_token_and_probes_the_call_the_cli_checks_with() {
+        let profile = get("screenly").unwrap();
+        match build_auth(
+            &profile.service,
+            "op://P/Screenly/token",
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap()
+        {
+            // The reference calls it bearer; `Bearer <token>` is a 401.
+            AuthSpec::Header {
+                header,
+                secret,
+                prefix,
+            } => {
+                assert_eq!(header, "authorization");
+                assert_eq!(secret, "op://P/Screenly/token");
+                assert_eq!(prefix.as_deref(), Some("Token "));
+            }
+            other => panic!("`screenly` authenticates `Token <token>`, got {other:?}"),
+        }
+        assert_eq!(profile.endpoint(), "https://api.screenlyapp.com");
+        assert_eq!(profile.probe.as_deref(), Some("/v4/screens?limit=1"));
+        assert_eq!(
+            probe_for("https://api.screenlyapp.com/").as_deref(),
+            Some("/v4/screens?limit=1")
+        );
+        let names: Vec<_> = profile.access.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names, ["read", "content", "write"]);
+    }
+    #[test]
+    fn screenly_content_edits_what_plays_and_not_the_fleet() {
+        let at = |level: &str, method: &str, path: &str| decides("screenly", level, method, path);
+        for version in ["v4", "v4.1"] {
+            for resource in ["assets", "playlists", "playlist-items", "labels/screens"] {
+                let path = format!("/{version}/{resource}");
+                assert_eq!(at("read", "GET", &path).as_deref(), Some("allow"));
+                assert_eq!(at("read", "PATCH", &path), None, "`PATCH {path}` at `read`");
+                assert_eq!(at("content", "POST", &path).as_deref(), Some("allow"));
+                assert_eq!(at("content", "PATCH", &path).as_deref(), Some("allow"));
+                // The row is in the query string, which no rule sees.
+                assert_eq!(at("content", "DELETE", &path).as_deref(), Some("ask"));
+            }
+            // Pairing bills for a device, unpairing releases one, sharing hands
+            // a playlist to another team.
+            let screens = format!("/{version}/screens");
+            assert_eq!(at("content", "POST", &screens).as_deref(), Some("ask"));
+            assert_eq!(at("content", "DELETE", &screens).as_deref(), Some("deny"));
+            let shared = format!("/{version}/playlists/shared");
+            assert_eq!(at("content", "POST", &shared).as_deref(), Some("ask"));
+        }
+        assert_eq!(
+            at("content", "POST", "/v3/edge-apps/abc/deploy").as_deref(),
+            Some("ask")
+        );
+        assert_eq!(
+            at("write", "DELETE", "/v4/screens").as_deref(),
+            Some("allow")
+        );
+    }
+
+    #[test]
+    fn screenly_mcp_hands_the_child_the_token_reference_and_scopes_its_tools() {
+        let profile = get("screenly-mcp").unwrap();
+        let Service::McpStdio { command, args, env } =
+            substitute_service(&profile.service, &BTreeMap::new(), "op://P/Screenly/token")
+                .unwrap()
+        else {
+            panic!("`screenly-mcp` is `screenly mcp` as a child process");
+        };
+        assert_eq!(command, "screenly");
+        assert_eq!(args, ["mcp"]);
+        assert_eq!(
+            env,
+            [("API_TOKEN".to_string(), "op://P/Screenly/token".to_string())]
+        );
+
+        let at = |level: &str, tool: &str| decides("screenly-mcp", level, "tools/call", tool);
+        for tool in ["screen_list", "asset_get", "edge_app_list_settings"] {
+            assert_eq!(at("read", tool).as_deref(), Some("allow"), "`{tool}`");
+        }
+        for tool in ["asset_create", "playlist_item_update", "label_link_screen"] {
+            assert_eq!(
+                at("read", tool).as_deref(),
+                Some("ask"),
+                "`{tool}` at `read`"
+            );
+            assert_eq!(at("content", tool).as_deref(), Some("allow"), "`{tool}`");
+        }
+        for tool in [
+            "asset_delete",
+            "shared_playlist_create",
+            "edge_app_publish_from_html",
+        ] {
+            assert_eq!(at("content", tool).as_deref(), Some("ask"), "`{tool}`");
+            assert_eq!(at("write", tool).as_deref(), Some("allow"), "`{tool}`");
+        }
+    }
+
+    #[test]
+    fn anthias_signs_in_as_the_device_user_and_refuses_a_scheme_it_cannot_dial() {
+        let profile = get("anthias").unwrap();
+        let vars = resolve_vars(
+            &profile,
+            &[
+                "host=anthias.local".to_string(),
+                "username=pi".to_string(),
+                "scheme=http".to_string(),
+            ],
+        )
+        .unwrap();
+        let service = substitute_service(&profile.service, &vars, "op://P/Anthias/pw").unwrap();
+        assert_eq!(service.endpoint(), "http://anthias.local/api");
+        match build_auth(&service, "op://P/Anthias/pw", &vars, &[]).unwrap() {
+            AuthSpec::Basic {
+                username,
+                username_secret,
+                secret,
+            } => {
+                assert_eq!(username.as_deref(), Some("pi"));
+                assert!(username_secret.is_none());
+                assert_eq!(secret, "op://P/Anthias/pw");
+            }
+            other => panic!("`anthias` authenticates HTTP Basic, got {other:?}"),
+        }
+        // TLS is opt-in on the device, but the default is not to send the
+        // password in the clear.
+        let defaulted = resolve_vars(
+            &profile,
+            &["host=anthias.local".to_string(), "username=pi".to_string()],
+        )
+        .unwrap();
+        assert_eq!(defaulted["scheme"], "https");
+        let err = resolve_vars(
+            &profile,
+            &[
+                "host=anthias.local".to_string(),
+                "username=pi".to_string(),
+                "scheme=ftp".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scheme=ftp"), "{err:#}");
+        // The enrolment writes the probe; the base-URL fallback cannot, since
+        // `{scheme}://{host}/api` is also the shape of every Graylog upstream.
+        assert_eq!(profile.probe.as_deref(), Some("/v2/info"));
+        assert_eq!(probe_for("http://192.168.1.20:8000/api"), None);
+        assert_eq!(probe_for("https://graylog.example.com:9000/api"), None);
+    }
+
+    #[test]
+    fn anthias_read_never_changes_the_screen_and_no_level_rewrites_its_password() {
+        let at = |level: &str, method: &str, path: &str| decides("anthias", level, method, path);
+        for path in ["/v2/assets", "/v2/assets/abc123/content", "/v2/info"] {
+            assert_eq!(
+                at("read", "GET", path).as_deref(),
+                Some("allow"),
+                "`{path}`"
+            );
+        }
+        // A GET that switches what is on screen — including the spelling that
+        // also matches `/v2/assets/*/content`.
+        for path in ["/v2/assets/control/next", "/v2/assets/control/content"] {
+            assert_eq!(at("read", "GET", path).as_deref(), Some("ask"), "`{path}`");
+            assert_eq!(at("content", "GET", path).as_deref(), Some("allow"));
+        }
+        // Rules name v2; the legacy versions are left to the default.
+        assert_eq!(at("read", "GET", "/v1/assets/control/next"), None);
+        assert_eq!(at("read", "PATCH", "/v2/device_settings"), None);
+
+        assert_eq!(
+            at("content", "POST", "/v2/assets").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            at("content", "POST", "/v2/file_asset").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            at("content", "PATCH", "/v2/assets/abc123").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            at("content", "DELETE", "/v2/assets/abc123").as_deref(),
+            Some("ask")
+        );
+        for (method, path) in [
+            ("POST", "/v2/reboot"),
+            ("POST", "/v2/integrations/screenly/migrate"),
+            ("PATCH", "/v2/device_settings"),
+        ] {
+            assert_eq!(
+                at("content", method, path).as_deref(),
+                Some("ask"),
+                "`{path}`"
+            );
+        }
+
+        for (method, path) in [
+            ("PATCH", "/v2/device_settings"),
+            ("POST", "/v2/shutdown"),
+            ("POST", "/v1/shutdown"),
+            ("POST", "/v2/recover"),
+            ("POST", "/v1/recover"),
+        ] {
+            assert_eq!(
+                at("write", method, path).as_deref(),
+                Some("ask"),
+                "`{path}`"
+            );
+        }
+        assert_eq!(
+            at("write", "GET", "/v2/device_settings").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(at("write", "POST", "/v2/reboot").as_deref(), Some("allow"));
     }
 }
