@@ -90,6 +90,12 @@ Seven levels exist for reasons that are not about permissions:
   memberships, webhooks, exports — left to prompt. The question an operator is
   answering is not "may it write" but "may it write to tasks", and `write` is
   the level that cannot tell the two apart.
+- **`discourse --access post`** lets an agent take part in a forum: every
+  read, plus starting topics, replying, editing posts, liking and uploading.
+  DELETE is denied and every other write prompts. The admin panel (`/admin`,
+  and Logster at `/logs`) prompts at `read` and `post` even for a GET, because
+  that is where a forum keeps its members' email addresses, IP logs and
+  backups, and an admin's key reaches all of it.
 - **`sbomify`** splits its writes by sbomify's own roles rather than by verb.
   `--access triage` is the operator: every read plus recording a triage
   decision on a vulnerability. `--access publish` is the CI bot: every read
@@ -114,6 +120,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | PostHog | `posthog` (REST), `posthog-mcp` |
 | DataForSEO | `dataforseo`, `dataforseo-mcp` |
 | Semrush | `semrush` (v3, `?key=`), `semrush-trends` (the same key, its own allowance), `semrush-v4` (`Authorization: Apikey`), `semrush-mcp` |
+| Discourse | `discourse` (`--var host=…` — every forum is its own host, `--var scheme=http` for a plain-HTTP one) |
 | Graylog | `graylog` |
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths), and `sbomify-self-hosted` / `sbomify-v1-self-hosted` for staging or an install of your own (`--var host=…`, `--var scheme=http` for a plain-HTTP one) |
@@ -261,6 +268,16 @@ file in the clear, while the token stays a reference.
   `sbomify-v1-self-hosted`: the same rules and probe at `--var host=…`, with a
   token from that install. Enrol them `--as sbomify-staging` (or similar) to
   keep them next to production.
+- **A Discourse key should belong to one user.** The key goes upstream as
+  `Api-Key`, and a *Single User* key acts as that user and needs nothing else.
+  An *All Users* key acts as whoever an `Api-Username` header names — any
+  account on the forum — which is not what `discourse` is for; enrol one by hand
+  with `upstream add --auth header --header Api-Key --set-header
+  Api-Username=…` if you mean it. A new topic, a reply and a private message
+  are the same `POST /posts.json`, told apart by the body, so `post` cannot
+  allow one without the others; give the key *Granular* scopes if the forum
+  should refuse what the ACL cannot see. There is no hosted default: point
+  `--var host=…` at the forum, and enrol a second forum `--as` another name.
 - **A Spotify token is app-only, and expires in an hour.** Spotify issues no
   long-lived API key: every call carries an OAuth access token. So `spotify` is
   the one profile whose credential the proxy *spends* rather than forwards — it
