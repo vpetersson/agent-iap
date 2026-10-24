@@ -132,6 +132,45 @@ call is not opening the network, and the agent VLAN still needs its own rules.
 Not a sandbox — it constrains what an agent can *reach*, never what it can
 compute.
 
+### And 1Password for Agents?
+
+[1Password for Agents](https://1password.com/personal-ai-agent-integrations)
+addresses a related issue, often leading to confusion between the two. It
+handles autofill for browser logins: when a partner agent (such as Meta's Muse,
+Grok Bot, and similar tools, with Claude and ChatGPT listed as integrations)
+encounters a sign-in form and requests a credential, you approve it on your own
+device, allowing 1Password to input the password or one-time code directly onto
+the page. The agent never views the secret. However, once the session is logged
+in, 1Password withdraws: it possesses no insight into, nor influence over, what
+the agent does with that session. It functions solely with agents that have
+integrated with it and is available on Individual and Family plans.
+
+1Password's non-browser method — Environments, `op run`, service accounts, the
+SDKs — provides API keys to a process as environment variables, effectively
+returning the key to the agent's process.
+
+This distinction spans layer, scope, and audience:
+
+- **Layer.** A proxy situated within the API and MCP request path, distinct from
+  the browser. The agent invokes the upstream via the proxy, with the actual
+  credential attached during transmission.
+- **Credential type.** API keys and tokens, rather than website passwords. The
+  agent retains a proxy-minted token, which is short-lived when workload
+  identity is active, and never the key itself.
+- **Policy.** Per-credential access control lists (ACLs), either standing or
+  with an expiration date, a human prompt where a rule dictates `ask`, and an
+  audit entry for every call. Control does not stop at the initial request —
+  every subsequent call undergoes the same verification.
+- **Any agent, self-hosted, open source.** Anything capable of being directed at
+  a proxy functions: Claude Code, Codex, Cursor, or a shell script. There is no
+  partner integration, and no vendor exists in the request path other than your
+  own.
+
+Complementary rather than competing: 1Password protects web logins and retains
+the secrets, while agent-iap regulates API access using those same secrets —
+`op://` is the reference it resolves. 1Password fills the form and steps away;
+agent-iap stays in the request path.
+
 ## Install
 
 Every `v…` tag builds a binary for each platform, checksums it, and attaches it
