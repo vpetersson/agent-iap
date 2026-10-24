@@ -691,10 +691,12 @@ struct AuthFlags {
     /// or `iap://NAME` for one `agent-iap secret set` keeps.
     #[arg(long, value_name = "REF")]
     secret: Option<String>,
-    /// Header name for `--auth header`, e.g. `x-api-key`.
+    /// Header name for `--auth header`, e.g. `x-api-key`. With `--auth
+    /// oauth2-client-credentials`, the header the minted token goes in instead
+    /// of `Authorization: Bearer`.
     #[arg(long, value_name = "NAME")]
     header: Option<String>,
-    /// Value prefix for `--auth header`, when the API wants one.
+    /// Value prefix for `--header`, when the API wants one.
     #[arg(long, value_name = "PREFIX")]
     prefix: Option<String>,
     /// Username for `--auth basic`.

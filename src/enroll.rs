@@ -101,6 +101,9 @@ pub enum AuthSpec {
         client_secret: String,
         scope: Option<String>,
         audience: Option<String>,
+        /// Where the minted token goes; `None` is `Authorization: Bearer`.
+        header: Option<String>,
+        prefix: Option<String>,
     },
     ServiceAccountJwt {
         key_file: Option<String>,
@@ -188,6 +191,8 @@ impl AuthInput {
                 "client-secret",
                 "scope",
                 "audience",
+                "header",
+                "prefix",
             ],
             "service-account-jwt" => &[
                 "key-file",
@@ -270,6 +275,8 @@ impl AuthInput {
                 client_secret,
                 scope,
                 audience,
+                header,
+                prefix,
             } => AuthInput {
                 token_url: Some(token_url.clone()),
                 client_id: Some(client_id.clone()),
@@ -282,6 +289,8 @@ impl AuthInput {
                     .map(String::from)
                     .collect(),
                 audience: audience.clone(),
+                header: header.clone(),
+                prefix: prefix.clone(),
                 ..scheme("oauth2-client-credentials")
             },
             AuthConfig::ServiceAccountJwt {
@@ -411,6 +420,9 @@ impl AuthInput {
                 // have to know that.
                 scope: (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
                 audience: self.audience.clone(),
+                // Optional: absent is `Authorization: Bearer <token>`.
+                header: self.header.clone(),
+                prefix: self.prefix.clone(),
             },
             "service-account-jwt" => {
                 if self.key_file.is_none() && self.private_key.is_none() {
@@ -1891,6 +1903,8 @@ fn auth_value(auth: &AuthSpec) -> Value {
             client_secret,
             scope,
             audience,
+            header,
+            prefix,
         } => {
             table.insert("type", "oauth2_client_credentials".into());
             table.insert("token_url", token_url.as_str().into());
@@ -1901,6 +1915,12 @@ fn auth_value(auth: &AuthSpec) -> Value {
             }
             if let Some(audience) = audience {
                 table.insert("audience", audience.as_str().into());
+            }
+            if let Some(header) = header {
+                table.insert("header", header.as_str().into());
+            }
+            if let Some(prefix) = prefix {
+                table.insert("prefix", prefix.as_str().into());
             }
         }
         AuthSpec::ServiceAccountJwt {
@@ -2068,6 +2088,8 @@ mod tests {
                 client_secret: "env:F".into(),
                 scope: Some("read".into()),
                 audience: Some("https://example.com".into()),
+                header: None,
+                prefix: None,
             },
             AuthConfig::ServiceAccountJwt {
                 key_file: Some("env:G".into()),
@@ -3360,6 +3382,8 @@ mod tests {
                 client_secret: "op://Private/Example/client-secret".into(),
                 scope: Some("read:things write:things".into()),
                 audience: Some("https://api.example.com".into()),
+                header: Some("x-shopify-access-token".into()),
+                prefix: None,
             },
             AuthConfig::ServiceAccountJwt {
                 key_file: Some("op://Private/GCP/credential".into()),

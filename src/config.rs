@@ -474,6 +474,15 @@ pub enum AuthConfig {
         scope: Option<String>,
         #[serde(default)]
         audience: Option<String>,
+        /// Where the minted token goes. Absent is `Authorization: Bearer
+        /// <token>`, which is what RFC 6750 and almost every vendor want;
+        /// Shopify mints with the same grant and then reads the token only
+        /// from `X-Shopify-Access-Token`.
+        #[serde(default)]
+        header: Option<String>,
+        /// Written before the token in `header`. Ignored without `header`.
+        #[serde(default)]
+        prefix: Option<String>,
     },
     /// Service account → short-lived access token (RFC 7523), the flow Google uses.
     ///
@@ -1185,8 +1194,27 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
             );
         }
     }
-    if let AuthConfig::Oauth2ClientCredentials { token_url, .. } = auth {
+    if let AuthConfig::Oauth2ClientCredentials {
+        token_url,
+        header,
+        prefix,
+        ..
+    } = auth
+    {
         url::Url::parse(token_url).with_context(|| format!("{label}: token_url"))?;
+        // Checked here rather than on the first call, where a bad name is an
+        // error on every request after a token was minted for nothing.
+        if let Some(header) = header {
+            header
+                .parse::<http::HeaderName>()
+                .map_err(|_| anyhow::anyhow!("{label}: `{header}` is not a valid header name"))?;
+        }
+        if prefix.is_some() && header.is_none() {
+            bail!(
+                "{label}: `prefix` only applies with `header` — without one the token goes \
+                 out as `Authorization: Bearer <token>`"
+            );
+        }
     }
 
     if let AuthConfig::AwsSigv4 {
@@ -1325,6 +1353,36 @@ methods = ["POST"]
 paths = ["/v1/messages"]
 action = "allow"
 "#;
+
+    /// Where a minted token goes is checked when the file loads, not on the
+    /// first call — by which point a token has been minted for nothing and
+    /// every request fails the same way.
+    #[test]
+    fn a_minted_token_header_is_checked_where_it_is_typed() {
+        let auth =
+            |header: Option<&str>, prefix: Option<&str>| AuthConfig::Oauth2ClientCredentials {
+                token_url: "https://acme.myshopify.com/admin/oauth/access_token".into(),
+                client_id: "0a1b2c".into(),
+                client_secret: "env:SHOPIFY_CLIENT_SECRET".into(),
+                scope: None,
+                audience: None,
+                header: header.map(Into::into),
+                prefix: prefix.map(Into::into),
+            };
+        check_auth(&auth(None, None), "upstream `x`").unwrap();
+        check_auth(&auth(Some("x-shopify-access-token"), None), "upstream `x`").unwrap();
+        let error = check_auth(&auth(Some("not a header"), None), "upstream `x`").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a valid header name"),
+            "{error:#}"
+        );
+        // A prefix with nowhere to go would be silently dropped.
+        let error = check_auth(&auth(None, Some("Token ")), "upstream `x`").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("only applies with `header`"),
+            "{error:#}"
+        );
+    }
 
     fn server_on(listen: &str, admin: Option<&str>) -> ServerConfig {
         ServerConfig {

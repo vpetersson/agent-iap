@@ -89,9 +89,14 @@ pub enum AuthTemplate {
     /// client id is the caller's rather than the vendor's, so it arrives as a
     /// `Var` and goes in the file in the clear; only the secret is a reference.
     Oauth2ClientCredentials {
+        /// `{var}` expansion applies: Shopify mints on the shop's own host.
         token_url: String,
         /// Name of the `Var` holding the client id.
         client_id_var: String,
+        /// The header the minted token goes in, for a vendor that does not
+        /// read it from `Authorization: Bearer` — Shopify's
+        /// `X-Shopify-Access-Token`. `None` is the bearer header.
+        header: Option<String>,
     },
     /// Google and anything else doing RFC 7523. Scopes come from the access
     /// level, because "read" and "write" are different scopes, not just
@@ -810,8 +815,9 @@ fn build_auth(
         AuthTemplate::Oauth2ClientCredentials {
             token_url,
             client_id_var,
+            header,
         } => AuthSpec::Oauth2ClientCredentials {
-            token_url,
+            token_url: expand(&token_url, vars, "")?,
             client_id: vars
                 .get(&client_id_var)
                 .cloned()
@@ -823,6 +829,8 @@ fn build_auth(
             // as a malformed request are both waiting for this.
             scope: Some(scopes.join(" ")).filter(|scope| !scope.is_empty()),
             audience: None,
+            header,
+            prefix: None,
         },
         AuthTemplate::ServiceAccountJwt { subject_var } => AuthSpec::ServiceAccountJwt {
             key_file: Some(secret.to_string()),
@@ -1876,6 +1884,276 @@ fn bearer_api(spec: BearerApi<'_>) -> Profile {
         note: None,
         probe: None,
     }
+}
+
+/// What `read`, `records`, `ask-writes` and `write` mean for the Stripe API.
+///
+/// The thing an operator is deciding about Stripe is not "may it write" but
+/// "may it move money": an agent keeping the catalogue and the customer list
+/// tidy needs none of the endpoints that charge, refund, pay out or transfer,
+/// and those are the ones a mistake cannot be taken back from.
+fn stripe_access() -> Vec<Access> {
+    // Each of these answers with something that acts as the account, or as a
+    // connected account, outside this proxy — a key, a token, a signed-in
+    // Dashboard link, a stored secret. Handing one to the agent is handing it
+    // a credential, so no level allows them, `write` included. Apps secrets
+    // are a GET (`/v1/apps/secrets/find`), which is why this comes before
+    // the rule that allows reads.
+    const CREDENTIALS: &[&str] = &[
+        "/v1/ephemeral_keys",
+        "/v1/ephemeral_keys/*",
+        "/v1/terminal/connection_tokens",
+        "/v1/account_links",
+        "/v1/account_sessions",
+        "/v1/accounts/*/login_links",
+        "/v1/apps/secrets",
+        "/v1/apps/secrets/**",
+    ];
+    // A standing push of every event to a URL nobody here reviews, which does
+    // not stop when the agent's token is revoked.
+    const PUSH: &[&str] = &[
+        "/v1/webhook_endpoints",
+        "/v1/webhook_endpoints/*",
+        "/v2/core/event_destinations",
+        "/v2/core/event_destinations/**",
+    ];
+    // Records that describe what is sold and to whom. Creating or editing one
+    // charges nobody; subscriptions and invoices are left out because both do.
+    const RECORDS: &[&str] = &[
+        "/v1/customers",
+        "/v1/customers/*",
+        "/v1/products",
+        "/v1/products/*",
+        "/v1/prices",
+        "/v1/prices/*",
+        "/v1/coupons",
+        "/v1/coupons/*",
+        "/v1/promotion_codes",
+        "/v1/promotion_codes/*",
+    ];
+    // POSTs that only compute: an upcoming invoice, rendered and not created.
+    const PREVIEWS: &[&str] = &["/v1/invoices/create_preview"];
+    const ALL: &[&str] = &["/v1/**", "/v2/**"];
+    let credentials = || rule("credentials", &["*"], CREDENTIALS, "deny");
+    let reads = || rule("reads", &["GET"], ALL, "allow");
+    let previews = || rule("previews", &["POST"], PREVIEWS, "allow");
+    vec![
+        access(
+            "read",
+            "every GET, and invoice previews",
+            &[],
+            vec![credentials(), reads(), previews()],
+        ),
+        access(
+            "records",
+            "also create and edit customers, products, prices, coupons and promotion codes; \
+             money movement and webhooks prompt, DELETE is refused",
+            &[],
+            vec![
+                credentials(),
+                reads(),
+                previews(),
+                rule("push", &["*"], PUSH, "ask"),
+                rule("records", &["POST"], RECORDS, "allow"),
+                rule("deletes", &["DELETE"], ALL, "deny"),
+                rule("writes", &["*"], ALL, "ask"),
+            ],
+        ),
+        access(
+            "ask-writes",
+            "reads allowed, anything else prompts, DELETE denied",
+            &[],
+            vec![
+                credentials(),
+                reads(),
+                previews(),
+                rule("deletes", &["DELETE"], ALL, "deny"),
+                rule("writes", &["*"], ALL, "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every endpoint but the ones that mint a credential",
+            &[],
+            vec![credentials(), rule("all", &["*"], ALL, "allow")],
+        ),
+    ]
+}
+
+/// What `read` and `write` mean for Stripe's MCP server.
+fn stripe_mcp_access() -> Vec<Access> {
+    const READS: &[&str] = &[
+        "stripe_api_search",
+        "stripe_api_details",
+        "stripe_api_read",
+        "get_stripe_account_info",
+        "get_balance_summary",
+        "search_stripe_documentation",
+        "stripe_implementation_planner",
+    ];
+    // Treasury tools that send money out of the account, and Atlas, which
+    // incorporates a company. None of them is a read, and `stripe_api_write`
+    // at least passes through the key's own approval rules.
+    const MONEY: &[&str] = &[
+        "send_money",
+        "transfer_money",
+        "convert_currency",
+        "setup_recipient",
+        "atlas_company_formation",
+    ];
+    vec![
+        access(
+            "read",
+            "the tools that look things up; money movers refused, everything else prompts",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("money", &["tools/call"], MONEY, "deny"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every tool; the ones that move money or form a company still prompt",
+            &[],
+            vec![
+                rule("money", &["tools/call"], MONEY, "ask"),
+                rule("tools", &["tools/call"], &["**"], "allow"),
+            ],
+        ),
+    ]
+}
+
+/// What both Shopify profiles say about the API itself, whichever way the
+/// token arrives.
+const SHOPIFY_NOTE: &str = "The app's access scopes, chosen when it was set up, are the real \
+     limit: the ACL sees a path, and most of what an agent does on Shopify is GraphQL, which \
+     is one `POST /graphql.json` whether it reads a product or deletes one. So `read` allows \
+     REST GETs and prompts for every GraphQL call; `graphql` allows GraphQL outright, bounded \
+     only by those scopes, and still prompts for REST writes. REST has been legacy since \
+     October 2024 and new features are GraphQL-only. Storefront access tokens are a \
+     credential handed back to the caller, so every level denies the REST endpoints that \
+     list or mint them — GraphQL's `storefrontAccessTokenCreate` goes through `graphql` \
+     unseen, and only leaving the `unauthenticated_*` scopes off the app stops it. The \
+     version is part of the address: Shopify releases one a quarter and supports each for \
+     at least twelve months, then answers a retired one with the oldest it still supports \
+     rather than an error — the `X-Shopify-API-Version` response header says which you got, \
+     and moving on is `--var version=…` on a new enrolment or an edit to `base_url`. Bulk \
+     operation results and staged uploads live on Google Cloud Storage, not on the store, and \
+     the Storefront and Customer Account APIs take other credentials; none of them is this \
+     upstream. One upstream is one store: enrol another `--as shopify-<store>`.";
+
+fn shopify_vars() -> Vec<Var> {
+    vec![
+        Var {
+            check: Some(shopify_store),
+            ..v(
+                "store",
+                "the store's permanent `myshopify.com` subdomain — `acme` for \
+                 `acme.myshopify.com`, under Settings → Domains. Not a custom domain: the \
+                 Admin API answers only on `myshopify.com`.",
+                None,
+            )
+        },
+        Var {
+            check: Some(shopify_version),
+            ..v(
+                "version",
+                "the Admin API version, `YYYY-MM` for a quarterly release (`01`, `04`, `07` \
+                 or `10`). Each is supported for at least twelve months.",
+                Some("2026-10"),
+            )
+        },
+    ]
+}
+
+/// A `myshopify.com` subdomain, and nothing that would turn the base URL into
+/// a different host — a scheme, a dot, a path.
+fn shopify_store(value: &str) -> std::result::Result<(), String> {
+    if value.ends_with(".myshopify.com") {
+        return Err(format!(
+            "just the subdomain — `{}`, without `.myshopify.com`",
+            value.trim_end_matches(".myshopify.com")
+        ));
+    }
+    let valid = !value.is_empty()
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err("expected a `myshopify.com` subdomain: lowercase letters, digits and `-`".into())
+    }
+}
+
+/// `YYYY-MM` on a quarterly month, or `unstable`. Anything else is a 404 on
+/// every call from a store that is otherwise answering.
+fn shopify_version(value: &str) -> std::result::Result<(), String> {
+    if value == "unstable" {
+        return Ok(());
+    }
+    match value.split_once('-') {
+        Some((year, month))
+            if year.len() == 4
+                && year.chars().all(|c| c.is_ascii_digit())
+                && matches!(month, "01" | "04" | "07" | "10") =>
+        {
+            Ok(())
+        }
+        _ => Err(
+            "expected a release like `2026-10` — Shopify ships in January, April, July and \
+             October — or `unstable`"
+                .into(),
+        ),
+    }
+}
+
+/// What `read`, `graphql` and `write` mean for the Shopify Admin API.
+fn shopify_access() -> Vec<Access> {
+    // A storefront access token is a credential for the public Storefront
+    // API, returned to whoever asked — by a GET as well as by the POST that
+    // makes one. Denied before anything allows reads.
+    const TOKENS: &[&str] = &[
+        "/storefront_access_tokens.json",
+        "/storefront_access_tokens/*.json",
+    ];
+    const GRAPHQL: &[&str] = &["/graphql.json"];
+    let tokens = || rule("storefront-tokens", &["*"], TOKENS, "deny");
+    let reads = || rule("reads", &["GET"], &["/**"], "allow");
+    vec![
+        access(
+            "read",
+            "REST GETs; every GraphQL call prompts, since a query and a mutation share a path",
+            &[],
+            vec![
+                tokens(),
+                reads(),
+                rule("graphql", &["POST"], GRAPHQL, "ask"),
+            ],
+        ),
+        access(
+            "graphql",
+            "also every GraphQL call, bounded by the app's scopes; REST writes prompt, REST \
+             DELETE is refused",
+            &[],
+            vec![
+                tokens(),
+                reads(),
+                rule("graphql", &["POST"], GRAPHQL, "allow"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every endpoint the app's scopes reach, but storefront tokens",
+            &[],
+            vec![tokens(), rule("all", &["*"], &["/**"], "allow")],
+        ),
+    ]
 }
 
 /// What `read`, `triage` and `write` mean for the Sentry REST API.
@@ -4117,6 +4395,187 @@ pub fn catalog() -> Vec<Profile> {
             // unauthenticated `/v2/network/ip-addresses`.
             probe: Some("/v2/info".into()),
         },
+        // ---------------- Stripe ----------------
+        Profile {
+            id: "stripe".into(),
+            title: "Stripe API".into(),
+            vendor: "Stripe".into(),
+            summary: "Customers, products, prices, subscriptions, invoices, payments and payouts."
+                .into(),
+            default_name: "stripe".into(),
+            credential: Credential {
+                about: "a restricted API key (`rk_live_…`, or `rk_test_…` for a sandbox), \
+                        tagged as an agent key — not the account's secret key"
+                    .into(),
+                url: "https://dashboard.stripe.com/apikeys".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.stripe.com".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: stripe_access(),
+            note: Some(
+                "Use a restricted key, and tag it as an agent key when Stripe asks what it is \
+                 for: its permissions are checked before this policy is, so a call the ACL \
+                 allows still comes back 403 for a resource the key was not given, and an \
+                 agent-tagged key is held to Stripe's own approval rules, which park payouts, \
+                 refunds and account changes for a reviewer in the Dashboard. A secret key \
+                 (`sk_…`) can do everything and makes the ACL the only limit. Sandbox and live \
+                 are separate keys over separate data: enrol a sandbox key `--as \
+                 stripe-sandbox` beside the live one. Several endpoints hand back a credential \
+                 or a signed-in link rather than data — ephemeral keys, Terminal connection \
+                 tokens, Connect account links, account sessions and login links, and Stripe \
+                 Apps secrets, whose `find` is a GET that returns the secret — so every level \
+                 denies them, `write` included. `records` allows editing customers, products, \
+                 prices, coupons and promotion codes and nothing that charges, refunds, pays \
+                 out or transfers; rules see the path and not the form body, so a customer \
+                 update that sets `balance` (a credit against future invoices) or a default \
+                 payment method is inside it. Webhook endpoints and v2 event destinations \
+                 push every event to any URL until somebody deletes them, so `records` and \
+                 `ask-writes` prompt for them. A `Stripe-Account` header from the agent acts \
+                 on a connected account with a platform key, and the ACL does not read \
+                 headers — give a platform key only the connected-account permissions you \
+                 mean. File uploads and downloads are on `files.stripe.com`, and Connect \
+                 OAuth on `connect.stripe.com`; neither is this upstream's host."
+                    .into(),
+            ),
+            // A GET, free, on every account. A wrong key is a 401 here; a
+            // restricted key without Balance read is a 403, which `verify`
+            // reports as a key that works but is not entitled — tell the two
+            // apart rather than calling both a failure.
+            probe: Some("/v1/balance".into()),
+        },
+        Profile {
+            id: "stripe-mcp".into(),
+            title: "Stripe MCP server".into(),
+            vendor: "Stripe".into(),
+            summary: "Stripe's hosted MCP server — the API, docs search and analytics as tools, \
+                      fronted with a key instead of a browser."
+                .into(),
+            default_name: "stripe-mcp".into(),
+            credential: Credential {
+                about: "an agent-tagged restricted API key — from December 2026 the server \
+                        refuses any other key"
+                    .into(),
+                url: "https://dashboard.stripe.com/apikeys".into(),
+            },
+            vars: vec![],
+            service: Service::McpHttp {
+                url: "https://mcp.stripe.com".into(),
+                // The documented alternative to the OAuth flow for a client
+                // that cannot do one: the key as an ordinary bearer token.
+                auth: AuthTemplate::Bearer,
+            },
+            access: stripe_mcp_access(),
+            note: Some(
+                "Stripe's MCP server offers OAuth first; it also takes an API key as `Bearer`, \
+                 and that is what this profile enrols, so the credential stays in the proxy. \
+                 From 30 November 2026 it accepts only restricted keys tagged as agent keys — \
+                 a secret key or an untagged restricted key gets a 401 carrying an OAuth \
+                 challenge, which reads like a broken server rather than a wrong key. Most of \
+                 the API is reached through two tools, `stripe_api_read` for any GET and \
+                 `stripe_api_write` for any POST or DELETE, so a tool rule cannot tell \
+                 updating a customer from issuing a refund: the narrowing below `write` is \
+                 the key's own permissions and Stripe's approval rules for agent keys, which \
+                 send a refund or an outbound payment to a human before it happens. `read` \
+                 refuses the Treasury tools that move money and Atlas company formation \
+                 outright, and prompts for `stripe_api_write`, `stripe_analytics` (Sigma, \
+                 which bills) and anything Stripe adds later; `write` still prompts for the \
+                 money movers. A `Stripe-Account` header on the session acts on a connected \
+                 account, and the ACL does not read headers."
+                    .into(),
+            ),
+            probe: None,
+        },
+        // ---------------- Shopify ----------------
+        Profile {
+            id: "shopify".into(),
+            title: "Shopify Admin API".into(),
+            vendor: "Shopify".into(),
+            summary: "Products, orders, customers and inventory on one store, with a \
+                      long-lived Admin API access token."
+                .into(),
+            default_name: "shopify".into(),
+            credential: Credential {
+                about: "a custom app's Admin API access token (`shpat_…`) — Shopify stopped \
+                        issuing these for new apps on 1 January 2026; for a new app use \
+                        `shopify-client-credentials`"
+                    .into(),
+                url: "https://help.shopify.com/en/manual/apps/app-types/custom-apps".into(),
+            },
+            vars: shopify_vars(),
+            service: Service::Http {
+                base_url: "https://{store}.myshopify.com/admin/api/{version}".into(),
+                auth: AuthTemplate::Header {
+                    header: "x-shopify-access-token".into(),
+                    prefix: None,
+                },
+            },
+            access: shopify_access(),
+            note: Some(format!(
+                "{} The token goes upstream as `X-Shopify-Access-Token`, not `Authorization`; \
+                 a token copied from a legacy custom app keeps working until the app is \
+                 uninstalled, but no new one can be made in the store admin since 1 January \
+                 2026, and an app built in the Dev Dashboard has a client id and secret \
+                 instead — that is `shopify-client-credentials`.",
+                SHOPIFY_NOTE
+            )),
+            // Every Admin API token can read its own shop, whatever its
+            // scopes. A wrong token is a 401 here and a wrong store a 404, so
+            // `verify` tells a bad credential from a typo in `store`.
+            probe: Some("/shop.json".into()),
+        },
+        Profile {
+            id: "shopify-client-credentials".into(),
+            title: "Shopify Admin API (Dev Dashboard app)".into(),
+            vendor: "Shopify".into(),
+            summary: "The same Admin API for an app made in the Dev Dashboard: the proxy \
+                      trades its client secret for a 24-hour token."
+                .into(),
+            default_name: "shopify".into(),
+            credential: Credential {
+                about: "the app's Client secret, from its settings in the Dev Dashboard — the \
+                        Client ID goes beside it as `--var client_id=…`"
+                    .into(),
+                url: "https://dev.shopify.com/dashboard".into(),
+            },
+            vars: {
+                let mut vars = shopify_vars();
+                vars.push(v(
+                    "client_id",
+                    "the app's Client ID, off the same settings page as the secret. It names \
+                     the app rather than authenticating it, so it goes in the file in the \
+                     clear.",
+                    None,
+                ));
+                vars
+            },
+            service: Service::Http {
+                base_url: "https://{store}.myshopify.com/admin/api/{version}".into(),
+                auth: AuthTemplate::Oauth2ClientCredentials {
+                    token_url: "https://{store}.myshopify.com/admin/oauth/access_token".into(),
+                    client_id_var: "client_id".into(),
+                    // Shopify mints with the standard grant and then reads
+                    // the token from its own header only.
+                    header: Some("x-shopify-access-token".into()),
+                },
+            },
+            access: shopify_access(),
+            note: Some(format!(
+                "{} Shopify issues no long-lived token to an app made in the Dev Dashboard: \
+                 the proxy holds the client secret, trades it for an access token at the \
+                 store's `/admin/oauth/access_token` (form-encoded `client_credentials`), \
+                 caches it for the 24 hours it lives and sends it as `X-Shopify-Access-Token`. \
+                 The grant only works when the app and the store belong to the same Shopify \
+                 organization — any other store answers `shop_not_permitted`, which `verify` \
+                 reports as a failed token request. Scopes are not requested: the token \
+                 carries whatever the app's released version in the Dev Dashboard declares, \
+                 so narrowing them is a new app version, not an edit here.",
+                SHOPIFY_NOTE
+            )),
+            probe: Some("/shop.json".into()),
+        },
         // ---------------- Common neighbours ----------------
         Profile {
             id: "anthropic".into(),
@@ -4325,19 +4784,6 @@ pub fn catalog() -> Vec<Profile> {
             read_paths: &["/conversations.*", "/users.*", "/team.info"],
             write_paths: &["/**"],
         }),
-        bearer_api(BearerApi {
-            id: "stripe",
-            title: "Stripe API",
-            vendor: "Stripe",
-            summary: "Customers, subscriptions, invoices and charges.",
-            base_url: "https://api.stripe.com",
-            credential: Credential {
-                about: "a restricted API key — not the live secret key".into(),
-                url: "https://dashboard.stripe.com/apikeys".into(),
-            },
-            read_paths: &["/v1/**"],
-            write_paths: &["/v1/**"],
-        }),
         // Spotify issues no long-lived API key at all: every call carries an
         // OAuth access token that expires in an hour. So the credential the
         // proxy holds is the app's client secret, and the token is minted here
@@ -4372,6 +4818,7 @@ pub fn catalog() -> Vec<Profile> {
                     // the header works.
                     token_url: "https://accounts.spotify.com/api/token".into(),
                     client_id_var: "client_id".into(),
+                    header: None,
                 },
             },
             access: vec![
@@ -4589,6 +5036,133 @@ mod tests {
                     assert!(!rule.methods.is_empty() && !rule.paths.is_empty());
                 }
             }
+        }
+    }
+
+    /// Shopify mints with the ordinary client-credentials grant, on the
+    /// store's own host, and then reads the token from a header of its own. A
+    /// profile that sent it as `Authorization: Bearer`, or minted at a
+    /// `token_url` with `{store}` still in it, would be a 401 with nothing to
+    /// say why.
+    #[test]
+    fn shopify_client_credentials_mints_on_the_store_and_names_its_header() {
+        let profile = get("shopify-client-credentials").unwrap();
+        let vars = BTreeMap::from([
+            ("store".to_string(), "acme".to_string()),
+            ("version".to_string(), "2026-10".to_string()),
+            ("client_id".to_string(), "0a1b2c".to_string()),
+        ]);
+        let auth = build_auth(
+            &profile.service,
+            "op://Private/Shopify/client-secret",
+            &vars,
+            &profile.default_access().scopes,
+        )
+        .unwrap();
+        let AuthSpec::Oauth2ClientCredentials {
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+            header,
+            prefix,
+            ..
+        } = auth
+        else {
+            panic!("shopify-client-credentials must enrol as the client-credentials grant");
+        };
+        assert_eq!(
+            token_url,
+            "https://acme.myshopify.com/admin/oauth/access_token"
+        );
+        assert_eq!(client_id, "0a1b2c");
+        assert_eq!(client_secret, "op://Private/Shopify/client-secret");
+        assert_eq!(
+            scope, None,
+            "the app's version decides the scopes, not the request"
+        );
+        assert_eq!(header.as_deref(), Some("x-shopify-access-token"));
+        assert_eq!(prefix, None);
+
+        let legacy = get("shopify").unwrap();
+        let AuthSpec::Header { header, prefix, .. } =
+            build_auth(&legacy.service, "env:SHOPIFY_TOKEN", &vars, &[]).unwrap()
+        else {
+            panic!("shopify must enrol its token as a header");
+        };
+        assert_eq!(header, "x-shopify-access-token");
+        assert_eq!(prefix, None);
+    }
+
+    /// `store` and `version` are address material, and a wrong one is a 404
+    /// from a store that is otherwise answering — so they are refused where
+    /// they are typed.
+    #[test]
+    fn shopify_refuses_a_store_or_version_that_names_no_endpoint() {
+        assert!(shopify_store("acme").is_ok());
+        assert!(shopify_store("acme-eu-2").is_ok());
+        let hint = shopify_store("acme.myshopify.com").unwrap_err();
+        assert!(hint.contains("`acme`"), "{hint}");
+        for bad in [
+            "",
+            "Acme",
+            "acme.com",
+            "https://acme",
+            "acme/admin",
+            "-acme",
+        ] {
+            assert!(shopify_store(bad).is_err(), "`{bad}` was accepted");
+        }
+        assert!(shopify_version("2026-10").is_ok());
+        assert!(shopify_version("unstable").is_ok());
+        for bad in ["2026-11", "26-10", "2026-1", "latest", "2026/10"] {
+            assert!(shopify_version(bad).is_err(), "`{bad}` was accepted");
+        }
+    }
+
+    /// The narrow Stripe levels are about money, not verbs: no level allows a
+    /// credential-minting endpoint, and `records` allows no POST that charges,
+    /// refunds, pays out or transfers.
+    #[test]
+    fn stripes_levels_keep_credentials_out_and_money_behind_a_human() {
+        let stripe = get("stripe").unwrap();
+        assert!(matches!(
+            stripe.service,
+            Service::Http {
+                auth: AuthTemplate::Bearer,
+                ..
+            }
+        ));
+        assert_eq!(stripe.default_access().name, "read");
+        assert_eq!(stripe.probe.as_deref(), Some("/v1/balance"));
+        for level in &stripe.access {
+            let first = &level.rules[0];
+            assert_eq!(
+                (first.suffix.as_str(), first.action.as_str()),
+                ("credentials", "deny"),
+                "{}: the credential endpoints must be decided before anything allows",
+                level.name
+            );
+            assert!(first.paths.iter().any(|p| p == "/v1/apps/secrets/**"));
+        }
+        let records = stripe.find_access("records").unwrap();
+        let allowed_posts: Vec<&str> = records
+            .rules
+            .iter()
+            .filter(|rule| rule.action == "allow" && rule.methods.iter().any(|m| m == "POST"))
+            .flat_map(|rule| rule.paths.iter().map(String::as_str))
+            .collect();
+        for money in [
+            "/v1/refunds",
+            "/v1/payouts",
+            "/v1/transfers",
+            "/v1/charges",
+            "/v1/**",
+        ] {
+            assert!(
+                !allowed_posts.contains(&money),
+                "`records` allows POST {money}"
+            );
         }
     }
 

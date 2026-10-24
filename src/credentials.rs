@@ -139,6 +139,15 @@ impl CredentialInjector {
                     chrono::Utc::now(),
                 )?;
             }
+            AuthConfig::Oauth2ClientCredentials {
+                header: Some(header),
+                prefix,
+                ..
+            } => {
+                let token = self.minted_token(target, auth).await?;
+                let rendered = format!("{}{}", prefix.as_deref().unwrap_or(""), token.expose());
+                set_header(request, header, &rendered)?;
+            }
             AuthConfig::Oauth2ClientCredentials { .. } | AuthConfig::ServiceAccountJwt { .. } => {
                 let token = self.minted_token(target, auth).await?;
                 set_header(
@@ -365,6 +374,7 @@ impl CredentialInjector {
             client_secret,
             scope,
             audience,
+            ..
         } = auth
         else {
             unreachable!("only called for the client-credentials scheme");

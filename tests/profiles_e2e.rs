@@ -23,7 +23,8 @@ const AGENT_TOKEN: &str = "iap_workflow_agent";
 async fn spawn_upstream() -> SocketAddr {
     async fn handler(request: Request) -> Json<Value> {
         let path = request.uri().path().to_string();
-        if path.ends_with("/token") {
+        // `/access_token` is Shopify's, on the store's own host.
+        if path.ends_with("/token") || path.ends_with("/access_token") {
             return Json(serde_json::json!({
                 "access_token": "ya29.minted-by-the-proxy",
                 "expires_in": 3600,
@@ -48,6 +49,7 @@ async fn spawn_upstream() -> SocketAddr {
             "x-api-key": header("x-api-key"),
             "api-key": header("api-key"),
             "x-iap-token": header("x-iap-token"),
+            "x-shopify-access-token": header("x-shopify-access-token"),
         }))
     }
 
@@ -68,9 +70,11 @@ struct Harness {
 
 /// Build a policy file with `profile add`, repoint it at the mock, and serve it.
 ///
-/// The rewrite is deliberately narrow: only the host of each `base_url` moves.
-/// Paths, credential scheme and every ACL rule are exactly what the profile
-/// wrote, so what the test exercises is the profile and not a fixture.
+/// The rewrite is deliberately narrow: only the host of each `base_url` moves,
+/// and of a client-credentials `token_url`, which is a second address the
+/// profile wrote. Paths, credential scheme and every ACL rule are exactly what
+/// the profile wrote, so what the test exercises is the profile and not a
+/// fixture.
 async fn harness_from_profiles(specs: &[(&str, AddOptions)], upstream: SocketAddr) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("iap.toml");
@@ -93,12 +97,20 @@ async fn harness_from_profiles(specs: &[(&str, AddOptions)], upstream: SocketAdd
 
     let text = std::fs::read_to_string(&path).unwrap();
     let mut config: Config = toml::from_str(&text).unwrap();
-    for up in &mut config.upstreams {
-        let mut url = url::Url::parse(&up.base_url).unwrap();
+    let repoint = |address: &str| {
+        let mut url = url::Url::parse(address).unwrap();
         url.set_scheme("http").unwrap();
         url.set_host(Some(&upstream.ip().to_string())).unwrap();
         url.set_port(Some(upstream.port())).unwrap();
-        up.base_url = url.to_string();
+        url.to_string()
+    };
+    for up in &mut config.upstreams {
+        up.base_url = repoint(&up.base_url);
+        if let agent_iap::config::AuthConfig::Oauth2ClientCredentials { token_url, .. } =
+            &mut up.auth
+        {
+            *token_url = repoint(token_url);
+        }
     }
     config.audit.path = audit_path;
     config.audit.stderr = false;
@@ -2182,4 +2194,128 @@ async fn discourse_posts_to_the_forum_it_was_pointed_at_and_not_its_admin_panel(
         assert_eq!(status, 403, "{method} {path} went through");
         assert!(body["path"].is_null(), "{method} {path} reached the forum");
     }
+}
+
+/// The Stripe level an agent keeping the books gets: the catalogue and the
+/// customer list are its to edit, and nothing that moves money reaches Stripe
+/// without a human.
+#[tokio::test]
+async fn stripe_records_edits_the_catalogue_and_moves_no_money() {
+    std::env::set_var("TEST_STRIPE_KEY", "rk_test_real-key");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_STRIPE_KEY");
+    opts.access = Some("records".into());
+    let harness = harness_from_profiles(&[("stripe", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/stripe/v1/customers").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["authorization"], "Bearer rk_test_real-key");
+    let (status, _) = call(&harness, "GET", "/stripe/v1/balance").await;
+    assert_eq!(status, 200, "the probe has to be callable");
+
+    for path in ["/stripe/v1/customers/cus_123", "/stripe/v1/prices"] {
+        let (status, seen) = call(&harness, "POST", path).await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(seen["method"], "POST");
+    }
+
+    // Money. `ask` with nobody attached is a denial, which is the safe end.
+    for path in [
+        "/stripe/v1/refunds",
+        "/stripe/v1/payouts",
+        "/stripe/v1/payment_intents/pi_1/confirm",
+        "/stripe/v1/customers/cus_123/balance_transactions",
+        "/stripe/v1/webhook_endpoints",
+    ] {
+        let (status, body) = call(&harness, "POST", path).await;
+        assert_eq!(status, 403, "{path}");
+        assert!(body["path"].is_null(), "{path} reached Stripe: {body}");
+    }
+    let (status, body) = call(&harness, "DELETE", "/stripe/v1/customers/cus_123").await;
+    assert_eq!(status, 403);
+    assert!(body["path"].is_null(), "a DELETE reached Stripe: {body}");
+}
+
+/// Some Stripe endpoints answer with a credential rather than data. Through
+/// this proxy that is a credential handed to the agent, so even `write`, which
+/// is otherwise every endpoint, refuses them — the GET among them included.
+#[tokio::test]
+async fn stripe_never_hands_the_agent_a_credential_at_any_level() {
+    std::env::set_var("TEST_STRIPE_KEY_W", "rk_test_w");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_STRIPE_KEY_W");
+    opts.access = Some("write".into());
+    let harness = harness_from_profiles(&[("stripe", opts)], upstream).await;
+
+    let (status, _) = call(&harness, "POST", "/stripe/v1/refunds").await;
+    assert_eq!(status, 200, "`write` is every other endpoint");
+
+    for (method, path) in [
+        ("POST", "/stripe/v1/ephemeral_keys"),
+        ("POST", "/stripe/v1/terminal/connection_tokens"),
+        ("POST", "/stripe/v1/account_links"),
+        ("POST", "/stripe/v1/accounts/acct_1/login_links"),
+        ("GET", "/stripe/v1/apps/secrets/find"),
+    ] {
+        let (status, body) = call(&harness, method, path).await;
+        assert_eq!(status, 403, "{method} {path}");
+        refused_by(&body, "stripe-credentials");
+    }
+}
+
+/// Shopify reads its token from a header of its own, and the version is part
+/// of the address. A GraphQL call is a POST to one path whether it reads or
+/// writes, so `read` cannot let one through without letting them all.
+#[tokio::test]
+async fn shopify_sends_the_token_in_its_own_header_and_read_holds_graphql_back() {
+    std::env::set_var("TEST_SHOPIFY_TOKEN", "shpat_real-token");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SHOPIFY_TOKEN");
+    opts.vars = vec!["store=acme".into()];
+    let harness = harness_from_profiles(&[("shopify", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "GET", "/shopify/products.json").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/admin/api/2026-10/products.json");
+    assert_eq!(seen["x-shopify-access-token"], "shpat_real-token");
+    assert!(
+        seen["authorization"].is_null(),
+        "the agent's token went upstream"
+    );
+    let (status, _) = call(&harness, "GET", "/shopify/shop.json").await;
+    assert_eq!(status, 200, "the probe has to be callable");
+
+    let (status, body) = call(&harness, "POST", "/shopify/graphql.json").await;
+    assert_eq!(status, 403, "`read` let a GraphQL call through unasked");
+    assert!(body["path"].is_null());
+
+    let (status, body) = call(&harness, "GET", "/shopify/storefront_access_tokens.json").await;
+    assert_eq!(status, 403);
+    refused_by(&body, "shopify-storefront-tokens");
+}
+
+/// An app made in the Dev Dashboard has no long-lived token, so the proxy
+/// mints one on the store's own host and sends it where Shopify reads it —
+/// not as the `Authorization: Bearer` every other minted token goes out as.
+#[tokio::test]
+async fn shopify_client_credentials_mints_on_the_store_and_sends_its_header() {
+    std::env::set_var("TEST_SHOPIFY_CLIENT_SECRET", "shpss_client-secret");
+    let upstream = spawn_upstream().await;
+    let mut opts = options("env:TEST_SHOPIFY_CLIENT_SECRET");
+    opts.access = Some("graphql".into());
+    opts.vars = vec!["store=acme".into(), "client_id=0a1b2c".into()];
+    let harness = harness_from_profiles(&[("shopify-client-credentials", opts)], upstream).await;
+
+    let (status, seen) = call(&harness, "POST", "/shopify/graphql.json").await;
+    assert_eq!(status, 200);
+    assert_eq!(seen["path"], "/admin/api/2026-10/graphql.json");
+    assert_eq!(seen["x-shopify-access-token"], "ya29.minted-by-the-proxy");
+    assert!(seen["authorization"].is_null());
+
+    let (status, body) = call(&harness, "DELETE", "/shopify/products/1.json").await;
+    assert_eq!(status, 403);
+    assert!(
+        body["path"].is_null(),
+        "a REST DELETE reached Shopify: {body}"
+    );
 }

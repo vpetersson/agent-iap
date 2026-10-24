@@ -1240,6 +1240,8 @@ mod tests {
                 client_secret: "op://Private/Example/client-secret".into(),
                 scope: Some("read:things write:things".into()),
                 audience: None,
+                header: Some("x-shopify-access-token".into()),
+                prefix: None,
             },
             AuthConfig::ServiceAccountJwt {
                 key_file: Some("op://Private/GCP/credential".into()),
