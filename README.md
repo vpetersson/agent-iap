@@ -135,37 +135,41 @@ compute.
 ### And 1Password for Agents?
 
 [1Password for Agents](https://1password.com/personal-ai-agent-integrations)
-solves a neighbouring problem, and the two are easy to confuse. It is autofill
-for browser logins: a partner agent (Meta's Muse, Grok Bot and the like, with
-Claude and ChatGPT named as integrations) reaches a sign-in form and asks for a
-credential, you approve on your own device, and 1Password fills the password or
-one-time code straight into the page. The agent never sees the secret. But once
-the session is logged in, 1Password has stepped away: it has no view of, and no
-say in, what the agent does with that session. It works only with agents that
-have integrated with it, and it ships on the Individual and Family plans.
-1Password's non-browser route — Environments, `op run`, service accounts, the
-SDKs — hands API keys to a process as environment variables, which puts the key
-back in the agent's process.
+addresses a related issue, often leading to confusion between the two. It
+handles autofill for browser logins: when a partner agent (such as Meta's Muse,
+Grok Bot, and similar tools, with Claude and ChatGPT listed as integrations)
+encounters a sign-in form and requests a credential, you approve it on your own
+device, allowing 1Password to input the password or one-time code directly onto
+the page. The agent never views the secret. However, once the session is logged
+in, 1Password withdraws: it possesses no insight into, nor influence over, what
+the agent does with that session. It functions solely with agents that have
+integrated with it and is available on Individual and Family plans.
 
-This differs in layer, scope and audience:
+1Password's non-browser method — Environments, `op run`, service accounts, the
+SDKs — provides API keys to a process as environment variables, effectively
+returning the key to the agent's process.
 
-- **Layer.** A proxy in the API and MCP request path, not the browser. The agent
-  calls the upstream through the proxy, and the real credential is attached on
-  the way out.
-- **Credential type.** API keys and tokens, not website passwords. The agent
-  holds a proxy-minted token, short-lived when workload identity is on, and never
-  the key.
-- **Policy.** Per-credential ACLs, standing or with a deadline, a human prompt
-  where a rule says `ask`, and an audit line for every call. Control does not end
-  at the first request — every later call goes through the same check.
-- **Any agent, self-hosted, open source.** Anything that can be pointed at a
-  proxy works: Claude Code, Codex, Cursor, a shell script. No partner
-  integration, and no vendor in the request path but yours.
+This distinction spans layer, scope, and audience:
 
-Complementary rather than competing: 1Password secures web logins and keeps the
-secrets, and agent-iap governs API access with those same secrets — `op://` is
-the reference it resolves. 1Password fills the form and steps away; agent-iap
-stays in the request path.
+- **Layer.** A proxy situated within the API and MCP request path, distinct from
+  the browser. The agent invokes the upstream via the proxy, with the actual
+  credential attached during transmission.
+- **Credential type.** API keys and tokens, rather than website passwords. The
+  agent retains a proxy-minted token, which is short-lived when workload
+  identity is active, and never the key itself.
+- **Policy.** Per-credential access control lists (ACLs), either standing or
+  with an expiration date, a human prompt where a rule dictates `ask`, and an
+  audit entry for every call. Control does not stop at the initial request —
+  every subsequent call undergoes the same verification.
+- **Any agent, self-hosted, open source.** Anything capable of being directed at
+  a proxy functions: Claude Code, Codex, Cursor, or a shell script. There is no
+  partner integration, and no vendor exists in the request path other than your
+  own.
+
+Complementary rather than competing: 1Password protects web logins and retains
+the secrets, while agent-iap regulates API access using those same secrets —
+`op://` is the reference it resolves. 1Password fills the form and steps away;
+agent-iap stays in the request path.
 
 ## Install
 
