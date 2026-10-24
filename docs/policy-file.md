@@ -54,6 +54,24 @@ hard error — a typo must never quietly widen access.
 cached until a minute before they expire, and a burst of requests on a cold
 cache mints one token, not one each.
 
+A minted token goes out as `Authorization: Bearer <token>`. An
+`oauth2_client_credentials` upstream whose API reads it from somewhere else
+names the header, with an optional `prefix` — Shopify mints with the standard
+grant and then accepts the token only as `X-Shopify-Access-Token`:
+
+```toml
+[upstreams.auth]
+type = "oauth2_client_credentials"
+token_url = "https://acme.myshopify.com/admin/oauth/access_token"
+client_id = "0a1b2c"
+client_secret = "op://Private/Shopify/client-secret"
+header = "x-shopify-access-token"
+```
+
+The header name is checked when the file loads, and a `prefix` without a
+`header` is refused rather than ignored. On the command line it is
+`--auth oauth2-client-credentials --header <NAME> [--prefix <PREFIX>]`.
+
 A cached token is thrown away early only when the upstream answers **401** —
 that is the API saying the credential itself did not hold up, and the next call
 mints a fresh one rather than replaying a dead token until it expires. A **403**

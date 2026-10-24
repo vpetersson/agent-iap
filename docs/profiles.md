@@ -133,9 +133,11 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths), and `sbomify-self-hosted` / `sbomify-v1-self-hosted` for staging or an install of your own (`--var host=…`, `--var scheme=http` for a plain-HTTP one) |
 | Screenly | `screenly` (API v4 and v4.1, `Authorization: Token`), `screenly-mcp` (the CLI's `screenly mcp`, same token), `anthias` (one self-hosted player, `--var host=… --var username=…`) |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
+| Stripe | `stripe` (REST, with a `records` level that edits the catalogue and moves no money), `stripe-mcp` (the hosted MCP server, on an agent-tagged key) |
+| Shopify | `shopify` (a legacy custom app's `shpat_` token), `shopify-client-credentials` (a Dev Dashboard app; the proxy mints the 24-hour token) — both `--var store=…`, `--var version=…` |
 | Object storage | `s3` (`--var region=…`), `r2` (`--var account_id=…`), `s3-compatible` (`--var host=…` — MinIO, B2, Wasabi, Spaces, Ceph, …) — all `aws_sigv4`, all needing `--var access_key_id=…` and `--var bucket=…` |
 | GitHub | `github` (the REST API), `github-git` (`git clone`, `fetch` and `push` over HTTPS, `--var repo=owner/name` to narrow it) |
-| Others | `anthropic`, `openai`, `xai`, `linear`, `slack`, `stripe` |
+| Others | `anthropic`, `openai`, `xai`, `linear`, `slack` |
 
 `agent-iap profile list --output json` for a machine, `--vendor google` to narrow
 it.
@@ -350,6 +352,58 @@ file in the clear, while the token stays a reference.
   handling and inference to the United States and is an edit to `base_url`,
   not a second profile. xAI's management API is a different host and a
   different credential — a management key — and no profile fronts it.
+- **On Stripe the decision is money, not verbs.** `stripe` has four levels.
+  `read` is every GET plus `POST /v1/invoices/create_preview`, which renders an
+  invoice without creating one. `records` adds creating and editing customers,
+  products, prices, coupons and promotion codes — nothing there charges anyone
+  — and prompts for everything else, which is where refunds, payouts,
+  transfers, payment intents, subscriptions and invoices live; DELETE is
+  refused. `ask-writes` and `write` mean what they always did. Rules see the
+  path and not the form body, so a customer update that sets `balance` (a
+  credit against future invoices) is inside `records`. Some endpoints answer
+  with a credential instead of data — ephemeral keys, Terminal connection
+  tokens, Connect account links, account sessions and login links, and Stripe
+  Apps secrets, whose `find` is a GET — and every level denies them, `write`
+  included. Webhook endpoints and v2 event destinations push every event to a
+  URL until deleted, so the narrow levels prompt for them. Use a restricted
+  key tagged as an agent key: its permissions are checked before this policy
+  is, and Stripe holds an agent key's refunds and payouts for its own
+  approval. `verify` calls `/v1/balance` — a key without Balance read gets a
+  403 there, reported as a working key without that entitlement. A
+  `Stripe-Account` header from the agent acts on a connected account and the
+  ACL does not read headers; uploads (`files.stripe.com`) and Connect OAuth
+  (`connect.stripe.com`) are other hosts. `stripe-mcp` sends the same kind of
+  key as `Bearer` to `mcp.stripe.com`, which from 30 November 2026 takes only
+  agent-tagged keys and answers anything else with a 401 and an OAuth
+  challenge. Its `stripe_api_write` tool is every POST and DELETE in one, so
+  the tool rules cannot tell a customer edit from a refund: `read` prompts for
+  it, denies the Treasury tools that move money and Atlas company formation,
+  and `write` still prompts for those.
+- **Shopify's GraphQL is one path.** Most of the Admin API is GraphQL, and a
+  query and a mutation are the same `POST /graphql.json`, so `read` allows the
+  REST GETs and prompts for every GraphQL call; `graphql` allows them outright,
+  bounded only by the app's access scopes, and prompts for REST writes; `write`
+  is everything. The scopes chosen when the app was set up are the real limit.
+  Storefront access tokens are a credential returned to the caller, so the
+  REST endpoints that list or create them are denied at every level —
+  `storefrontAccessTokenCreate` over GraphQL is not visible to the ACL and is
+  stopped only by leaving the app's `unauthenticated_*` scopes off. The token
+  goes upstream as `X-Shopify-Access-Token`. `--var store=acme` is the
+  `myshopify.com` subdomain, never a custom domain, and `--var version`
+  defaults to `2026-10`: Shopify ships a version a quarter, supports each for
+  at least a year, and then serves the oldest supported one in place of a
+  retired one rather than failing — the `X-Shopify-API-Version` response
+  header says which you got. `verify` reads `/shop.json`, which every token
+  can, and which answers 401 for a bad token and 404 for a wrong store.
+  Shopify stopped issuing long-lived `shpat_` tokens to new custom apps on
+  1 January 2026. An existing one is `shopify`; an app made in the Dev
+  Dashboard is `shopify-client-credentials`, where the proxy holds the client
+  secret, mints a 24-hour token at the store's `/admin/oauth/access_token`
+  and sends it in Shopify's header. That grant works only for a store in the
+  app's own organization (`shop_not_permitted` otherwise), and scopes come
+  from the app's released version rather than the request. Bulk-operation
+  results and staged uploads are on Google Cloud Storage, and the Storefront
+  and Customer Account APIs take other credentials; no profile fronts them.
 - **A path the ACL cannot split.** Semrush's v3 analytics puts every report at
   the same path and names it in a query parameter — `/?type=domain_ranks` — so
   rules can say "reports, read-only" and nothing finer. The credential goes in
