@@ -29,7 +29,7 @@ hex = "0.4"
 base64 = "0.23"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 zeroize = "1"
 ratatui = "0.30"
 crossterm = "0.29"
