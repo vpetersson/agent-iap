@@ -3359,6 +3359,7 @@ fn sanitise_name(raw: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use crate::acl::AccessRequest;
@@ -3911,6 +3912,38 @@ action = "deny"
         // Nothing was written: the point of the middle column.
         let written = std::fs::read_to_string(dir.path().join("iap.toml")).unwrap();
         assert!(!written.contains("console-allow"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn test_until_quit__when_path_was_generalized__should_cover_siblings_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let view = waiting();
+        let mut dialogue = approve::Dialogue::new(view.clone());
+        dialogue.handle(KeyEvent::from(KeyCode::Char('g')));
+        let Some(approve::Answer::Decide { reach, .. }) =
+            dialogue.handle(KeyEvent::from(KeyCode::Enter))
+        else {
+            panic!("enter allows")
+        };
+        app.answer(&view, Verdict::Allow, approve::Duration::UntilQuit, *reach);
+
+        let covered = |path: &str| {
+            let request = AccessRequest::http("claude-code", "github", "POST", path);
+            app.state
+                .broker
+                .remembered()
+                .iter()
+                .any(|(scope, _)| scope.matches(&request))
+        };
+        assert_eq!(
+            [
+                covered("/repos/acme/api/pulls"),
+                covered("/repos/acme/web/issues"),
+                covered("/repos/acme/api/pulls/1"),
+            ],
+            [true, false, false]
+        );
     }
 
     #[tokio::test]
