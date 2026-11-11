@@ -162,20 +162,106 @@ pub fn reaches(view: &PendingView) -> Vec<Reach> {
     // thing there is to allow. Offering a fourth row identical to the third
     // would be a choice between two spellings of the same grant.
     if !request.path.is_empty() {
-        reaches.push(Reach {
-            label: format!("→ {method} {} on {target}", request.path),
-            scope: Scope::exact(request),
-            rule: RuleShape {
-                agent,
-                kind,
-                target,
-                methods: vec![method],
-                paths: vec![request.path.clone()],
-            },
-        });
+        reaches.push(path_reach(view, &literal_glob(&request.path)));
     }
 
     reaches
+}
+
+/// The path row, at `pattern` — the request's own path, or a glob over it that
+/// the operator widened to with `g` or typed with `e`.
+fn path_reach(view: &PendingView, pattern: &str) -> Reach {
+    let request = &view.request;
+    Reach {
+        label: format!("→ {} {pattern} on {}", request.method, request.target),
+        scope: if pattern == literal_glob(&request.path) {
+            Scope::exact(request)
+        } else {
+            Scope {
+                path: None,
+                path_pattern: Some(pattern.to_string()),
+                ..Scope::exact(request)
+            }
+        },
+        rule: RuleShape {
+            agent: request.agent.clone(),
+            kind: request.kind.as_str().to_string(),
+            target: request.target.clone(),
+            methods: vec![request.method.clone()],
+            paths: vec![pattern.to_string()],
+        },
+    }
+}
+
+/// What `g` steps through, narrowest first: the path itself, its siblings, and
+/// then each ancestor's whole subtree up to the first segment. Stops short of
+/// `/**`, which the method row already says.
+///
+/// A path that does not start with `/` is an MCP tool name, which has no
+/// parent to widen to.
+fn path_ladder(path: &str) -> Vec<String> {
+    let mut ladder = vec![literal_glob(path)];
+    let Some(rest) = path.strip_prefix('/') else {
+        return ladder;
+    };
+    let escaped: Vec<String> = rest.split('/').map(literal_glob).collect();
+    let segments: Vec<&str> = escaped.iter().map(String::as_str).collect();
+    let parent = &segments[..segments.len() - 1];
+    ladder.push(format!("/{}", [parent, &["*"]].concat().join("/")));
+    for kept in (1..parent.len()).rev() {
+        ladder.push(format!("/{}/**", segments[..kept].join("/")));
+    }
+    ladder.dedup();
+    ladder
+}
+
+/// A glob matching exactly this path. The path is the agent's, percent-decoded,
+/// so `%2A%2A` arrives as `**`: copied into a rule unescaped, a call that reads
+/// as one literal path would write a grant over a whole subtree.
+fn literal_glob(path: &str) -> String {
+    // `\` is an escape in globset's default syntax on Unix, which the ACL uses.
+    globset::escape(&path.replace('\\', "\\\\"))
+}
+
+/// Why a typed path glob cannot be the answer, if it cannot: it does not
+/// compile under the ACL's own matcher, or it does not cover the request on
+/// screen — and an answer that does not reach the call it answers writes a rule
+/// that leaves the same question coming back.
+fn check_path_pattern(pattern: &str, path: &str) -> Result<(), String> {
+    let compiled = crate::acl::path_glob(pattern).map_err(|error| format!("{error:#}"))?;
+    if crate::acl::path_matches(&[compiled], path) {
+        return Ok(());
+    }
+    // A trailing `*` meant as "everything under here" is the miss people make.
+    let deeper = pattern
+        .strip_suffix("/*")
+        .map(|parent| format!("{parent}/**"))
+        .filter(|deeper| {
+            crate::acl::path_glob(deeper)
+                .is_ok_and(|compiled| crate::acl::path_matches(&[compiled], path))
+        });
+    Err(match deeper {
+        Some(deeper) => format!("`*` stops at the next `/` — `{deeper}` covers this request"),
+        None => format!("`{pattern}` does not cover this request"),
+    })
+}
+
+/// The path row's pattern while it is being typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Edit {
+    pattern: String,
+    /// Characters, not bytes, before the cursor.
+    cursor: usize,
+    error: Option<String>,
+}
+
+impl Edit {
+    fn byte_at(&self, cursor: usize) -> usize {
+        self.pattern
+            .char_indices()
+            .nth(cursor)
+            .map_or(self.pattern.len(), |(byte, _)| byte)
+    }
 }
 
 /// What the event loop should do once the operator has answered.
@@ -214,6 +300,9 @@ pub struct Dialogue {
     reaches: Vec<Reach>,
     duration: usize,
     reach: usize,
+    ladder: Vec<String>,
+    rung: usize,
+    edit: Option<Edit>,
 }
 
 impl Dialogue {
@@ -225,16 +314,89 @@ impl Dialogue {
             reach: reaches.len() - 1,
             reaches,
             duration: 0,
+            ladder: path_ladder(&view.request.path),
+            rung: 0,
+            edit: None,
             view,
         }
     }
 
-    pub fn handle(&mut self, key: KeyEvent) -> Option<Answer> {
+    /// Whether the last row is about a path, so `g` and `e` have one to change.
+    fn has_path_row(&self) -> bool {
+        !self.view.request.path.is_empty()
+    }
+
+    fn set_path(&mut self, pattern: &str) {
+        let last = self.reaches.len() - 1;
+        self.reaches[last] = path_reach(&self.view, pattern);
+        self.reach = last;
+    }
+
+    fn step_path(&mut self, rung: usize) {
+        self.rung = rung.min(self.ladder.len() - 1);
+        let pattern = self.ladder[self.rung].clone();
+        self.set_path(&pattern);
+    }
+
+    fn handle_edit(&mut self, key: KeyEvent, mut edit: Edit) {
         match key.code {
-            KeyCode::Esc => return Some(Answer::Dismiss),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(Answer::Dismiss)
+            KeyCode::Esc => return,
+            KeyCode::Enter => match check_path_pattern(&edit.pattern, &self.view.request.path) {
+                Ok(()) => {
+                    if let Some(rung) = self.ladder.iter().position(|step| *step == edit.pattern) {
+                        self.rung = rung;
+                    }
+                    self.set_path(&edit.pattern);
+                    return;
+                }
+                Err(error) => edit.error = Some(error),
+            },
+            KeyCode::Left => edit.cursor = edit.cursor.saturating_sub(1),
+            KeyCode::Right => edit.cursor = (edit.cursor + 1).min(edit.pattern.chars().count()),
+            KeyCode::Home => edit.cursor = 0,
+            KeyCode::End => edit.cursor = edit.pattern.chars().count(),
+            KeyCode::Backspace if edit.cursor > 0 => {
+                edit.cursor -= 1;
+                edit.pattern.remove(edit.byte_at(edit.cursor));
+                edit.error = None;
             }
+            KeyCode::Delete if edit.cursor < edit.pattern.chars().count() => {
+                edit.pattern.remove(edit.byte_at(edit.cursor));
+                edit.error = None;
+            }
+            KeyCode::Char(character) => {
+                edit.pattern.insert(edit.byte_at(edit.cursor), character);
+                edit.cursor += 1;
+                edit.error = None;
+            }
+            _ => {}
+        }
+        self.edit = Some(edit);
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) -> Option<Answer> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Answer::Dismiss);
+        }
+        if let Some(edit) = self.edit.take() {
+            self.handle_edit(key, edit);
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('g') if self.has_path_row() => self.step_path(self.rung + 1),
+            KeyCode::Char('G') if self.has_path_row() => {
+                self.step_path(self.rung.saturating_sub(1))
+            }
+            KeyCode::Char('e') if self.has_path_row() => {
+                let pattern = self.reaches[self.reaches.len() - 1].rule.paths[0].clone();
+                self.edit = Some(Edit {
+                    cursor: pattern.chars().count(),
+                    pattern,
+                    error: None,
+                });
+                self.reach = self.reaches.len() - 1;
+            }
+            KeyCode::Esc => return Some(Answer::Dismiss),
             KeyCode::Right | KeyCode::Tab => {
                 self.duration = (self.duration + 1) % Duration::ALL.len();
             }
@@ -278,6 +440,13 @@ impl Dialogue {
     /// The dialogue's whole risk is an operator who thinks "Once" and picks
     /// "From now on", so the consequence is spelled out rather than inferred.
     fn consequence(&self) -> String {
+        if let Some(edit) = &self.edit {
+            return edit.error.clone().unwrap_or_else(|| {
+                "a path glob — `*` is one segment, `**` any depth; ←/→ home end move, enter \
+                 keeps it, esc puts the path back"
+                    .into()
+            });
+        }
         let reach = &self.reaches[self.reach];
         let duration = Duration::ALL[self.duration];
         match duration {
@@ -518,11 +687,23 @@ impl Dialogue {
     }
 
     fn options(&self) -> Vec<Line<'_>> {
-        self.reaches
+        let request = &self.view.request;
+        let mut lines: Vec<Line> = self
+            .reaches
             .iter()
             .enumerate()
             .map(|(index, reach)| {
                 let selected = index == self.reach;
+                let label = match &self.edit {
+                    Some(edit) if index == self.reaches.len() - 1 => {
+                        let (before, after) = edit.pattern.split_at(edit.byte_at(edit.cursor));
+                        format!(
+                            "→ {} {before}▏{after} on {}",
+                            request.method, request.target
+                        )
+                    }
+                    _ => reach.label.clone(),
+                };
                 Line::from(vec![
                     Span::raw("    "),
                     Span::styled(
@@ -530,7 +711,7 @@ impl Dialogue {
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(
-                        reach.label.clone(),
+                        label,
                         if selected {
                             Style::default()
                                 .fg(Color::White)
@@ -541,7 +722,15 @@ impl Dialogue {
                     ),
                 ])
             })
-            .collect()
+            .collect();
+        // Drawn in the one spare line the box already leaves under the rows.
+        if self.has_path_row() && self.edit.is_none() {
+            lines.push(Line::from(Span::styled(
+                "        g/G widens or narrows the path · e types it",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines
     }
 
     fn buttons(&self) -> Line<'_> {
@@ -573,6 +762,7 @@ impl Dialogue {
 }
 
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use crate::acl::AccessRequest;
@@ -683,6 +873,345 @@ mod tests {
         assert!(
             reach.scope.method.is_none(),
             "and forgets the method with it"
+        );
+    }
+
+    fn issue_edit() -> Dialogue {
+        Dialogue::new(view(AccessRequest::http(
+            "claude",
+            "github",
+            "PATCH",
+            "/repos/acme/api/issues/108",
+        )))
+    }
+
+    fn press(dialogue: &mut Dialogue, keys: &str) -> Option<Answer> {
+        keys.chars()
+            .map(|key| dialogue.handle(KeyEvent::from(KeyCode::Char(key))))
+            .last()
+            .flatten()
+    }
+
+    fn allowed_reach(dialogue: &mut Dialogue) -> Reach {
+        match dialogue.handle(KeyEvent::from(KeyCode::Enter)) {
+            Some(Answer::Decide { reach, .. }) => *reach,
+            _ => panic!("enter allows"),
+        }
+    }
+
+    fn patch_rule(path: &str) -> RuleShape {
+        RuleShape {
+            agent: "claude".into(),
+            kind: "http".into(),
+            target: "github".into(),
+            methods: vec!["PATCH".into()],
+            paths: vec![path.into()],
+        }
+    }
+
+    fn patch_scope(path_pattern: &str) -> Scope {
+        Scope {
+            agent: Some("claude".into()),
+            kind: Some(Kind::Http),
+            target: Some("github".into()),
+            method: Some("PATCH".into()),
+            path: None,
+            path_pattern: Some(path_pattern.into()),
+        }
+    }
+
+    #[test]
+    fn test_generalize__when_pressed_once__should_cover_sibling_paths() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "g");
+        let reach = allowed_reach(&mut dialogue);
+        assert_eq!(reach.rule, patch_rule("/repos/acme/api/issues/*"));
+        assert_eq!(reach.scope, patch_scope("/repos/acme/api/issues/*"));
+        assert_eq!(reach.label, "→ PATCH /repos/acme/api/issues/* on github");
+    }
+
+    #[test]
+    fn test_generalize__when_pressed_twice__should_cover_parent_subtree() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "gg");
+        assert_eq!(
+            allowed_reach(&mut dialogue).rule,
+            patch_rule("/repos/acme/api/**")
+        );
+    }
+
+    #[test]
+    fn test_generalize__when_pressed_past_first_segment__should_stop_at_first_segment() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "gggggg");
+        assert_eq!(allowed_reach(&mut dialogue).rule, patch_rule("/repos/**"));
+    }
+
+    #[test]
+    fn test_generalize__when_narrowed_back__should_return_to_exact_path() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "ggGG");
+        let reach = allowed_reach(&mut dialogue);
+        assert_eq!(reach.rule, patch_rule("/repos/acme/api/issues/108"));
+        assert_eq!(
+            reach.scope,
+            Scope::exact(&AccessRequest::http(
+                "claude",
+                "github",
+                "PATCH",
+                "/repos/acme/api/issues/108"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_generalize__when_cursor_is_on_wider_row__should_select_path_row() {
+        let mut dialogue = issue_edit();
+        dialogue.handle(KeyEvent::from(KeyCode::Up));
+        press(&mut dialogue, "g");
+        assert_eq!(
+            allowed_reach(&mut dialogue).rule,
+            patch_rule("/repos/acme/api/issues/*")
+        );
+    }
+
+    #[test]
+    fn test_edit__when_glob_covers_request__should_write_typed_pattern() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        for _ in "/repos/acme/api/issues/108".chars() {
+            dialogue.handle(KeyEvent::from(KeyCode::Backspace));
+        }
+        assert!(press(&mut dialogue, "/repos/acme/*/issues/*").is_none());
+        dialogue.handle(KeyEvent::from(KeyCode::Enter));
+        let reach = allowed_reach(&mut dialogue);
+        assert_eq!(reach.rule, patch_rule("/repos/acme/*/issues/*"));
+        assert_eq!(reach.scope, patch_scope("/repos/acme/*/issues/*"));
+    }
+
+    #[test]
+    fn test_edit__when_glob_misses_request__should_keep_editing_with_error() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        dialogue.handle(KeyEvent::from(KeyCode::Backspace));
+        press(&mut dialogue, "9");
+        assert!(dialogue.handle(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "/repos/acme/api/issues/109".into(),
+                cursor: 26,
+                error: Some("`/repos/acme/api/issues/109` does not cover this request".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_edit__when_trailing_star_misses_deeper_path__should_suggest_double_star() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press_key(&mut dialogue, KeyCode::Backspace, "issues/108".len());
+        press(&mut dialogue, "*");
+        assert!(dialogue.handle(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "/repos/acme/api/*".into(),
+                cursor: 17,
+                error: Some(
+                    "`*` stops at the next `/` — `/repos/acme/api/**` covers this request".into()
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn test_edit__when_glob_is_invalid__should_keep_editing_with_error() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press(&mut dialogue, "[");
+        assert!(dialogue.handle(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "/repos/acme/api/issues/108[".into(),
+                cursor: 27,
+                error: Some(
+                    "invalid path pattern `/repos/acme/api/issues/108[`: error parsing glob '/repos/acme/api/issues/108[': \
+                     unclosed character class; missing ']'"
+                        .into()
+                ),
+            })
+        );
+    }
+
+    fn press_key(dialogue: &mut Dialogue, key: KeyCode, times: usize) {
+        for _ in 0..times {
+            dialogue.handle(KeyEvent::from(key));
+        }
+    }
+
+    #[test]
+    fn test_edit__when_cursor_moved_into_middle__should_replace_segment_there() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press_key(&mut dialogue, KeyCode::Left, "/api/issues/108".len());
+        press_key(&mut dialogue, KeyCode::Backspace, "acme".len());
+        press(&mut dialogue, "*");
+        dialogue.handle(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            allowed_reach(&mut dialogue).rule,
+            patch_rule("/repos/*/api/issues/108")
+        );
+    }
+
+    #[test]
+    fn test_edit__when_home_then_delete__should_remove_characters_after_cursor() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press_key(&mut dialogue, KeyCode::Home, 1);
+        press_key(&mut dialogue, KeyCode::Right, 1);
+        press_key(&mut dialogue, KeyCode::Delete, "repos".len());
+        press(&mut dialogue, "orgs");
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "/orgs/acme/api/issues/108".into(),
+                cursor: 5,
+                error: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_edit__when_end_pressed_after_home__should_append_at_end() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press_key(&mut dialogue, KeyCode::Home, 1);
+        press_key(&mut dialogue, KeyCode::End, 1);
+        press(&mut dialogue, "9");
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "/repos/acme/api/issues/1089".into(),
+                cursor: 27,
+                error: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_edit__when_cursor_pushed_past_either_end__should_stop_at_that_end() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press_key(&mut dialogue, KeyCode::Right, 3);
+        press(&mut dialogue, "9");
+        press_key(&mut dialogue, KeyCode::Left, 40);
+        press_key(&mut dialogue, KeyCode::Backspace, 1);
+        press(&mut dialogue, "x");
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "x/repos/acme/api/issues/1089".into(),
+                cursor: 1,
+                error: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_edit__when_path_has_multibyte_characters__should_move_by_character() {
+        let mut dialogue = Dialogue::new(view(AccessRequest::http(
+            "claude", "github", "PATCH", "/café/1",
+        )));
+        press(&mut dialogue, "e");
+        press_key(&mut dialogue, KeyCode::Left, 2);
+        press(&mut dialogue, "x");
+        assert_eq!(
+            dialogue.edit,
+            Some(Edit {
+                pattern: "/caféx/1".into(),
+                cursor: 6,
+                error: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_edit__when_escaped__should_keep_dialogue_open_and_path_unchanged() {
+        let mut dialogue = issue_edit();
+        press(&mut dialogue, "e");
+        press(&mut dialogue, "ad");
+        assert!(dialogue.handle(KeyEvent::from(KeyCode::Esc)).is_none());
+        assert_eq!(dialogue.edit, None);
+        assert_eq!(
+            allowed_reach(&mut dialogue).rule,
+            patch_rule("/repos/acme/api/issues/108")
+        );
+    }
+
+    #[test]
+    fn test_exact_row__when_request_path_holds_glob_characters__should_write_them_literally() {
+        let mut dialogue = Dialogue::new(view(AccessRequest::http(
+            "claude",
+            "github",
+            "PATCH",
+            "/repos/**/a\\b/{x,y}?",
+        )));
+        assert_eq!(
+            allowed_reach(&mut dialogue).rule,
+            patch_rule("/repos/[*][*]/a\\\\b/[{]x,y[}][?]")
+        );
+    }
+
+    #[test]
+    fn test_generalize__when_request_path_holds_glob_characters__should_keep_them_literal() {
+        let mut dialogue = Dialogue::new(view(AccessRequest::http(
+            "claude",
+            "github",
+            "PATCH",
+            "/repos/**/api/issues/108",
+        )));
+        press(&mut dialogue, "g");
+        let reach = allowed_reach(&mut dialogue);
+        assert_eq!(reach.rule, patch_rule("/repos/[*][*]/api/issues/*"));
+        assert_eq!(
+            [
+                reach.scope.matches(&AccessRequest::http(
+                    "claude",
+                    "github",
+                    "PATCH",
+                    "/repos/**/api/issues/109"
+                )),
+                reach.scope.matches(&AccessRequest::http(
+                    "claude",
+                    "github",
+                    "PATCH",
+                    "/repos/acme/api/issues/109"
+                )),
+            ],
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn test_generalize__when_request_is_mcp_tool__should_leave_tool_name_exact() {
+        let mut dialogue = Dialogue::new(view(AccessRequest::mcp(
+            "claude",
+            "sentry",
+            "tools/call",
+            "create_issue",
+        )));
+        press(&mut dialogue, "g");
+        assert_eq!(
+            allowed_reach(&mut dialogue).rule,
+            RuleShape {
+                agent: "claude".into(),
+                kind: "mcp".into(),
+                target: "sentry".into(),
+                methods: vec!["tools/call".into()],
+                paths: vec!["create_issue".into()],
+            }
         );
     }
 
