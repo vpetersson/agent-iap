@@ -471,7 +471,11 @@ pub(crate) fn build_url(base: &str, path: &str, query: Option<&str>) -> anyhow::
     // `/` on a base that has its own path means the base itself: a webhook URL
     // must not gain a trailing slash, which Slack answers with a 301 that turns
     // the POST into a body-less GET.
-    let path = if path == "/" && !base_path.is_empty() { "" } else { path };
+    let path = if path == "/" && !base_path.is_empty() {
+        ""
+    } else {
+        path
+    };
     let approved_path = format!("{base_path}{path}");
 
     let mut raw = base.to_string();
@@ -688,7 +692,9 @@ mod tests {
             "https://hooks.example.com/services/T/B/X"
         );
         assert_eq!(
-            build_url("https://api.example.com", "/", None).unwrap().as_str(),
+            build_url("https://api.example.com", "/", None)
+                .unwrap()
+                .as_str(),
             "https://api.example.com/"
         );
     }
