@@ -466,8 +466,7 @@ enum Landed {
 /// asked for one *after* editing the file, and the write is its own good news —
 /// already on the footer, because it is true the moment the file is written.
 /// What is left to report there is only the bad case: the edit is in the file,
-/// the proxy refused it, and every pane is showing the policy from before it.
-/// See `stale`.
+/// the proxy refused it, and the panes are ahead of the proxy. See `stale`.
 struct Said {
     /// The line for a reload that took. `None` where the caller already said
     /// its piece and only a refusal is still worth hearing about.
@@ -935,18 +934,30 @@ impl App {
     /// cannot read — a path typed wrong in the form above, an item moved in the
     /// vault — is enough to refuse a policy that is otherwise fine.
     ///
-    /// Saying it matters more than it looks. These panes are built from the
-    /// config that is in force, so a refused reload leaves them showing the
-    /// policy from before the write — and without this line, that stale pane is
-    /// the *entire* symptom: the agent is in the file, the footer says it was
-    /// enrolled, and the list it should have appeared in has not changed.
+    /// The panes follow the file rather than the proxy here. They used to
+    /// stay on the policy in force, which hid the very entry that needed
+    /// fixing: an upstream added with an `op://` reference the proxy could not
+    /// read was in the file, refused, and on no pane — so there was no row to
+    /// press `e` on, and the only way to correct the reference was an editor.
+    /// Showing the file makes the mistake reachable from where it was made;
+    /// the header says the panes are ahead of the proxy for as long as they
+    /// are, because this line fades and that difference does not.
     fn stale(&mut self, error: &anyhow::Error) {
         let file = self.file_name();
+        // A file that does not even parse has nothing to show; the panes stay
+        // where they were and the error says why.
+        let shown = match self.policy.watcher().read() {
+            Ok(config) => self.policy.show(Arc::new(config)).is_ok(),
+            Err(_) => false,
+        };
+        let panes = match shown {
+            true => "these panes show the file, so fix it here — `e` on the row",
+            false => "these panes with it, so what they show is not what was just written",
+        };
         self.flash = Some(Flash {
             message: format!(
                 "the edit is in {file}, but the proxy refused to reload it and is still serving \
-                 the previous policy — these panes with it, so what they show is not what was \
-                 just written: {error:#}"
+                 the previous policy — {panes}: {error:#}"
             ),
             failed: true,
             at: Instant::now(),
@@ -1711,7 +1722,7 @@ impl App {
                             // the far end of a reload the operator should not
                             // have to wait through. The reload is a separate
                             // question, and only its bad answer is still worth
-                            // hearing: a refused one leaves these panes showing
+                            // hearing: a refused one leaves the proxy serving
                             // the policy from before the write.
                             self.say(effect.message);
                             // The verification rides on the reload rather than
@@ -2040,6 +2051,16 @@ impl App {
         // seconds and lockdown does not, so without this the state in which
         // every request is being refused looks exactly like the state in
         // which the policy is being served.
+        // The panes are showing a file the proxy refused — see `stale`.
+        if !Arc::ptr_eq(&self.policy.config, &self.state.config()) {
+            spans.push(Span::styled(
+                "  NOT IN FORCE — the proxy refused this file  ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.state.acl.locked_down() {
             spans.push(Span::styled(
                 "  LOCKDOWN  ",
@@ -4763,6 +4784,60 @@ base_url = "https://api.github.com"
     /// Open the `add an upstream` form on `bearer`, named, with the cursor on
     /// `secret` and a credential typed into it — the state the refusal used to
     /// be a dead end from.
+    /// The reported bug: an upstream added with a reference the proxy could
+    /// not read was written, refused, and on no pane — so it could not be
+    /// opened to fix the reference that was the whole problem.
+    #[tokio::test]
+    async fn an_upstream_the_proxy_refused_is_still_on_the_pane_to_be_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+        let Some(Modal::Form(form)) = &mut app.modal else {
+            panic!("the upstream form is not open");
+        };
+        set(form, "name", "anthropic");
+        set(form, "base-url", "https://api.anthropic.com");
+        let auth = form
+            .fields
+            .iter()
+            .position(|field| field.key == "auth")
+            .unwrap();
+        form.focus(auth);
+        while form.text("auth") != "bearer" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        // No `op` here, which is the same refusal as a vault that is locked
+        // or an item spelled wrong.
+        set(form, "secret", "op://Privat/Anthropic/credential");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.settle().await;
+
+        assert!(app.flash.as_ref().is_some_and(|flash| flash.failed));
+        let names: Vec<String> = app
+            .policy
+            .inventory
+            .upstreams
+            .iter()
+            .flatten()
+            .map(|upstream| upstream.name.clone())
+            .collect();
+        assert_eq!(names, ["anthropic", "github"], "on the pane, in order");
+        let screen = render(&mut app, 160, 30);
+        assert!(screen.contains("NOT IN FORCE"), "{screen}");
+
+        // And `e` on it opens the entry as written, which is the way out.
+        app.cursor[Tab::Upstreams.index()].select(Some(0));
+        app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("`e` did not open the refused upstream");
+        };
+        assert_eq!(form.intent, form::Intent::EditUpstream("anthropic".into()));
+        assert_eq!(form.text("secret"), "op://Privat/Anthropic/credential");
+    }
+
     async fn upstream_form_with_a_typed_credential(app: &mut App, name: &str, credential: &str) {
         app.tab = Tab::Upstreams;
         app.clamp_cursors();
@@ -5680,11 +5755,10 @@ base_url = "https://api.github.com"
 
         let written = std::fs::read_to_string(&app.policy.path).unwrap();
         assert!(written.contains("new-agent"), "the write itself landed");
-        assert_eq!(
-            views::agents(&app.policy.inventory).len(),
-            1,
-            "the pane is showing the policy still in force, which is the old one"
-        );
+        // The pane follows the file, so what was written can be found and
+        // fixed from here; the header says the proxy is not serving it.
+        assert_eq!(views::agents(&app.policy.inventory).len(), 2);
+        assert!(!Arc::ptr_eq(&app.policy.config, &app.state.config()));
 
         let flash = app.flash.as_ref().expect("the console said something");
         assert!(

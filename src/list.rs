@@ -176,6 +176,15 @@ pub struct Inventory {
     pub acl_default: Option<Action>,
 }
 
+/// Alphabetical the way a person reads a list: `GitHub` beside `github-git`,
+/// not ahead of every lower-case name because `G` is a smaller byte than `a`.
+/// Ties broken on the exact spelling, so the order is total and stable.
+fn by_name(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
 impl Inventory {
     pub fn build(config: &Config, options: &ListOptions) -> Result<Self> {
         // Only the agent-scoped view needs the globs compiled; a plain listing
@@ -203,7 +212,7 @@ impl Inventory {
                 Some(scope) => vec![scope.agent],
                 None => config.agents.iter().collect(),
             };
-            agents.sort_by(|a, b| a.id.cmp(&b.id));
+            agents.sort_by(|a, b| by_name(&a.id, &b.id));
             inventory.agents = Some(agents.into_iter().map(agent_row).collect());
         }
 
@@ -213,7 +222,7 @@ impl Inventory {
                 .iter()
                 .filter(|u| scope.as_ref().is_none_or(|s| s.may_address(&u.name)))
                 .collect();
-            upstreams.sort_by(|a, b| a.name.cmp(&b.name));
+            upstreams.sort_by(|a, b| by_name(&a.name, &b.name));
             inventory.upstreams = Some(
                 upstreams
                     .into_iter()
@@ -228,7 +237,7 @@ impl Inventory {
                 .iter()
                 .filter(|s| scope.as_ref().is_none_or(|sc| sc.may_address(&s.name)))
                 .collect();
-            servers.sort_by(|a, b| a.name.cmp(&b.name));
+            servers.sort_by(|a, b| by_name(&a.name, &b.name));
             inventory.mcp_servers = Some(
                 servers
                     .into_iter()
@@ -830,6 +839,27 @@ auth = { type = "bearer", secret = "literal:sk-super-secret" }
         let order: Vec<usize> = rows.iter().map(|r| r.index).collect();
         assert_eq!(order, vec![0, 1, 2]);
         assert_eq!(rows[0].name, "github-reads");
+    }
+
+    /// The pane is a list somebody scans for a name, so a capital letter must
+    /// not send an upstream to the top of it.
+    #[test]
+    fn services_are_listed_alphabetically_whatever_their_case() {
+        let mut text = String::new();
+        for name in ["zeta", "GitHub", "anthropic", "github-git"] {
+            text.push_str(&format!(
+                "[[upstreams]]\nname = \"{name}\"\nbase_url = \"https://{name}.example.com\"\n\n"
+            ));
+        }
+        let config: Config = toml::from_str(&text).unwrap();
+        let names: Vec<String> = Inventory::build(&config, &ListOptions::default())
+            .unwrap()
+            .upstreams
+            .unwrap()
+            .into_iter()
+            .map(|upstream| upstream.name)
+            .collect();
+        assert_eq!(names, ["anthropic", "GitHub", "github-git", "zeta"]);
     }
 
     #[test]
