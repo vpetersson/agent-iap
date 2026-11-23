@@ -268,6 +268,11 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 .opt("expires-in")
                 .map(|ttl| enroll::parse_ttl(&ttl).map(|delta| Utc::now() + delta))
                 .transpose()?;
+            let schedule = crate::schedule::Schedule::from_parts(
+                &form.list("days"),
+                &form.list("hours"),
+                form.opt("tz").as_deref(),
+            )?;
 
             let name = form.opt("name");
             let spec = enroll::RuleSpec {
@@ -279,6 +284,7 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 paths: &paths,
                 action: &action,
                 expires,
+                schedule,
                 // The switch beside `target` on the form, and off unless the
                 // operator turned it on: `*` is what the field is prefilled
                 // with, so a grant about every service must not be what a
@@ -295,10 +301,16 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                 }
                 None => enroll::add_rule(path, &spec)?,
             };
-            let until = match expires {
+            let mut until = match expires {
                 Some(at) => format!(", for {}", enroll::remaining(at, Utc::now())),
                 None => String::new(),
             };
+            if let Some(schedule) = &spec.schedule {
+                until.push_str(&format!(
+                    ", only {schedule} ({})",
+                    schedule.status(Utc::now())
+                ));
+            }
             Ok(Effect::said(format!(
                 "rule #{landed}: {action} {} {} on `{target}` for `{agent}`{until} — live now",
                 methods.join(","),

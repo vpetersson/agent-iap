@@ -114,7 +114,24 @@ methods = ["POST"]
 paths = ["/repos/acme/**"]
 action = "allow"
 expires = "2026-09-15T09:00:00Z"
+
+# A grant with hours in it. Outside the window this rule matches nothing and
+# whatever is behind it decides — here the backup agent can write to its bucket
+# from 03:00 to 05:00 Stockholm time, every night, and is asked about (or
+# refused) the rest of the day.
+[[acl]]
+agent = "backup"
+target = "r2"
+methods = ["PUT"]
+paths = ["/backups/**"]
+action = "allow"
+schedule = { hours = ["03:00-05:00"], tz = "Europe/Stockholm" }
 ```
+
+`expires` ends a grant once; `schedule` opens and closes one every week. They
+combine — a window that also stops existing on a date — and either can sit on
+`deny` or `ask` as well as `allow`: `deny` on `sat,sun` is a weekend freeze.
+[§ Time-bound rules](enrolling.md#time-bound-rules) has the whole shape.
 
 Each agent has its own token; the file holds only hashes, and two agents sharing
 one is a startup error rather than a puzzle later. Every audit record names the

@@ -291,7 +291,7 @@ fn verdict(verified: &Verifications, name: &str) -> (String, Color) {
 pub fn acl(inventory: &Inventory) -> Table {
     Table {
         headers: vec![
-            "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION", "EXPIRES",
+            "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION", "EXPIRES", "WHEN",
         ],
         rows: inventory
             .acl
@@ -299,11 +299,13 @@ pub fn acl(inventory: &Inventory) -> Table {
             .flatten()
             .map(|rule| {
                 let expires = rule.expires_in.clone();
-                // A rule whose deadline has passed is still in the file and
-                // still numbered, because the numbering is what `x` takes — but
-                // it decides nothing, and colouring it as though it did is the
-                // console telling the operator something untrue.
-                let spent = expires.as_deref() == Some("expired");
+                // A rule whose deadline has passed, or whose window is shut, is
+                // still in the file and still numbered, because the numbering
+                // is what `x` takes — but it decides nothing right now, and
+                // colouring it as though it did is the console telling the
+                // operator something untrue. The `WHEN` cell says `closed` in
+                // words, so the grey is not the only thing carrying it.
+                let spent = rule.dormant();
                 Row::accented(
                     [
                         rule.index.to_string(),
@@ -315,6 +317,7 @@ pub fn acl(inventory: &Inventory) -> Table {
                         rule.paths.join(","),
                         rule.action.to_string(),
                         expires.unwrap_or_else(|| "—".into()),
+                        rule.when().unwrap_or_else(|| "—".into()),
                     ],
                     if spent {
                         Color::DarkGray

@@ -168,6 +168,77 @@ survives a restart. Expired rules are not swept out of the file: they stay
 listed as `expired`, because a grant that was made and has run out is worth a
 record.
 
+### Time-bound rules
+
+A deadline ends a grant once. A schedule opens and closes it on the clock, every
+week — the backup job that may write between 03:00 and 05:00, the reporting
+agent that may read the warehouse on weekdays:
+
+```bash
+agent-iap acl add --name nightly-backup --agent backup \
+    --target r2 --methods PUT --paths '/backups/**' \
+    --action allow --hours 03:00-05:00 --tz Europe/Stockholm
+
+agent-iap acl add --name weekday-reports --agent reporter \
+    --target warehouse --methods GET --paths '/v1/**' \
+    --action allow --days mon-fri --hours 08:00-18:00 --tz America/New_York
+```
+
+which writes, under the rule:
+
+```toml
+schedule = { days = ["mon-fri"], hours = ["08:00-18:00"], tz = "America/New_York" }
+```
+
+- **`days`** — `mon` … `sun` (or the full names), and ranges: `mon-fri`,
+  `fri-mon`. Absent means every day.
+- **`hours`** — `HH:MM-HH:MM`, from the start up to but not including the end.
+  A window may cross midnight (`22:00-02:00`) and belongs to the day it
+  *opened* on, so `days = ["fri"]` with that window is Friday night into
+  Saturday morning and no other night. `24:00` closes a window at midnight.
+  More than one window is a list. Absent means the whole of each day.
+- **`tz`** — an IANA zone (`Europe/London`), `UTC`, or `local`
+  for this machine's clock. Required, and never guessed: the same `03:00` is a
+  different hour in a container whose clock is UTC, and a default that was
+  wrong would open the window early. The hours are wall-clock time in that
+  zone, so they follow daylight saving.
+
+Outside its window a rule matches nothing — exactly like an expired one — and
+the request falls through to whatever is behind it: the `ask` it was written in
+front of, or `acl_default`. A window can sit on `deny` or `ask` as well:
+`--action deny --days sat,sun` in front of everything else is a weekend freeze.
+
+An agent refused outside the window is told why, in the refusal and in the
+audit line, instead of being left with the `<default>` it fell through to:
+
+```
+denied by policy `<default>` — GET /backups/db.tar on `r2` — `nightly-backup`
+applies only 03:00-05:00 Europe/Stockholm (closed, opens in 20h14m)
+```
+
+`agent-iap list acl` and the console's rule list show each window in a `WHEN`
+column with where it stands right now (`closed, opens in 20h14m`), and the
+console greys a closed rule out the way it does an expired one. The console's
+add-rule form has `days`, `hours` and `tz` fields.
+
+What a window does not do:
+
+- **It is checked when a request arrives, not while it runs.** A call admitted
+  at 04:59 that streams until 05:30 is not cut off, and neither is an MCP
+  session's `initialize` revisited — but every later request on that session is
+  checked on its own, so a tool call at 05:01 is outside the window.
+- **It is this host's clock.** A proxy whose clock is wrong opens the window at
+  the wrong time; keep it on NTP.
+- **Zone rules are those of the build.** IANA names are resolved against the
+  time-zone database bundled into the binary — so a static build in a container
+  with no `/usr/share/zoneinfo` reads them the same as a laptop — and a country
+  that changes its daylight-saving rules after the build needs a newer build
+  (or `tz = "local"`, which reads the host's own zone).
+- **An answer in the approval console is not windowed.** Approving a request
+  that fell through to an `ask` for anything longer than *once* — a duration,
+  *until quit*, *from now on* — grants exactly that, at every hour; nothing
+  copies the closed rule's schedule into the answer.
+
 `--username-secret` is for the APIs that put the credential in the user half of
 basic auth — Graylog's `<token>:token`. A plain `--username` would mean the token
 living in a file meant to be committable, so the user field takes a reference

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{AclRuleConfig, Action, Config};
+use crate::schedule::Schedule;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,11 +97,39 @@ pub struct Decision {
     /// override this decision has to land *before* this position — which is the
     /// one thing the label alone cannot say.
     pub index: Option<usize>,
+    /// A rule earlier in the file that matched this request in every respect
+    /// but the clock: its `schedule` was closed. The difference between "no
+    /// rule lets you do this" and "a rule does, at 03:00" is the whole of what
+    /// an agent refused at 06:00 needs to know, and without this the refusal
+    /// names only the `<default>` it fell through to.
+    pub outside_window: Option<OutsideWindow>,
+}
+
+/// The first scheduled rule a request passed over because its window was shut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutsideWindow {
+    pub label: String,
+    /// `mon-fri 03:00-05:00 Europe/London`.
+    pub schedule: String,
+    /// `closed, opens in 3h0m`.
+    pub status: String,
 }
 
 impl Decision {
     pub fn rule_label(&self) -> &str {
         self.rule.as_deref().unwrap_or("<default>")
+    }
+
+    /// What to add to a refusal: empty, or ` — `nightly` applies only
+    /// mon-fri 03:00-05:00 Europe/London (closed, opens in 3h0m)`.
+    pub fn window_note(&self) -> String {
+        match &self.outside_window {
+            Some(w) => format!(
+                " — `{}` applies only {} ({})",
+                w.label, w.schedule, w.status
+            ),
+            None => String::new(),
+        }
     }
 }
 
@@ -138,26 +167,48 @@ struct CompiledRule {
     /// rather than swept by a timer, so a grant that ran out while the proxy
     /// was stopped is already over when it comes back.
     expires: Option<DateTime<Utc>>,
+    /// When, each week, it applies at all. The same clock reading as
+    /// `expires`, for the same reason.
+    schedule: Option<Schedule>,
+}
+
+/// How one rule stands against one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match {
+    Yes,
+    No,
+    /// It would have matched, but its window is shut.
+    OutsideWindow,
 }
 
 impl CompiledRule {
-    fn matches(&self, request: &AccessRequest, now: Option<DateTime<Utc>>) -> bool {
+    fn matches(&self, request: &AccessRequest, now: Option<DateTime<Utc>>) -> Match {
         // Checked first and cheaply: an expired rule is not a rule, and the
         // glob work below is wasted on it.
         if let (Some(expires), Some(now)) = (self.expires, now) {
             if now >= expires {
-                return false;
+                return Match::No;
             }
         }
         if let Some(kind) = self.kind {
             if kind != request.kind {
-                return false;
+                return Match::No;
             }
         }
-        self.agent.is_match(&request.agent)
+        let covers = self.agent.is_match(&request.agent)
             && self.target.is_match(&request.target)
             && self.methods.iter().any(|m| m.is_match(&request.method))
-            && self.matches_path(&request.path)
+            && self.matches_path(&request.path);
+        if !covers {
+            return Match::No;
+        }
+        // After the globs rather than before them, unlike expiry: a shut
+        // window is worth reporting only about a rule that otherwise covered
+        // the request.
+        match (&self.schedule, now) {
+            (Some(schedule), Some(now)) if !schedule.contains(now) => Match::OutsideWindow,
+            _ => Match::Yes,
+        }
     }
 
     fn matches_path(&self, path: &str) -> bool {
@@ -171,9 +222,10 @@ impl CompiledRule {
 struct Compiled {
     rules: Vec<CompiledRule>,
     default: Action,
-    /// Whether any rule has a deadline at all. When none does — the ordinary
-    /// case — evaluating a request never has to ask what time it is.
-    any_expiring: bool,
+    /// Whether any rule has a deadline or a schedule at all. When none does —
+    /// the ordinary case — evaluating a request never has to ask what time it
+    /// is.
+    any_timed: bool,
 }
 
 /// A rule list that has compiled, waiting to be put in charge.
@@ -255,26 +307,42 @@ impl Acl {
                 action: Action::Deny,
                 rule: Some(LOCKDOWN.to_string()),
                 index: None,
+                outside_window: None,
             };
         }
         let compiled = self.compiled.read();
         // One clock reading for the whole rule list, so two rules in the same
         // decision cannot disagree about whether the deadline between them has
-        // passed. Skipped entirely when nothing in the file expires.
-        let now = compiled.any_expiring.then(Utc::now);
+        // passed. Skipped entirely when nothing in the file is timed.
+        let now = compiled.any_timed.then(Utc::now);
+        let mut outside_window = None;
         for (index, rule) in compiled.rules.iter().enumerate() {
-            if rule.matches(request, now) {
-                return Decision {
-                    action: rule.action,
-                    rule: Some(rule.label.clone()),
-                    index: Some(index),
-                };
+            match rule.matches(request, now) {
+                Match::Yes => {
+                    return Decision {
+                        action: rule.action,
+                        rule: Some(rule.label.clone()),
+                        index: Some(index),
+                        outside_window,
+                    }
+                }
+                Match::OutsideWindow if outside_window.is_none() => {
+                    if let (Some(schedule), Some(now)) = (&rule.schedule, now) {
+                        outside_window = Some(OutsideWindow {
+                            label: rule.label.clone(),
+                            schedule: schedule.to_string(),
+                            status: schedule.status(now),
+                        });
+                    }
+                }
+                Match::OutsideWindow | Match::No => {}
             }
         }
         Decision {
             action: compiled.default,
             rule: None,
             index: None,
+            outside_window,
         }
     }
 
@@ -288,7 +356,7 @@ impl Acl {
     /// that worked this morning is being asked about again.
     pub fn expired_count(&self) -> usize {
         let compiled = self.compiled.read();
-        if !compiled.any_expiring {
+        if !compiled.any_timed {
             return 0;
         }
         let now = Utc::now();
@@ -368,11 +436,13 @@ fn compile_all(config: &Config) -> Result<Compiled> {
     for (index, rule) in config.acl.iter().enumerate() {
         rules.push(compile_rule(index, rule)?);
     }
-    let any_expiring = rules.iter().any(|rule| rule.expires.is_some());
+    let any_timed = rules
+        .iter()
+        .any(|rule| rule.expires.is_some() || rule.schedule.is_some());
     Ok(Compiled {
         rules,
         default: config.acl_default.action,
-        any_expiring,
+        any_timed,
     })
 }
 
@@ -403,6 +473,7 @@ fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {
             .with_context(|| format!("{label}: paths"))?,
         action: rule.action,
         expires: rule.expires,
+        schedule: rule.schedule.clone(),
         label,
     })
 }
@@ -696,6 +767,66 @@ action = "ask"
         );
     }
 
+    /// `HH:00-HH:00` around the current UTC hour: `from` hours away, `len` long.
+    fn window_from_now(from: i64, len: i64) -> String {
+        use chrono::Timelike;
+        let hour = |offset: i64| (Utc::now().hour() as i64 + offset).rem_euclid(24);
+        format!("{:02}:00-{:02}:00", hour(from), hour(from + len))
+    }
+
+    #[test]
+    fn a_rule_outside_its_window_falls_through_and_the_decision_says_why() {
+        // The schedule twin of the deadline test above. Wide margins either
+        // side of the current hour, so a run at 59 minutes past is not flaky.
+        let open = window_from_now(-1, 3);
+        let shut = window_from_now(4, 2);
+        let acl = acl(&format!(
+            r#"
+[[acl]]
+name = "nightly-backup"
+target = "s3"
+action = "allow"
+schedule = {{ hours = ["{shut}"], tz = "UTC" }}
+
+[[acl]]
+name = "business-hours"
+target = "warehouse"
+action = "allow"
+schedule = {{ hours = ["{open}"], tz = "UTC" }}
+
+[[acl]]
+name = "writes-need-a-human"
+target = "s3"
+action = "ask"
+"#
+        ));
+
+        let shut_out = acl.evaluate(&AccessRequest::http("a", "s3", "PUT", "/bucket/key"));
+        assert_eq!(shut_out.action, Action::Ask);
+        assert_eq!(
+            shut_out.rule_label(),
+            "writes-need-a-human",
+            "a closed window must not decide, and must not shadow the rule behind it"
+        );
+        let note = shut_out.window_note();
+        assert!(
+            note.contains("`nightly-backup` applies only") && note.contains(&shut),
+            "the refusal has to say a rule would allow this at another hour: {note}"
+        );
+        assert!(note.contains("closed, opens in"), "{note}");
+
+        let let_in = acl.evaluate(&AccessRequest::http("a", "warehouse", "GET", "/x"));
+        assert_eq!(let_in.action, Action::Allow);
+        assert_eq!(let_in.rule_label(), "business-hours");
+        assert_eq!(let_in.outside_window, None);
+
+        // A request the scheduled rule would not have covered anyway gets no
+        // note: blaming the clock for a path the rule never named is the kind
+        // of wrong cause this repo exists to avoid.
+        let unrelated = acl.evaluate(&AccessRequest::http("a", "elsewhere", "GET", "/x"));
+        assert_eq!(unrelated.outside_window, None);
+    }
+
     #[test]
     fn a_policy_with_no_deadlines_never_asks_what_time_it_is() {
         // Not a behaviour test — a cost one. Every request reads this list, and
@@ -705,7 +836,7 @@ action = "ask"
 target = "gh"
 action = "allow"
 "#);
-        assert!(!acl.compiled.read().any_expiring);
+        assert!(!acl.compiled.read().any_timed);
         assert_eq!(acl.expired_count(), 0);
     }
 

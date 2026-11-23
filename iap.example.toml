@@ -191,6 +191,12 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "op://Private/GitHub/token" }
 # than on somebody remembering to take it away. Checked on every request, so it
 # survives a restart; `agent-iap acl add --expires-in 90m` writes one, and so
 # does the approval console's dialogue. See the last rule in this file.
+#
+# Any rule may also carry a weekly window:
+#   schedule = { days = ["mon-fri"], hours = ["03:00-05:00"], tz = "Europe/London" }
+# Outside it the rule matches nothing, the same as past `expires`. `tz` is
+# required — an IANA zone, "UTC", or "local" — and the hours follow its
+# daylight saving. `agent-iap acl add --days … --hours … --tz …` writes one.
 
 [[acl]]
 name = "anthropic-inference"
@@ -271,3 +277,15 @@ action = "ask"
 # paths = ["/repos/acme/**"]
 # action = "allow"
 # expires = "2026-01-01T09:00:00Z"
+#
+# A grant with hours on it. Outside 03:00-05:00 Stockholm time, every day, it
+# decides nothing; `agent-iap list acl` shows it as `closed, opens in …`.
+# [[acl]]
+# name = "nightly-backup"
+# agent = "backup"
+# kind = "http"
+# target = "r2"
+# methods = ["PUT"]
+# paths = ["/backups/**"]
+# action = "allow"
+# schedule = { hours = ["03:00-05:00"], tz = "Europe/Stockholm" }

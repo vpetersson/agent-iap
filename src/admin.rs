@@ -458,7 +458,11 @@ async fn authorize(
                 allowed: false,
                 decision: "deny".into(),
                 rule: decision.rule_label().to_string(),
-                reason: Some(format!("denied by policy `{}`", decision.rule_label())),
+                reason: Some(format!(
+                    "denied by policy `{}`{}",
+                    decision.rule_label(),
+                    decision.window_note()
+                )),
             }
         }
         Action::Ask => {
@@ -471,8 +475,13 @@ async fn authorize(
                 allowed: outcome.verdict() == Verdict::Allow,
                 decision: outcome.label().to_string(),
                 rule: decision.rule_label().to_string(),
-                reason: (outcome.verdict() == Verdict::Deny)
-                    .then(|| format!("held for approval and not allowed ({})", outcome.label())),
+                reason: (outcome.verdict() == Verdict::Deny).then(|| {
+                    format!(
+                        "held for approval and not allowed ({}){}",
+                        outcome.label(),
+                        decision.window_note()
+                    )
+                }),
             }
         }
     };

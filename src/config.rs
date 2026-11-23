@@ -724,6 +724,15 @@ pub struct AclRuleConfig {
     /// as the record of a grant that was made and has run out.
     #[serde(default)]
     pub expires: Option<DateTime<Utc>>,
+    /// When, each week, this rule applies: days, hours, and the zone those
+    /// are read in. Absent means always.
+    ///
+    /// Outside its window the rule matches nothing — the same as past
+    /// `expires` — so the request falls through to whatever is behind it.
+    /// Parsed when the file loads, so a `25:00` or a misspelt zone is refused
+    /// on the line it is written on rather than as a rule that never opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<crate::schedule::Schedule>,
 }
 
 impl AclRuleConfig {

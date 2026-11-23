@@ -427,6 +427,10 @@ What it does not give you, and you should know before relying on it:
 - **The ACL sees method, path and tool name, not intent.** It cannot tell a
   reasonable `POST /v1/messages` from an expensive one. Use `ask` where the
   distinction matters.
+- **A time-bound rule is checked when a request arrives, against this host's
+  clock.** A call admitted inside the window runs to completion after it shuts,
+  and a host clock that is wrong opens the window at the wrong time
+  ([§ Time-bound rules](docs/enrolling.md#time-bound-rules)).
 - **Response bodies are not inspected.** Nothing here stops an upstream from
   returning data the agent should not have.
 - **`iap://` is a place to keep a credential, not a way to protect one.** The
