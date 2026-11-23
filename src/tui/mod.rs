@@ -1939,6 +1939,7 @@ impl App {
             paths: &rule.paths,
             action,
             expires: ttl.map(|ttl| chrono::Utc::now() + ttl),
+            schedule: None,
             // Every row of the dialogue names the target the request was for.
             // The one that did not — "any request from <agent>", which wrote
             // `target = "*"` — is gone, because an answer about one call is
@@ -3174,6 +3175,24 @@ fn rule_form(inventory: &Inventory) -> Form {
                 "ask stops the request on a human at this console",
                 vec!["allow".into(), "deny".into(), "ask".into()],
                 2,
+            ),
+            // Three plain fields rather than a picker: a window is short to
+            // type, and `ctrl-o` on a list of 400 zones is slower than typing
+            // the one you live in. Blank, all three, is a rule with no window.
+            Field::text(
+                "days",
+                "days",
+                "only on these days: mon-fri, sat,sun. Blank is every day. Needs tz.",
+            ),
+            Field::text(
+                "hours",
+                "hours",
+                "only in these hours: 03:00-05:00, or 22:00-02:00 across midnight. Needs tz.",
+            ),
+            Field::text(
+                "tz",
+                "tz",
+                "the zone days and hours are read in: Europe/London, UTC, or local",
             ),
             Field::text(
                 "position",
@@ -5080,6 +5099,7 @@ base_url = "https://api.github.com"
                 paths: &["/repos/**".into()],
                 action: "allow",
                 expires: None,
+                schedule: None,
                 any_target: false,
             },
         )

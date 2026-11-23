@@ -985,6 +985,8 @@ pub struct RuleSpec<'a> {
     pub action: &'a str,
     /// When the rule stops applying. `None` is the grant with no end.
     pub expires: Option<DateTime<Utc>>,
+    /// When, each week, it applies. `None` is always.
+    pub schedule: Option<crate::schedule::Schedule>,
     /// A pattern in `target` was asked for, rather than arrived at by leaving
     /// a flag alone.
     ///
@@ -1125,6 +1127,23 @@ fn rule_entry(spec: &RuleSpec<'_>) -> Table {
         // wrong at least once.
         entry["expires"] = toml_edit::value(expires.to_rfc3339_opts(SecondsFormat::Secs, true));
     }
+    if let Some(schedule) = &spec.schedule {
+        // One inline table, so the window reads on one line under the rule it
+        // belongs to rather than as a `[acl.schedule]` section a reader has to
+        // match back up.
+        let raw = schedule.raw();
+        let mut table = toml_edit::InlineTable::new();
+        if let Some(days) = &raw.days {
+            table.insert("days", string_array(days).into());
+        }
+        if let Some(hours) = &raw.hours {
+            table.insert("hours", string_array(hours).into());
+        }
+        if let Some(tz) = &raw.tz {
+            table.insert("tz", tz.as_str().into());
+        }
+        entry["schedule"] = toml_edit::value(table);
+    }
     entry
 }
 
@@ -1148,6 +1167,7 @@ fn rule<'a>(
         paths,
         action,
         expires: None,
+        schedule: None,
         any_target: false,
     }
 }
@@ -2795,6 +2815,7 @@ mod tests {
                 paths: &["/repos/**".into()],
                 action: "allow",
                 expires: Some(expires),
+                schedule: None,
                 any_target: false,
             },
         )

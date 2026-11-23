@@ -29,6 +29,11 @@ hex = "0.4"
 base64 = "0.23"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+# IANA zones for a rule's `schedule`: "03:00-05:00" means the wall clock somewhere,
+# and a fixed offset is wrong for half the year wherever there is daylight saving.
+# The database is bundled, so a static binary in a container with no
+# /usr/share/zoneinfo reads "Europe/London" the same as a laptop does.
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 parking_lot = "0.13"
 zeroize = "1"
 ratatui = "0.30"

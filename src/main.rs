@@ -819,6 +819,9 @@ impl AuthFlags {
 }
 
 #[derive(Subcommand)]
+// Parsed once per process, so the size of the `Add` variant costs nothing worth
+// boxing for.
+#[allow(clippy::large_enum_variant)]
 enum AclCommand {
     /// Append a rule. Appended, not inserted: first match wins, so a new rule
     /// cannot silently shadow one already in the file.
@@ -871,6 +874,19 @@ enum AclCommand {
         /// grant you can hand out without having to remember to take it back.
         #[arg(long, value_name = "DURATION")]
         expires_in: Option<String>,
+        /// Days of the week this rule applies on: `mon-fri`, `sat,sun`, `wed`.
+        /// Repeatable. Outside them the rule matches nothing. Needs `--tz`.
+        #[arg(long, value_name = "DAYS")]
+        days: Vec<String>,
+        /// Hours of the day this rule applies in: `03:00-05:00`, or
+        /// `22:00-02:00` across midnight. Repeatable. Needs `--tz`.
+        #[arg(long, value_name = "HH:MM-HH:MM")]
+        hours: Vec<String>,
+        /// The zone `--days` and `--hours` are read in: an IANA name such as
+        /// `Europe/London`, `UTC`, or `local` for this machine's clock. Never
+        /// assumed — the same "03:00" is a different hour in a UTC container.
+        #[arg(long, value_name = "ZONE")]
+        tz: Option<String>,
     },
     /// Remove a rule by its number. Everything after it moves up one, so
     /// removing several means re-reading the list between them.
@@ -1264,6 +1280,9 @@ fn main() -> Result<()> {
             paths,
             action,
             expires_in,
+            days,
+            hours,
+            tz,
         }) => add_rule(AddRule {
             path: config.config,
             name,
@@ -1275,6 +1294,9 @@ fn main() -> Result<()> {
             paths,
             action,
             expires_in,
+            days,
+            hours,
+            tz,
         }),
         Command::Acl(AclCommand::Rm { index, config }) => remove_rule(&config.config, index),
         Command::Acl(AclCommand::Reset { config, deny, yes }) => {
@@ -3147,6 +3169,9 @@ struct AddRule {
     paths: Vec<String>,
     action: ActionArg,
     expires_in: Option<String>,
+    days: Vec<String>,
+    hours: Vec<String>,
+    tz: Option<String>,
 }
 
 fn add_rule(options: AddRule) -> Result<()> {
@@ -3156,6 +3181,12 @@ fn add_rule(options: AddRule) -> Result<()> {
         .map(|ttl| enroll::parse_ttl(ttl).map(|delta| chrono::Utc::now() + delta))
         .transpose()
         .context("--expires-in")?;
+    let schedule = agent_iap::schedule::Schedule::from_parts(
+        &options.days,
+        &options.hours,
+        options.tz.as_deref(),
+    )
+    .context("--days/--hours/--tz")?;
 
     enroll::add_rule(
         &options.path,
@@ -3168,6 +3199,7 @@ fn add_rule(options: AddRule) -> Result<()> {
             paths: &options.paths,
             action: options.action.as_str(),
             expires,
+            schedule: schedule.clone(),
             any_target: options.any_target,
         },
     )?;
@@ -3191,6 +3223,12 @@ fn add_rule(options: AddRule) -> Result<()> {
         println!(
             "It stops applying at {} — after that, whatever is behind it decides.",
             expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+    }
+    if let Some(schedule) = schedule {
+        println!(
+            "It applies only {schedule} ({}). Outside that, whatever is behind it decides.",
+            schedule.status(chrono::Utc::now())
         );
     }
     Ok(())

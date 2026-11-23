@@ -124,6 +124,35 @@ pub struct AclRow {
     /// subtraction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in: Option<String>,
+    /// The rule's weekly window, and where it stands right now:
+    /// `mon-fri 03:00-05:00 Europe/London`, `closed, opens in 3h0m`. `None`
+    /// for a rule that applies at all hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+}
+
+impl AclRow {
+    /// Whether the rule is shut right now — past `expires`, or outside its
+    /// `schedule`. It is still in the file and still numbered, but it decides
+    /// nothing until it opens, and drawing it as though it did is untrue.
+    pub fn dormant(&self) -> bool {
+        self.expires_in.as_deref() == Some("expired")
+            || self
+                .window
+                .as_deref()
+                .is_some_and(|w| w.starts_with("closed"))
+    }
+
+    /// The `WHEN` cell: `mon-fri 03:00-05:00 Europe/London (closed, opens in 3h0m)`.
+    pub fn when(&self) -> Option<String> {
+        let schedule = self.schedule.as_deref()?;
+        Some(match &self.window {
+            Some(window) => format!("{schedule} ({window})"),
+            None => schedule.to_string(),
+        })
+    }
 }
 
 /// Everything the policy file exposes, in the sections that were asked for.
@@ -348,12 +377,14 @@ impl Inventory {
                         r.paths.join(","),
                         r.action.to_string(),
                         r.expires_in.clone().unwrap_or_else(|| NONE.to_string()),
+                        r.when().unwrap_or_else(|| NONE.to_string()),
                     ]
                 })
                 .collect();
             let mut table = render_table(
                 &[
-                    "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION", "EXPIRES",
+                    "#", "NAME", "AGENT", "KIND", "TARGET", "METHODS", "PATHS", "ACTION",
+                    "EXPIRES", "WHEN",
                 ],
                 &rows,
             );
@@ -551,6 +582,11 @@ fn acl_row(index: usize, rule: &crate::config::AclRuleConfig) -> AclRow {
         expires_in: rule
             .expires
             .map(|at| crate::enroll::remaining(at, chrono::Utc::now())),
+        schedule: rule.schedule.as_ref().map(ToString::to_string),
+        window: rule
+            .schedule
+            .as_ref()
+            .map(|schedule| schedule.status(chrono::Utc::now())),
     }
 }
 

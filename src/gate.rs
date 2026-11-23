@@ -100,7 +100,11 @@ pub async fn clear(
             StatusCode::FORBIDDEN,
             "policy_denied",
             &rule,
-            format!("denied by policy `{rule}` — {}", phrase(access)),
+            format!(
+                "denied by policy `{rule}` — {}{}",
+                phrase(access),
+                decision.window_note()
+            ),
         )),
         Action::Ask => {
             // Park the request in front of a human. Anything but an explicit
@@ -115,8 +119,9 @@ pub async fn clear(
                     "approval_denied",
                     &rule,
                     format!(
-                        "held for approval by policy `{rule}` and not allowed ({})",
-                        outcome.label()
+                        "held for approval by policy `{rule}` and not allowed ({}){}",
+                        outcome.label(),
+                        decision.window_note()
                     ),
                 ));
             }
