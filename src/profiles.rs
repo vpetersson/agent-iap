@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::enroll::{self, AuthSpec, McpTransportSpec};
+use crate::secrets::{display_ref, SecretRef};
 
 /// What credential the profile needs, so `profile show` can say what to fetch
 /// before the first call fails with a 401 that names nothing.
@@ -741,6 +742,26 @@ fn expand(template: &str, vars: &BTreeMap<String, String>, secret: &str) -> Resu
     Ok(out)
 }
 
+/// `expand`, for a URL. A var that lands in one is written into the policy
+/// file as it was typed and never resolved — so a credential reference there
+/// is a reference in the wrong field, not a value to look up. Said as much,
+/// rather than as `https://op://Private/r2 key/secret.r2.cloudflarestorage.com
+/// is not a valid base URL`, which reads as though the reference's spaces were
+/// the problem.
+fn expand_url(template: &str, vars: &BTreeMap<String, String>, secret: &str) -> Result<String> {
+    for (name, value) in vars {
+        if template.contains(&format!("{{{name}}}")) && SecretRef::parse(value).is_ok() {
+            bail!(
+                "`{name}` is part of the URL `{template}` and is written as typed, so it cannot \
+                 be a credential reference like `{}` — give `{name}` its plain value, and put \
+                 the reference in `secret`",
+                display_ref(value)
+            );
+        }
+    }
+    expand(template, vars, secret)
+}
+
 fn substitute_service(
     service: &Service,
     vars: &BTreeMap<String, String>,
@@ -748,11 +769,11 @@ fn substitute_service(
 ) -> Result<Service> {
     Ok(match service {
         Service::Http { base_url, auth } => Service::Http {
-            base_url: expand(base_url, vars, secret)?,
+            base_url: expand_url(base_url, vars, secret)?,
             auth: auth.clone(),
         },
         Service::McpHttp { url, auth } => Service::McpHttp {
-            url: expand(url, vars, secret)?,
+            url: expand_url(url, vars, secret)?,
             auth: auth.clone(),
         },
         Service::McpStdio { command, args, env } => Service::McpStdio {
@@ -5841,6 +5862,63 @@ mod tests {
                 assert_eq!(secret, "literal:token");
             }
             other => panic!("expected basic, got {other:?}"),
+        }
+    }
+
+    /// A 1Password reference typed into a var that is part of the URL — R2's
+    /// `account_id` — is named as being in the wrong field. The spaces in it
+    /// are not the problem, and the error used to make them look like it.
+    #[test]
+    fn a_reference_in_a_url_var_is_in_the_wrong_field() {
+        let profile = get("r2").unwrap();
+        let vars = resolve_vars(
+            &profile,
+            &[
+                "account_id=op://Private/r2 token/secret access key".into(),
+                "access_key_id=AKIDEXAMPLE".into(),
+                "bucket=reports".into(),
+            ],
+        )
+        .unwrap();
+        let error = substitute_service(&profile.service, &vars, "op://Private/r2 token/secret")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`account_id`"), "{error}");
+        assert!(error.contains("`secret`"), "{error}");
+        assert!(!error.contains("not a valid base URL"), "{error}");
+
+        // The same reference in `secret`, where it belongs, is taken as is.
+        let vars = resolve_vars(
+            &profile,
+            &[
+                "account_id=0123abcd".into(),
+                "access_key_id=AKIDEXAMPLE".into(),
+                "bucket=reports".into(),
+            ],
+        )
+        .unwrap();
+        let service = substitute_service(
+            &profile.service,
+            &vars,
+            "op://Private/r2 token/secret access key",
+        )
+        .unwrap();
+        assert_eq!(
+            service.endpoint(),
+            "https://0123abcd.r2.cloudflarestorage.com"
+        );
+        match build_auth(
+            &service,
+            "op://Private/r2 token/secret access key",
+            &vars,
+            &[],
+        )
+        .unwrap()
+        {
+            AuthSpec::AwsSigv4 { secret, .. } => {
+                assert_eq!(secret, "op://Private/r2 token/secret access key")
+            }
+            other => panic!("expected aws_sigv4, got {other:?}"),
         }
     }
 
