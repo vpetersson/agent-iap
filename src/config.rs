@@ -1159,6 +1159,21 @@ impl Config {
         Ok(())
     }
 
+    /// The references one upstream or MCP server needs, for an enrolment to
+    /// prove before it leaves the entry in the file.
+    pub fn service_secret_refs(&self, name: &str) -> Vec<String> {
+        let holders = [format!("upstream `{name}`"), format!("mcp server `{name}`")];
+        let mut refs: Vec<String> = self
+            .secret_sites()
+            .into_iter()
+            .filter(|(holder, _, _)| holders.contains(holder))
+            .map(|(_, reference, _)| reference.to_string())
+            .collect();
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+
     /// Every secret reference in the config, for `check` and startup preloading.
     pub fn secret_refs(&self) -> Vec<String> {
         let mut refs: Vec<String> = self
