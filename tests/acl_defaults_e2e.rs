@@ -39,6 +39,11 @@ fn agent_iap(path: &Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_agent-iap"))
         .args(args)
         .args(["--config", path.to_str().unwrap()])
+        // An enrolment reads back the reference it wrote, so the ones these
+        // tests enrol have to be readable.
+        .env("ANTHROPIC_API_KEY", "sk-not-real")
+        .env("GH_TOKEN", "ghp-not-real")
+        .env("GITHUB_TOKEN", "ghp-not-real")
         .output()
         .unwrap()
 }

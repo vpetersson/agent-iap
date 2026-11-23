@@ -1073,8 +1073,85 @@ fn agent_iap(path: &Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_agent-iap"))
         .args(args)
         .args(["--config", path.to_str().unwrap()])
+        // An enrolment reads back the reference it wrote.
+        .env("GITHUB_TOKEN", "ghp-not-real")
         .output()
         .unwrap()
+}
+
+/// The reported bug: a reference nobody could read went into the file without
+/// a word, and the proxy refused to start at all the next time it was run.
+#[test]
+fn an_enrolment_whose_credential_cannot_be_read_writes_nothing() {
+    let (_dir, path) = minimal_policy();
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    for args in [
+        &[
+            "profile",
+            "add",
+            "huggingface",
+            "--secret",
+            "env:AGENT_IAP_NOT_SET",
+        ][..],
+        &[
+            "upstream",
+            "add",
+            "hf",
+            "--base-url",
+            "https://huggingface.co",
+            "--auth",
+            "bearer",
+            "--secret",
+            "env:AGENT_IAP_NOT_SET",
+        ][..],
+        &[
+            "mcp-server",
+            "add",
+            "hf-mcp",
+            "--url",
+            "https://huggingface.co/mcp",
+            "--auth",
+            "bearer",
+            "--secret",
+            "env:AGENT_IAP_NOT_SET",
+        ][..],
+    ] {
+        let output = agent_iap(&path, args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?} was accepted");
+        assert!(
+            stderr.contains("env:AGENT_IAP_NOT_SET")
+                && stderr.contains("nothing was written")
+                && stderr.contains("--no-check"),
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "{args:?} left the entry in the file"
+        );
+    }
+
+    // And `--no-check` is the way to write one only the proxy's host can read.
+    let output = agent_iap(
+        &path,
+        &[
+            "profile",
+            "add",
+            "huggingface",
+            "--secret",
+            "env:AGENT_IAP_NOT_SET",
+            "--no-check",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(written.upstream("huggingface").is_some());
 }
 
 #[test]
