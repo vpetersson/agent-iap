@@ -522,7 +522,10 @@ pub enum AuthConfig {
     /// its method, path, query, headers and body, after the ACL has said yes.
     AwsSigv4 {
         /// The access key id. It names the key rather than proving anything,
-        /// the way an OAuth client id does, so it goes in the file in the clear.
+        /// the way an OAuth client id does, so it may go in the file in the
+        /// clear — or be a reference, resolved like `secret`, for a key whose
+        /// id and secret are kept side by side in 1Password and rotate
+        /// together.
         access_key_id: String,
         /// Secret reference to the secret access key.
         secret: String,
@@ -553,8 +556,16 @@ impl AuthConfig {
             AuthConfig::None => vec![],
             AuthConfig::Bearer { secret }
             | AuthConfig::Header { secret, .. }
-            | AuthConfig::Query { secret, .. }
-            | AuthConfig::AwsSigv4 { secret, .. } => vec![("auth.secret", secret.as_str())],
+            | AuthConfig::Query { secret, .. } => vec![("auth.secret", secret.as_str())],
+            AuthConfig::AwsSigv4 {
+                access_key_id,
+                secret,
+                ..
+            } => sigv4_key_id_ref(access_key_id)
+                .map(|reference| ("auth.access_key_id", reference))
+                .into_iter()
+                .chain(std::iter::once(("auth.secret", secret.as_str())))
+                .collect(),
             AuthConfig::Basic {
                 username_secret,
                 secret,
@@ -1177,6 +1188,16 @@ fn describe_account(account: Option<&str>) -> String {
     }
 }
 
+/// `access_key_id` as a reference, when it is one. A key id typed in the clear
+/// never starts with a scheme, so the spelling is enough to tell the two
+/// apart; `literal:` is not counted, and `check_auth` refuses it.
+pub fn sigv4_key_id_ref(access_key_id: &str) -> Option<&str> {
+    match SecretRef::parse(access_key_id) {
+        Ok(SecretRef::Literal(_)) | Err(_) => None,
+        Ok(_) => Some(access_key_id),
+    }
+}
+
 fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     // The password half of `<token>:token` is a scheme constant, not a
     // credential — warning about it every startup trains the operator to
@@ -1235,17 +1256,24 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     {
         // Each of these goes into the signature verbatim, so a wrong one is a
         // `SignatureDoesNotMatch` on every call with nothing naming the field.
-        // A reference here would be sent as the literal string `op://…`.
+        // A reference is resolved first (`secret_fields` lists it), so what is
+        // checked here is a key id typed in the clear.
         if access_key_id.trim().is_empty() {
             bail!("{label}: `access_key_id` is empty");
         }
-        if SecretRef::parse(access_key_id).is_ok() || access_key_id.contains("://") {
+        if let Ok(SecretRef::Literal(_)) = SecretRef::parse(access_key_id) {
             bail!(
-                "{label}: `access_key_id` is the key id itself, not a reference — it is sent \
-                 as written. Only `secret` is resolved"
+                "{label}: `access_key_id` is not secret, so `literal:` buys nothing — write \
+                 the key id itself, or a reference such as `op://vault/item/access key id`"
             );
         }
-        if access_key_id.trim() != access_key_id {
+        if sigv4_key_id_ref(access_key_id).is_none() && access_key_id.contains("://") {
+            bail!(
+                "{label}: `access_key_id` is neither a key id nor a reference agent-iap \
+                 knows — expected the id itself, or `op://`, `env:`, `file:` or `iap://`"
+            );
+        }
+        if sigv4_key_id_ref(access_key_id).is_none() && access_key_id.trim() != access_key_id {
             bail!("{label}: `access_key_id` has leading or trailing whitespace");
         }
         for (field, value) in [("region", Some(region)), ("service", service.as_ref())] {
@@ -1777,11 +1805,23 @@ type = "service_account_jwt"
         };
         with("access_key_id = \"AKID\"\nregion = \"auto\"\n").expect("the R2 shape");
 
-        // A reference here would be sent as the string `op://…`.
-        let error = with("access_key_id = \"op://Vault/R2/id\"\nregion = \"auto\"\n")
+        // A reference is resolved like `secret`, and listed beside it.
+        with("access_key_id = \"op://Vault/R2 token/access key id\"\nregion = \"auto\"\n")
+            .expect("a key id kept in 1Password");
+        let config = toml::from_str::<Config>(
+            "[[upstreams]]\nname = \"r2\"\nbase_url = \"https://a.r2.cloudflarestorage.com\"\n\
+             auth = { type = \"aws_sigv4\", access_key_id = \"op://Vault/R2/id\", secret = \"env:R2\", region = \"auto\" }\n",
+        )
+        .unwrap();
+        assert_eq!(config.secret_refs(), vec!["env:R2", "op://Vault/R2/id"]);
+        let error = with("access_key_id = \"literal:AKID\"\nregion = \"auto\"\n")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not a reference"), "{error}");
+        assert!(error.contains("`literal:`"), "{error}");
+        let error = with("access_key_id = \"https://AKID\"\nregion = \"auto\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("neither a key id"), "{error}");
 
         let error = with("access_key_id = \"AKID\"\nregion = \"EU West 1\"\n")
             .unwrap_err()

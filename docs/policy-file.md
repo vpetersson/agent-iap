@@ -139,15 +139,16 @@ base_url = "https://<account_id>.r2.cloudflarestorage.com"
 
 [upstreams.auth]
 type = "aws_sigv4"
-access_key_id = "0123456789abcdef0123456789abcdef"   # the id itself, in the clear
+access_key_id = "0123456789abcdef0123456789abcdef"   # the id itself, or a reference
 secret = "op://Private/R2 token/secret access key"
 region = "auto"            # R2's; AWS wants the bucket's region, e.g. "eu-west-1"
 # service = "s3"           # the default; any other AWS service signs the same way
 ```
 
 `access_key_id` names the key rather than proving anything, the way an OAuth
-client id does, so it is a plain value; a reference there is refused, because
-it would be signed as the literal string `op://…`. Only `secret` is resolved.
+client id does, so it can be written in the clear. It can also be a reference —
+`op://Private/R2 token/access key id` — resolved like `secret` when a request is
+signed, so a key kept in 1Password as an id and a secret rotates as a pair.
 `region` and `service` are checked for shape at load: each goes into the
 signature verbatim, and a wrong one is otherwise a `SignatureDoesNotMatch` on
 every call that names no field.

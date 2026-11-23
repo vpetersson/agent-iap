@@ -37,7 +37,7 @@ console](console.md#the-approval-console)).
 | --- | --- |
 | `--as <name>` | name it something else — this is how one proxy fronts two accounts of the same service |
 | `--access <level>` | which scopes the credential is minted with, and which rules `--grant` would write; defaults to the narrowest the profile has |
-| `--var name=value` | what is yours rather than the vendor's: a self-hosted host, a region, an API login |
+| `--var name=value` | what is yours rather than the vendor's: a self-hosted host, a region, an API login. The value may be a reference (`op://Private/R2 token/account id`), read once when the service is written — except an object store's `access_key_id`, which stays a reference and is read each time a request is signed |
 | `--grant` | also write that level's ACL rules — a standing `allow` for every call they cover |
 | `--agent <id>` | with `--grant`: scope the granted rules to one agent instead of all of them |
 | `--dry-run` | print, do not write |

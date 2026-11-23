@@ -1431,8 +1431,12 @@ fn describe_auth(auth: &AuthConfig) -> String {
             region,
             service,
         } => format!(
-            "signed (SigV4, {}/{region}) as `{access_key_id}` with the key resolved from {}",
+            "signed (SigV4, {}/{region}) as {} with the key resolved from {}",
             service.as_deref().unwrap_or(crate::sigv4::S3),
+            match crate::config::sigv4_key_id_ref(access_key_id) {
+                Some(reference) => format!("the key id resolved from {}", display_ref(reference)),
+                None => format!("`{access_key_id}`"),
+            },
             display_ref(secret)
         ),
     }
