@@ -449,7 +449,8 @@ impl AuthInput {
             "aws-sigv4" => AuthSpec::AwsSigv4 {
                 access_key_id: self.access_key_id.clone().context(
                     "`--auth aws-sigv4` needs `--access-key-id <ID>` — the key id itself, which \
-                     is not secret; the secret access key goes in `--secret <REF>`",
+                     is not secret, or a reference to it; the secret access key goes in \
+                     `--secret <REF>`",
                 )?,
                 secret: need_secret()?,
                 region: self.region.clone().context(
