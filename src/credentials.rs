@@ -129,10 +129,16 @@ impl CredentialInjector {
             } => {
                 // Last, by construction: the signature covers the headers and
                 // the body, so nothing may touch the request after this.
+                // The key id is resolved like the secret when it is a
+                // reference, so a key rotated in 1Password moves as a pair.
+                let key_id = match crate::config::sigv4_key_id_ref(access_key_id) {
+                    Some(reference) => self.resolve(reference)?.expose().trim().to_string(),
+                    None => access_key_id.clone(),
+                };
                 let value = self.resolve(secret)?;
                 crate::sigv4::sign(
                     request,
-                    access_key_id,
+                    &key_id,
                     value.expose(),
                     region,
                     service.as_deref().unwrap_or(crate::sigv4::S3),
@@ -685,6 +691,41 @@ mod tests {
         let query = req.url().query().unwrap();
         assert!(query.contains("limit=5"), "{query}");
         assert!(query.contains("key=sk-real"), "{query}");
+    }
+
+    /// A key id kept in 1Password beside its secret is resolved when the
+    /// request is signed, and the id — not the reference — is what goes out.
+    #[tokio::test]
+    async fn sigv4_signs_with_a_key_id_read_from_its_reference() {
+        let injector = injector();
+        injector.resolver.preset(
+            "op://Private/r2 token/access key id",
+            Secret::new("AKIDFROMVAULT".into()),
+        );
+        let mut req = reqwest::Request::new(
+            http::Method::GET,
+            "https://0123abcd.r2.cloudflarestorage.com/reports"
+                .parse()
+                .unwrap(),
+        );
+        injector
+            .apply(
+                "r2",
+                &AuthConfig::AwsSigv4 {
+                    access_key_id: "op://Private/r2 token/access key id".into(),
+                    secret: "literal:sk-real".into(),
+                    region: "auto".into(),
+                    service: None,
+                },
+                &mut req,
+            )
+            .await
+            .unwrap();
+        let authorization = req.headers()["authorization"].to_str().unwrap();
+        assert!(
+            authorization.contains("Credential=AKIDFROMVAULT/"),
+            "{authorization}"
+        );
     }
 
     #[tokio::test]

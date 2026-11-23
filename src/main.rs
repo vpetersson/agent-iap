@@ -743,8 +743,8 @@ struct AuthFlags {
     /// Client secret *reference* for `--auth oauth2-client-credentials`.
     #[arg(long, value_name = "REF")]
     client_secret: Option<String>,
-    /// Access key id for `--auth aws-sigv4` — the id itself, not a reference;
-    /// the secret access key is `--secret`.
+    /// Access key id for `--auth aws-sigv4` — the id itself, or a reference
+    /// to it (`op://…`); the secret access key is `--secret`.
     #[arg(long, value_name = "ID")]
     access_key_id: Option<String>,
     /// Signing region for `--auth aws-sigv4`: `us-east-1`, or `auto` for R2.

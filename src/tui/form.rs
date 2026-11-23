@@ -1180,7 +1180,7 @@ fn wording(key: &'static str) -> (&'static str, &'static str) {
         ),
         "access-key-id" => (
             "access key id",
-            "the key id itself (AKIA…) — not secret; the secret access key goes in `secret`",
+            "the key id (AKIA…) or a reference to it; the secret access key goes in `secret`",
         ),
         "region" => ("region", "signing region, e.g. us-east-1; `auto` for Cloudflare R2"),
         "service" => ("service", "signing service; leave blank for s3"),

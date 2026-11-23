@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::enroll::{self, AuthSpec, McpTransportSpec};
-use crate::secrets::{display_ref, SecretRef};
+use crate::secrets::{display_ref, SecretRef, SecretResolver};
 
 /// What credential the profile needs, so `profile show` can say what to fetch
 /// before the first call fails with a 401 that names nothing.
@@ -436,7 +436,20 @@ pub fn add(path: &Path, profile: &Profile, options: &AddOptions) -> Result<Added
         Some(level) => profile.find_access(level)?,
         None => profile.default_access(),
     };
-    let vars = resolve_vars(profile, &options.vars)?;
+    // Built only when a var is a reference, so enrolling a profile whose vars
+    // are all typed in the clear never needs the policy file to load or `op`
+    // to answer.
+    let resolver = std::cell::OnceCell::new();
+    let vars = resolve_vars_with(profile, &options.vars, &|reference| {
+        let resolver = match resolver.get() {
+            Some(resolver) => resolver,
+            None => {
+                let config = crate::config::Config::load(path)?;
+                resolver.get_or_init(|| SecretResolver::for_config(&config))
+            }
+        };
+        Ok(resolver.resolve(reference)?.expose().trim().to_string())
+    })?;
 
     let needs_secret = !matches!(
         service_auth(&profile.service),
@@ -665,7 +678,31 @@ fn service_auth(service: &Service) -> Option<AuthTemplate> {
     }
 }
 
+/// `resolve_vars_with`, reading references from the environment — which is
+/// all a test's references point at.
+#[cfg(test)]
 fn resolve_vars(profile: &Profile, given: &[String]) -> Result<BTreeMap<String, String>> {
+    let resolver = SecretResolver::new("op");
+    resolve_vars_with(profile, given, &|reference| {
+        Ok(resolver.resolve(reference)?.expose().trim().to_string())
+    })
+}
+
+/// The vars a profile was given, with its defaults filled in and checked.
+///
+/// A var typed as a credential reference — R2's `account_id`, kept in
+/// 1Password beside the key it belongs to — is read with `read` here, once,
+/// and the value is what lands in the policy file. Most vars end up in a base
+/// URL, a probe path or a region, none of which is resolved at request time,
+/// and none of which is a secret. Two are left as typed: the SigV4 key id,
+/// which `aws_sigv4` resolves when it signs so a key rotated in 1Password
+/// moves as a pair; and every var of an MCP stdio server, whose args and env
+/// take a reference as one.
+fn resolve_vars_with(
+    profile: &Profile,
+    given: &[String],
+    read: &dyn Fn(&str) -> Result<String>,
+) -> Result<BTreeMap<String, String>> {
     let mut supplied = BTreeMap::new();
     for entry in given {
         let (key, value) = entry
@@ -702,6 +739,25 @@ fn resolve_vars(profile: &Profile, given: &[String]) -> Result<BTreeMap<String, 
                     profile.id, var.name, var.about
                 )
             })?;
+        let kept = match &profile.service {
+            Service::McpStdio { .. } => true,
+            Service::Http { auth, .. } | Service::McpHttp { auth, .. } => matches!(
+                auth,
+                AuthTemplate::AwsSigv4 { access_key_id_var, .. } if *access_key_id_var == var.name
+            ),
+        };
+        let value = match SecretRef::parse(&value) {
+            Ok(SecretRef::Literal(_)) | Err(_) => value,
+            Ok(_) if kept => value,
+            Ok(_) => read(&value).with_context(|| {
+                format!(
+                    "`--var {}` for profile `{}` is the reference `{}`, and reading it failed",
+                    var.name,
+                    profile.id,
+                    display_ref(&value)
+                )
+            })?,
+        };
         if let Some(check) = var.check {
             check(&value).map_err(|problem| {
                 anyhow::anyhow!(
@@ -742,26 +798,6 @@ fn expand(template: &str, vars: &BTreeMap<String, String>, secret: &str) -> Resu
     Ok(out)
 }
 
-/// `expand`, for a URL. A var that lands in one is written into the policy
-/// file as it was typed and never resolved — so a credential reference there
-/// is a reference in the wrong field, not a value to look up. Said as much,
-/// rather than as `https://op://Private/r2 key/secret.r2.cloudflarestorage.com
-/// is not a valid base URL`, which reads as though the reference's spaces were
-/// the problem.
-fn expand_url(template: &str, vars: &BTreeMap<String, String>, secret: &str) -> Result<String> {
-    for (name, value) in vars {
-        if template.contains(&format!("{{{name}}}")) && SecretRef::parse(value).is_ok() {
-            bail!(
-                "`{name}` is part of the URL `{template}` and is written as typed, so it cannot \
-                 be a credential reference like `{}` — give `{name}` its plain value, and put \
-                 the reference in `secret`",
-                display_ref(value)
-            );
-        }
-    }
-    expand(template, vars, secret)
-}
-
 fn substitute_service(
     service: &Service,
     vars: &BTreeMap<String, String>,
@@ -769,11 +805,11 @@ fn substitute_service(
 ) -> Result<Service> {
     Ok(match service {
         Service::Http { base_url, auth } => Service::Http {
-            base_url: expand_url(base_url, vars, secret)?,
+            base_url: expand(base_url, vars, secret)?,
             auth: auth.clone(),
         },
         Service::McpHttp { url, auth } => Service::McpHttp {
-            url: expand_url(url, vars, secret)?,
+            url: expand(url, vars, secret)?,
             auth: auth.clone(),
         },
         Service::McpStdio { command, args, env } => Service::McpStdio {
@@ -5865,61 +5901,59 @@ mod tests {
         }
     }
 
-    /// A 1Password reference typed into a var that is part of the URL — R2's
-    /// `account_id` — is named as being in the wrong field. The spaces in it
-    /// are not the problem, and the error used to make them look like it.
+    /// R2's `account_id` and `access_key_id` may both be references, kept in
+    /// 1Password beside the secret — spaces and all. The account id is read
+    /// when the service is enrolled, since it lands in the base URL; the key
+    /// id stays a reference, for `aws_sigv4` to resolve when it signs.
     #[test]
-    fn a_reference_in_a_url_var_is_in_the_wrong_field() {
+    fn r2_takes_its_account_id_and_key_id_as_references() {
+        std::env::set_var("AGENT_IAP_TEST_R2_ACCOUNT", "0123abcd\n");
         let profile = get("r2").unwrap();
         let vars = resolve_vars(
             &profile,
             &[
-                "account_id=op://Private/r2 token/secret access key".into(),
-                "access_key_id=AKIDEXAMPLE".into(),
+                "account_id=env:AGENT_IAP_TEST_R2_ACCOUNT".into(),
+                "access_key_id=op://Private/r2 token/access key id".into(),
                 "bucket=reports".into(),
             ],
         )
         .unwrap();
-        let error = substitute_service(&profile.service, &vars, "op://Private/r2 token/secret")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("`account_id`"), "{error}");
-        assert!(error.contains("`secret`"), "{error}");
-        assert!(!error.contains("not a valid base URL"), "{error}");
+        assert_eq!(vars["account_id"], "0123abcd");
+        assert_eq!(vars["access_key_id"], "op://Private/r2 token/access key id");
 
-        // The same reference in `secret`, where it belongs, is taken as is.
-        let vars = resolve_vars(
-            &profile,
-            &[
-                "account_id=0123abcd".into(),
-                "access_key_id=AKIDEXAMPLE".into(),
-                "bucket=reports".into(),
-            ],
-        )
-        .unwrap();
-        let service = substitute_service(
-            &profile.service,
-            &vars,
-            "op://Private/r2 token/secret access key",
-        )
-        .unwrap();
+        let secret = "op://Private/r2 token/secret access key";
+        let service = substitute_service(&profile.service, &vars, secret).unwrap();
         assert_eq!(
             service.endpoint(),
             "https://0123abcd.r2.cloudflarestorage.com"
         );
-        match build_auth(
-            &service,
-            "op://Private/r2 token/secret access key",
-            &vars,
-            &[],
-        )
-        .unwrap()
-        {
-            AuthSpec::AwsSigv4 { secret, .. } => {
-                assert_eq!(secret, "op://Private/r2 token/secret access key")
+        match build_auth(&service, secret, &vars, &[]).unwrap() {
+            AuthSpec::AwsSigv4 {
+                access_key_id,
+                secret: written,
+                ..
+            } => {
+                assert_eq!(access_key_id, "op://Private/r2 token/access key id");
+                assert_eq!(written, secret);
             }
             other => panic!("expected aws_sigv4, got {other:?}"),
         }
+
+        // A reference that does not resolve is named, rather than written
+        // into the URL to fail there as `https://op://….r2…`.
+        let error = resolve_vars(
+            &profile,
+            &[
+                "account_id=env:AGENT_IAP_TEST_R2_ACCOUNT_UNSET".into(),
+                "access_key_id=AKIDEXAMPLE".into(),
+                "bucket=reports".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("`--var account_id`"),
+            "{error:#}"
+        );
     }
 
     /// The object stores sign rather than attach, take the key id as a plain
