@@ -2315,6 +2315,165 @@ fn discourse_access() -> Vec<Access> {
     ]
 }
 
+/// One token reaches the Hub, Inference Providers and the MCP server, so the
+/// three Hugging Face profiles ask for the same thing.
+fn huggingface_token() -> Credential {
+    Credential {
+        about: "a user access token (`hf_…`) — fine-grained, scoped to the repos and \
+                permissions this upstream needs"
+            .into(),
+        url: "https://huggingface.co/settings/tokens".into(),
+    }
+}
+
+const HUGGINGFACE_HUB_NOTE: &str = "The token's own role is the real limit: a `read` token \
+     cannot commit however the ACL reads, and a fine-grained token reaches only the repos, \
+     namespaces and permissions it was given — enrol one of those rather than a classic \
+     `write` token. Downloads are `GET /<repo>/resolve/<revision>/<file>` on this host, with \
+     `datasets/` or `spaces/` in front for those repo types; the answer is a redirect to a \
+     signed URL on Hugging Face's CDN or Xet storage, which the client fetches directly, so \
+     the bytes never pass through the proxy and the audit log records the request for them. \
+     For the same reason uploads are only half here: the commit is a POST to \
+     `/api/<type>s/<repo>/commit/<revision>`, but large files go to LFS or Xet storage on \
+     another host, using a short-lived token the Hub hands back — `read` refuses the GET \
+     that mints the Xet one, and `ask-writes` asks about it. `write` still asks before a \
+     Job or a Space hardware change, both of which bill the account while they run, and \
+     before deleting or renaming a repo, changing its settings (which is where it turns \
+     public or ungated) or setting a Space secret. Inference is a different host, \
+     `router.huggingface.co`, and its own profile, `huggingface-inference`; Inference \
+     Endpoints are a third, and no profile fronts them.";
+
+const HUGGINGFACE_INFERENCE_NOTE: &str = "Every call is billed: the router forwards it to \
+     whichever provider serves the model and charges the Hugging Face account, after the \
+     monthly credits run out, so `inference` is a spend the same way an OpenAI key is. The \
+     model names its provider — `org/model:provider`, or `:fastest` / `:cheapest` — and the \
+     ACL sees only the path, so it cannot hold an agent to one provider or one model. \
+     `inference` is `/v1/chat/completions`, the only task the router serves on its \
+     OpenAI-compatible surface; embeddings, image, video and speech generation go to \
+     per-provider routes the Hugging Face clients build, and those need `--access all`. \
+     An `X-HF-Bill-To` header bills an organization instead of the token's owner, and \
+     the ACL does not read headers. A fine-grained token needs the \"Make calls to Inference Providers\" \
+     permission, without which a good token is a 403. No `verify` probe: the model list \
+     answers without a token, so it proves nothing about one — check the token against \
+     the `huggingface` profile's `/api/whoami-v2`, which is the same credential.";
+
+/// What `read`, `ask-writes` and `write` mean for the Hugging Face Hub.
+///
+/// Almost everything an agent wants from the Hub is a GET — search, repo
+/// metadata, the file tree, and the files themselves under `/resolve/` — so
+/// `read` is every GET and HEAD. The exceptions run the other way: one GET
+/// hands back a credential that writes, and a handful of POSTs and PUTs either
+/// bill for compute or make something private public.
+fn huggingface_access() -> Vec<Access> {
+    // A short-lived token for Xet storage that can upload to the repo. It is
+    // a GET, and it is handed to the caller rather than injected, so it would
+    // otherwise come through `read` — this is why the rule precedes the reads.
+    // The upload it pays for goes to Xet's own host, which the proxy never
+    // sees.
+    // Buckets mint theirs without a revision, so both spellings.
+    const WRITE_TOKENS: &[&str] = &["/api/**/xet-write-token", "/api/**/xet-write-token/**"];
+    // POSTs that only look: `huggingface_hub` asks for many files' metadata in
+    // one `paths-info` call rather than a GET each.
+    const READ_POSTS: &[&str] = &["/api/*/**/paths-info/**"];
+    // Paid hardware: a Job runs a container on the account's bill, and a
+    // Space's hardware and sleep time decide what it costs while it runs.
+    const COMPUTE: &[&str] = &[
+        "/api/jobs/**",
+        "/api/scheduled-jobs/**",
+        "/api/spaces/**/hardware",
+        "/api/spaces/**/sleeptime",
+    ];
+    // Things a mistake cannot be taken back from, or that put something on
+    // view: deleting or renaming a repo, squashing its history, the settings
+    // that flip it public or ungate it, and a Space's secrets, which its code
+    // reads and can publish.
+    const EXPOSE: &[&str] = &[
+        "/api/repos/delete",
+        "/api/repos/move",
+        "/api/*/**/super-squash/**",
+        "/api/*/**/settings",
+        "/api/spaces/**/secrets",
+    ];
+    // Reading a Job's logs or a Space's runtime is free; only changing one
+    // is what these lists are about.
+    const CHANGES: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
+    let write_tokens = |action| rule("write-tokens", &["*"], WRITE_TOKENS, action);
+    let reads = || rule("reads", &["GET", "HEAD"], &["/**"], "allow");
+    let read_posts = || rule("read-posts", &["POST"], READ_POSTS, "allow");
+    vec![
+        access(
+            "read",
+            "every GET and HEAD — search, metadata and downloads; nothing that writes",
+            &[],
+            vec![write_tokens("deny"), reads(), read_posts()],
+        ),
+        access(
+            "ask-writes",
+            "reads allowed, anything else prompts, DELETE denied",
+            &[],
+            vec![
+                write_tokens("ask"),
+                reads(),
+                read_posts(),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every endpoint; paid compute, deleting, renaming or exposing a repo still prompt",
+            &[],
+            vec![
+                rule("compute", CHANGES, COMPUTE, "ask"),
+                rule("expose", CHANGES, EXPOSE, "ask"),
+                rule("all", &["*"], &["/**"], "allow"),
+            ],
+        ),
+    ]
+}
+
+/// What `read` and `write` mean for Hugging Face's MCP server.
+fn huggingface_mcp_access() -> Vec<Access> {
+    // The anonymous set by name, and the shape of the lookups an account can
+    // switch on — `hf_doc_search`, `hf_papers_search`, `hf_job_get`.
+    const READS: &[&str] = &[
+        "hf_fs",
+        "hf_whoami",
+        "hub_repo_details",
+        "hub_repo_search",
+        "*_search",
+        "*_details",
+        "*_info",
+        "*_get",
+        "*_list",
+        "*_read",
+        "*_fetch",
+    ];
+    // They run a container on the account's compute credits.
+    const COMPUTE: &[&str] = &["*job*", "*sandbox*"];
+    vec![
+        access(
+            "read",
+            "the tools that look things up; everything else prompts",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("other-tools", &["tools/call"], &["**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every tool; Jobs and sandboxes still prompt",
+            &[],
+            vec![
+                rule("reads", &["tools/call"], READS, "allow"),
+                rule("compute", &["tools/call"], COMPUTE, "ask"),
+                rule("tools", &["tools/call"], &["**"], "allow"),
+            ],
+        ),
+    ]
+}
+
 /// The same three levels for the MCP server, so `--access triage` means the
 /// same thing whichever of the four Sentry profiles it is given to.
 fn sentry_mcp_access() -> Vec<Access> {
@@ -4801,6 +4960,96 @@ pub fn catalog() -> Vec<Profile> {
             ),
             probe: Some("/v1/api-key".into()),
         },
+        // ---------------- Hugging Face ----------------
+        Profile {
+            id: "huggingface".into(),
+            title: "Hugging Face Hub API".into(),
+            vendor: "Hugging Face".into(),
+            summary: "Models, datasets and Spaces — search, metadata, downloads and commits."
+                .into(),
+            default_name: "huggingface".into(),
+            credential: huggingface_token(),
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://huggingface.co".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: huggingface_access(),
+            note: Some(HUGGINGFACE_HUB_NOTE.into()),
+            // Answers for the token itself — its name, its role and, for a
+            // fine-grained one, what it was scoped to. A bad token is a 401.
+            probe: Some("/api/whoami-v2".into()),
+        },
+        Profile {
+            id: "huggingface-inference".into(),
+            title: "Hugging Face Inference Providers".into(),
+            vendor: "Hugging Face".into(),
+            summary: "Open-weight models behind one OpenAI-compatible router, billed to the \
+                      Hugging Face account."
+                .into(),
+            default_name: "huggingface-inference".into(),
+            credential: huggingface_token(),
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://router.huggingface.co".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: vec![
+                access(
+                    "inference",
+                    "chat completions, the one OpenAI-compatible endpoint, and the model list",
+                    &[],
+                    vec![
+                        rule(
+                            "generate",
+                            &["POST"],
+                            &["/v1/chat/completions"],
+                            "allow",
+                        ),
+                        rule("models", &["GET"], &["/v1/models", "/v1/models/**"], "allow"),
+                    ],
+                ),
+                access(
+                    "all",
+                    "every provider route — images, audio, video and embeddings included",
+                    &[],
+                    vec![rule("all", &["*"], &["/**"], "allow")],
+                ),
+            ],
+            note: Some(HUGGINGFACE_INFERENCE_NOTE.into()),
+            probe: None,
+        },
+        Profile {
+            id: "huggingface-mcp".into(),
+            title: "Hugging Face MCP server".into(),
+            vendor: "Hugging Face".into(),
+            summary: "Hugging Face's hosted MCP server — Hub search, repo details, docs and \
+                      papers as tools, fronted with a token instead of a browser."
+                .into(),
+            default_name: "huggingface-mcp".into(),
+            credential: huggingface_token(),
+            vars: vec![],
+            service: Service::McpHttp {
+                url: "https://huggingface.co/mcp".into(),
+                // The documented alternative to `?login`, the OAuth flow.
+                auth: AuthTemplate::Bearer,
+            },
+            access: huggingface_mcp_access(),
+            note: Some(
+                "Which tools the server offers is chosen per account, at \
+                 https://huggingface.co/settings/mcp, not here: the token decides the set and \
+                 the ACL rules on names. Without a token it serves an anonymous, rate-limited \
+                 set — `hf_fs`, `hf_whoami`, `hub_repo_search`, `hub_repo_details` — so a \
+                 session that lists only those is one whose token did not arrive. `read` \
+                 allows the tools shaped like lookups and prompts for everything else, which \
+                 is where creating repos, Jobs, sandboxes and Gradio Space tools live; \
+                 `write` allows every tool but still prompts for Jobs and sandboxes, which run \
+                 on the account's compute credits. A Gradio Space tool runs on that Space's \
+                 hardware — ZeroGPU quota for most — and `write` allows it."
+                    .into(),
+            ),
+            probe: None,
+        },
         bearer_api(BearerApi {
             id: "github",
             title: "GitHub REST API",
@@ -7204,5 +7453,196 @@ mod tests {
             Some("allow")
         );
         assert_eq!(at("write", "POST", "/v2/reboot").as_deref(), Some("allow"));
+    }
+
+    /// One token, a bearer header, and a probe that names the token rather
+    /// than answering anyone.
+    #[test]
+    fn huggingface_authenticates_a_bearer_token_and_probes_whoami() {
+        let hub = get("huggingface").unwrap();
+        match build_auth(&hub.service, "env:HF_TOKEN", &BTreeMap::new(), &[]).unwrap() {
+            AuthSpec::Bearer { secret } => assert_eq!(secret, "env:HF_TOKEN"),
+            other => panic!("the Hub takes a bearer token, got {other:?}"),
+        }
+        assert_eq!(hub.endpoint(), "https://huggingface.co");
+        assert_eq!(hub.probe.as_deref(), Some("/api/whoami-v2"));
+        assert_eq!(
+            probe_for("https://huggingface.co").as_deref(),
+            Some("/api/whoami-v2")
+        );
+    }
+
+    /// `read` is what an agent pulling a model needs, and none of what lets it
+    /// push one — including the GET that hands back an upload token.
+    #[test]
+    fn huggingface_read_downloads_and_writes_nothing() {
+        let at = |method: &str, path: &str| decides("huggingface", "read", method, path);
+        for path in [
+            "/api/whoami-v2",
+            "/api/models",
+            "/api/models/acme/tiny-llm",
+            "/api/models/acme/tiny-llm/tree/main",
+            "/api/datasets/acme/reviews/revision/main",
+            "/api/spaces/acme/demo",
+            "/acme/tiny-llm/resolve/main/config.json",
+            "/datasets/acme/reviews/resolve/main/data/train.parquet",
+            // A legacy repo with no owner.
+            "/gpt2/resolve/main/config.json",
+            "/api/models/acme/tiny-llm/xet-read-token/main",
+        ] {
+            assert_eq!(at("GET", path).as_deref(), Some("allow"), "GET {path}");
+        }
+        // `huggingface_hub` asks for a file's metadata with a HEAD first.
+        assert_eq!(
+            at("HEAD", "/acme/tiny-llm/resolve/main/model.safetensors").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            at("POST", "/api/models/acme/tiny-llm/paths-info/main").as_deref(),
+            Some("allow")
+        );
+
+        assert_eq!(
+            at("GET", "/api/models/acme/tiny-llm/xet-write-token/main").as_deref(),
+            Some("deny"),
+            "a token that uploads is a write, whatever the verb"
+        );
+        assert_eq!(at("POST", "/api/models/acme/tiny-llm/commit/main"), None);
+        assert_eq!(at("POST", "/api/repos/create"), None);
+        assert_eq!(at("DELETE", "/api/repos/delete"), None);
+        assert_eq!(at("POST", "/api/jobs/acme"), None);
+    }
+
+    /// `write` commits freely and still asks before what bills or what cannot
+    /// be taken back.
+    #[test]
+    fn huggingface_write_still_asks_before_compute_and_exposure() {
+        let at = |method: &str, path: &str| decides("huggingface", "write", method, path);
+        for (method, path) in [
+            ("POST", "/api/models/acme/tiny-llm/commit/main"),
+            ("POST", "/api/models/acme/tiny-llm/preupload/main"),
+            ("POST", "/api/repos/create"),
+            ("POST", "/api/models/acme/tiny-llm/discussions"),
+            ("GET", "/api/models/acme/tiny-llm/xet-write-token/main"),
+            // Reading a Job back is not running one.
+            ("GET", "/api/jobs/acme"),
+        ] {
+            assert_eq!(
+                at(method, path).as_deref(),
+                Some("allow"),
+                "{method} {path}"
+            );
+        }
+        for (method, path) in [
+            ("POST", "/api/jobs/acme"),
+            ("POST", "/api/spaces/acme/demo/hardware"),
+            ("POST", "/api/spaces/acme/demo/sleeptime"),
+            ("DELETE", "/api/repos/delete"),
+            ("POST", "/api/repos/move"),
+            ("PUT", "/api/models/acme/tiny-llm/settings"),
+            ("POST", "/api/spaces/acme/demo/secrets"),
+        ] {
+            assert_eq!(at(method, path).as_deref(), Some("ask"), "{method} {path}");
+        }
+
+        let ask = |method: &str, path: &str| decides("huggingface", "ask-writes", method, path);
+        assert_eq!(
+            ask("GET", "/acme/tiny-llm/resolve/main/config.json").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            ask("GET", "/api/models/acme/tiny-llm/xet-write-token/main").as_deref(),
+            Some("ask")
+        );
+        assert_eq!(
+            ask("POST", "/api/models/acme/tiny-llm/commit/main").as_deref(),
+            Some("ask")
+        );
+        assert_eq!(ask("DELETE", "/api/repos/delete").as_deref(), Some("deny"));
+    }
+
+    /// The router bills per call and its model list is public, so the default
+    /// level is the one chat endpoint and nothing is probed.
+    #[test]
+    fn huggingface_inference_chats_by_default_and_probes_nothing() {
+        let router = get("huggingface-inference").unwrap();
+        assert_eq!(router.endpoint(), "https://router.huggingface.co");
+        assert_eq!(router.default_access().name, "inference");
+        // `/v1/models` answers without a token, so it would pass a bad one.
+        assert_eq!(router.probe, None);
+        let at = |level: &str, method: &str, path: &str| {
+            decides("huggingface-inference", level, method, path)
+        };
+        assert_eq!(
+            at("inference", "POST", "/v1/chat/completions").as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            at("inference", "GET", "/v1/models").as_deref(),
+            Some("allow")
+        );
+        // The per-provider routes are where the per-asset bills are.
+        assert_eq!(at("inference", "POST", "/fal-ai/fal-ai/flux/dev"), None);
+        assert_eq!(
+            at(
+                "inference",
+                "POST",
+                "/hf-inference/models/acme/embedder/pipeline/feature-extraction"
+            ),
+            None
+        );
+        assert_eq!(
+            at("all", "POST", "/fal-ai/fal-ai/flux/dev").as_deref(),
+            Some("allow")
+        );
+    }
+
+    /// Lookups pass, and what spends the account's compute credits asks at
+    /// every level.
+    #[test]
+    fn the_huggingface_mcp_levels_hold_back_jobs_and_sandboxes() {
+        let mcp = get("huggingface-mcp").unwrap();
+        assert!(matches!(mcp.service, Service::McpHttp { .. }));
+        let tool = |level: &str, name: &str| {
+            let level = mcp.find_access(level).unwrap();
+            level
+                .rules
+                .iter()
+                .find(|rule| {
+                    rule.paths
+                        .iter()
+                        .any(|pattern| crate::acl::plain_glob(pattern).unwrap().is_match(name))
+                })
+                .map(|rule| rule.action.clone())
+        };
+        for name in [
+            "hf_fs",
+            "hf_whoami",
+            "hub_repo_search",
+            "hub_repo_details",
+            "hf_doc_search",
+            "hf_docs_read",
+            "hf_jobs_list",
+            "hf_job_get",
+        ] {
+            assert_eq!(tool("read", name).as_deref(), Some("allow"), "{name}");
+            assert_eq!(tool("write", name).as_deref(), Some("allow"), "{name}");
+        }
+        for name in [
+            "hf_jobs",
+            "hf_job_run",
+            "sandbox_create",
+            "gr1_flux1_schnell_infer",
+        ] {
+            assert_eq!(tool("read", name).as_deref(), Some("ask"), "{name}");
+        }
+        for name in ["hf_jobs", "hf_job_run", "sandbox_create"] {
+            assert_eq!(tool("write", name).as_deref(), Some("ask"), "{name}");
+        }
+        assert_eq!(tool("write", "hf_repo_create").as_deref(), Some("allow"));
+        assert_eq!(
+            tool("write", "gr1_flux1_schnell_infer").as_deref(),
+            Some("allow")
+        );
     }
 }

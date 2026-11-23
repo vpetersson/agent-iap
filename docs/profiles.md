@@ -132,6 +132,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths), and `sbomify-self-hosted` / `sbomify-v1-self-hosted` for staging or an install of your own (`--var host=…`, `--var scheme=http` for a plain-HTTP one) |
 | Screenly | `screenly` (API v4 and v4.1, `Authorization: Token`), `screenly-mcp` (the CLI's `screenly mcp`, same token), `anthias` (one self-hosted player, `--var host=… --var username=…`) |
+| Hugging Face | `huggingface` (the Hub: search, metadata, downloads and commits), `huggingface-inference` (Inference Providers, the OpenAI-compatible router), `huggingface-mcp` (the hosted MCP server) — all one `hf_…` token |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Stripe | `stripe` (REST, with a `records` level that edits the catalogue and moves no money), `stripe-mcp` (the hosted MCP server, on an agent-tagged key) |
 | Shopify | `shopify` (a legacy custom app's `shpat_` token), `shopify-client-credentials` (a Dev Dashboard app; the proxy mints the 24-hour token) — both `--var store=…`, `--var version=…` |
@@ -352,6 +353,36 @@ file in the clear, while the token stays a reference.
   handling and inference to the United States and is an edit to `base_url`,
   not a second profile. xAI's management API is a different host and a
   different credential — a management key — and no profile fronts it.
+- **On Hugging Face one token reaches three hosts, and the token is the real
+  limit.** A classic `read` token cannot commit however the ACL reads; a
+  fine-grained one reaches only the repos and permissions it was given, and is
+  the one to enrol. `huggingface` is the Hub at `huggingface.co`. Its `read`
+  level is every GET and HEAD — search, repo metadata, file trees and downloads
+  (`/<repo>/resolve/<rev>/<file>`, `datasets/` or `spaces/` in front for those
+  types) — plus the `paths-info` POST `huggingface_hub` reads metadata with.
+  Downloads answer with a redirect to a signed URL on the CDN or Xet storage,
+  which the client follows itself, so the bytes never pass through the proxy.
+  Uploads are half here for the same reason: the commit is a POST to the Hub,
+  but large files go to LFS or Xet storage elsewhere with a short-lived token
+  the Hub hands back, and `GET …/xet-write-token/…` is that token — `read`
+  refuses it and `ask-writes` asks. `write` allows the rest, but still asks
+  before a Job or a Space hardware or sleep-time change, which bill compute
+  credits, and before deleting, renaming or squashing a repo, changing its
+  settings (where it turns public or ungated) or setting a Space secret.
+  `huggingface-inference` is `router.huggingface.co`: every call bills, the
+  model id names its provider (`org/model:provider`) where the ACL cannot see
+  it, and `inference` is `/v1/chat/completions` — the only task the router
+  serves OpenAI-compatibly — plus the model list; embeddings, images, video
+  and speech go to per-provider routes and need `--access all`. A fine-grained
+  token needs "Make calls to Inference Providers". It has no `verify` probe,
+  because `/v1/models` answers without a token; verify the same credential
+  through `huggingface`'s `/api/whoami-v2`. `huggingface-mcp` is
+  `huggingface.co/mcp` with the token as a bearer. Its tools are chosen per
+  account at huggingface.co/settings/mcp, so the rules match names: `read`
+  allows lookups (`hf_fs`, `hub_repo_search`, `*_search`, `*_get`, …) and
+  prompts for the rest; `write` allows every tool but Jobs and sandboxes. A
+  session offering only `hf_fs`, `hf_whoami`, `hub_repo_search` and
+  `hub_repo_details` is the anonymous set — the token did not arrive.
 - **On Stripe the decision is money, not verbs.** `stripe` has four levels.
   `read` is every GET plus `POST /v1/invoices/create_preview`, which renders an
   invoice without creating one. `records` adds creating and editing customers,
