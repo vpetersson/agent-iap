@@ -248,6 +248,17 @@ in `--username-secret` is still refused.
 
 ### Verifying
 
+Every enrolment reads the reference it just wrote, whether or not `--verify`
+was asked for. The proxy reads every reference before it serves anything, so a
+reference it cannot read — an `op://` field spelled `credentials` on an item
+whose field is `credential` — is a proxy that will not start. `upstream add`,
+`mcp-server add` and `profile add` read the new entry's references once it is
+written and put the file back as it was if one fails, naming the reference and
+what `op` (or the environment, or the file) said. The console's forms do the
+same and stay open on the error. `--no-check` writes the entry anyway, for a
+reference only the proxy's own host can read: an `env:` set in its unit file,
+a `file:` that exists on another machine.
+
 `check` asks the file a question: does it parse, does every reference resolve,
 do the rules make sense. The other half is only answerable by the service:
 

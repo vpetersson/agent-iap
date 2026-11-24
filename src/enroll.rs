@@ -47,7 +47,7 @@ use crate::config::{AclRuleConfig, Action, AuthConfig, Config};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::identity;
-use crate::secrets::SecretRef;
+use crate::secrets::{SecretRef, SecretResolver};
 
 /// An agent enrolled into the file, and the token that proves it is that agent.
 pub struct EnrolledAgent {
@@ -1826,6 +1826,72 @@ fn auth_secrets(auth: &AuthSpec) -> Vec<&str> {
             .map(String::as_str)
             .collect(),
     }
+}
+
+/// Run an enrolment, then prove the service it wrote can have its credential
+/// read — and put the file back as it was if it cannot.
+///
+/// A reference is only ever *parsed* on the way in, so `op://Private/Item/credentials`
+/// against an item whose field is `credential` was written without a word, and
+/// found out at the next start: the proxy resolves every reference before it
+/// serves anything, so one typo in one upstream was a proxy that would not
+/// start at all. Reading it here puts the error next to the command that
+/// caused it, while the operator still has the reference in front of them.
+///
+/// Checked after the write rather than before because the write is what knows
+/// the whole entry — a profile builds its scheme from flags and vars — and the
+/// file is what knows which 1Password account each reference is read from.
+/// `write` hands back whatever it produced and the name of the service it
+/// wrote; `None` for a dry run, which wrote nothing to check.
+pub fn checked<T>(
+    path: &Path,
+    check: bool,
+    write: impl FnOnce() -> Result<(T, Option<String>)>,
+) -> Result<T> {
+    let before = read(path)?;
+    let (written, name) = write()?;
+    let Some(name) = name.filter(|_| check) else {
+        return Ok(written);
+    };
+    if let Err(error) = check_service_resolves(path, &name) {
+        save(path, before).with_context(|| {
+            format!(
+                "{error:#}
+
+and putting the file back failed"
+            )
+        })?;
+        return Err(error.context(format!(
+            "nothing was written to `{}`: the proxy would refuse to start with `{name}` in it",
+            path.display()
+        )));
+    }
+    Ok(written)
+}
+
+/// Read every reference one service in the file names.
+pub fn check_service_resolves(path: &Path, name: &str) -> Result<()> {
+    let config = policy(path)?;
+    let references = config.service_secret_refs(name);
+    if references.is_empty() {
+        return Ok(());
+    }
+    let resolver = SecretResolver::for_config(&config);
+    let failures: Vec<String> = resolver
+        .resolve_all(&references)
+        .into_iter()
+        .zip(&references)
+        .filter_map(|(answer, reference)| {
+            answer.err().map(|error| format!("  {reference}: {error}"))
+        })
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{name}`'s credential could not be read\n{}",
+        failures.join("\n")
+    )
 }
 
 /// Reject a credential where a *reference* belongs, before anything is written.

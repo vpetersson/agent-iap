@@ -220,7 +220,11 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             let name = required(form, "name")?;
             let base_url = required(form, "base-url")?;
             let headers = form.pairs("set-header")?;
-            enroll::add_upstream(path, &name, &base_url, &form.auth().to_spec()?, &headers)?;
+            let auth = form.auth().to_spec()?;
+            enroll::checked(path, true, || {
+                enroll::add_upstream(path, &name, &base_url, &auth, &headers)?;
+                Ok(((), Some(name.clone())))
+            })?;
             Ok(Effect::wrote(
                 form,
                 &name,
@@ -230,7 +234,11 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
         Intent::EditUpstream(name) => {
             let base_url = required(form, "base-url")?;
             let headers = form.pairs("set-header")?;
-            enroll::edit_upstream(path, name, &base_url, &form.auth().to_spec()?, &headers)?;
+            let auth = form.auth().to_spec()?;
+            enroll::checked(path, true, || {
+                enroll::edit_upstream(path, name, &base_url, &auth, &headers)?;
+                Ok(((), Some(name.clone())))
+            })?;
             Ok(Effect::wrote(
                 form,
                 name,
@@ -250,7 +258,11 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
                     cwd: form.opt("cwd"),
                 },
             };
-            enroll::add_mcp_server(path, &name, &transport, &form.auth().to_spec()?)?;
+            let auth = form.auth().to_spec()?;
+            enroll::checked(path, true, || {
+                enroll::add_mcp_server(path, &name, &transport, &auth)?;
+                Ok(((), Some(name.clone())))
+            })?;
             Ok(Effect::wrote(
                 form,
                 &name,
@@ -321,23 +333,26 @@ pub fn submit(policy: &Policy, form: &Form) -> Result<Effect> {
             let id = required(form, "id")?;
             let profile = profiles::get(&id)?;
             let dry_run = form.flag("dry-run");
-            let added = profiles::add(
-                path,
-                &profile,
-                &profiles::AddOptions {
-                    name: form.opt("as"),
-                    secret: form.opt("secret"),
-                    access: form.opt("access"),
-                    vars: form
-                        .prefixed("var:")
-                        .into_iter()
-                        .map(|(name, value)| format!("{name}={value}"))
-                        .collect(),
-                    agent: form.opt("agent"),
-                    grant: form.flag("grant"),
-                    dry_run,
-                },
-            )?;
+            let options = profiles::AddOptions {
+                name: form.opt("as"),
+                secret: form.opt("secret"),
+                access: form.opt("access"),
+                vars: form
+                    .prefixed("var:")
+                    .into_iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect(),
+                agent: form.opt("agent"),
+                grant: form.flag("grant"),
+                dry_run,
+            };
+            // The console *is* the proxy, so a reference it cannot read here is
+            // one the reload behind this write would refuse.
+            let added = enroll::checked(path, true, || {
+                let added = profiles::add(path, &profile, &options)?;
+                let name = added.plan.is_none().then(|| added.name.clone());
+                Ok((added, name))
+            })?;
             if let Some(plan) = added.plan {
                 return Ok(Effect {
                     message: format!("`{id}` — nothing written"),

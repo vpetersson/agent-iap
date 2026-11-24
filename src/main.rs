@@ -450,6 +450,22 @@ struct VerifyArg {
     /// run, so nothing is verified by one either.
     #[arg(long)]
     verify: bool,
+    /// Write the entry even if its credential reference cannot be read from
+    /// here. Without it the reference is read once the entry is written, and
+    /// the file is put back if that fails — the proxy refuses to start with a
+    /// reference it cannot read, so the mistake is caught here rather than at
+    /// the next start. For a reference only the proxy's own host can read: an
+    /// `env:` set in its unit file, a `file:` on another machine.
+    #[arg(long)]
+    no_check: bool,
+}
+
+/// What `--no-check` is for, said where it is needed.
+fn no_check_hint(error: anyhow::Error) -> anyhow::Error {
+    error.context(
+        "fix the reference and run this again — or pass `--no-check` if only the proxy's \
+         own host can read it",
+    )
 }
 
 #[derive(Subcommand)]
@@ -2966,7 +2982,11 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
     let auth = auth.to_spec()?;
     let headers = parse_pairs(&set_headers, "--set-header")?;
 
-    enroll::add_upstream(&path, &name, &base_url, &auth, &headers)?;
+    enroll::checked(&path, !verify.no_check, || {
+        enroll::add_upstream(&path, &name, &base_url, &auth, &headers)?;
+        Ok(((), Some(name.clone())))
+    })
+    .map_err(no_check_hint)?;
     println!("Added upstream `{name}` to {}.", path.display());
     println!("Agents reach it at `/{name}/<path>`.");
     print!("{}", first_call_notice(&path, &name, "http")?);
@@ -3130,7 +3150,11 @@ fn add_mcp_server(options: AddMcpServer) -> Result<()> {
     };
 
     let auth = auth.to_spec()?;
-    enroll::add_mcp_server(&path, &name, &transport, &auth)?;
+    enroll::checked(&path, !verify.no_check, || {
+        enroll::add_mcp_server(&path, &name, &transport, &auth)?;
+        Ok(((), Some(name.clone())))
+    })
+    .map_err(no_check_hint)?;
     println!("Added MCP server `{name}` to {}.", path.display());
     print!("{}", first_call_notice(&path, &name, "mcp")?);
     // The one thing that is specific to MCP and has no symptom when it is got
@@ -3688,7 +3712,13 @@ fn add_from_profile(
     options: &profiles::AddOptions,
     verify: VerifyArg,
 ) -> Result<()> {
-    let added = profiles::add(path, profile, options)?;
+    let added = enroll::checked(path, !verify.no_check, || {
+        let added = profiles::add(path, profile, options)?;
+        // A dry run wrote nothing, so there is nothing to read back.
+        let name = added.plan.is_none().then(|| added.name.clone());
+        Ok((added, name))
+    })
+    .map_err(no_check_hint)?;
 
     if let Some(plan) = &added.plan {
         println!("{plan}");

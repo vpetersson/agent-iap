@@ -4781,38 +4781,25 @@ name = "github"
 base_url = "https://api.github.com"
 "#;
 
-    /// Open the `add an upstream` form on `bearer`, named, with the cursor on
-    /// `secret` and a credential typed into it — the state the refusal used to
-    /// be a dead end from.
-    /// The reported bug: an upstream added with a reference the proxy could
-    /// not read was written, refused, and on no pane — so it could not be
-    /// opened to fix the reference that was the whole problem.
+    /// An external edit can still leave an unreadable reference in the file.
+    /// Keep it visible and editable even though enrolment now checks references
+    /// before writing them from the console.
     #[tokio::test]
     async fn an_upstream_the_proxy_refused_is_still_on_the_pane_to_be_fixed() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_for_test(dir.path());
+        enroll::add_upstream(
+            &app.policy.path,
+            "anthropic",
+            "https://api.anthropic.com",
+            &enroll::AuthSpec::Bearer {
+                secret: "env:AGENT_IAP_TEST_NOT_SET".into(),
+            },
+            &[],
+        )
+        .unwrap();
         app.tab = Tab::Upstreams;
-        app.clamp_cursors();
-        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
-        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
-        let Some(Modal::Form(form)) = &mut app.modal else {
-            panic!("the upstream form is not open");
-        };
-        set(form, "name", "anthropic");
-        set(form, "base-url", "https://api.anthropic.com");
-        let auth = form
-            .fields
-            .iter()
-            .position(|field| field.key == "auth")
-            .unwrap();
-        form.focus(auth);
-        while form.text("auth") != "bearer" {
-            form.handle(KeyEvent::from(KeyCode::Right));
-        }
-        // No `op` here, which is the same refusal as a vault that is locked
-        // or an item spelled wrong.
-        set(form, "secret", "op://Privat/Anthropic/credential");
-        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.reload(Said::after_a_write(None));
         app.settle().await;
 
         assert!(app.flash.as_ref().is_some_and(|flash| flash.failed));
@@ -4828,14 +4815,57 @@ base_url = "https://api.github.com"
         let screen = render(&mut app, 160, 30);
         assert!(screen.contains("NOT IN FORCE"), "{screen}");
 
-        // And `e` on it opens the entry as written, which is the way out.
         app.cursor[Tab::Upstreams.index()].select(Some(0));
         app.handle(KeyEvent::from(KeyCode::Char('e'))).unwrap();
         let Some(Modal::Form(form)) = &app.modal else {
             panic!("`e` did not open the refused upstream");
         };
         assert_eq!(form.intent, form::Intent::EditUpstream("anthropic".into()));
-        assert_eq!(form.text("secret"), "op://Privat/Anthropic/credential");
+        assert_eq!(form.text("secret"), "env:AGENT_IAP_TEST_NOT_SET");
+    }
+
+    /// Open the `add an upstream` form on `bearer`, named, with the cursor on
+    /// `secret` and a credential typed into it — the state the refusal used to
+    /// be a dead end from.
+    /// The console is the proxy, so a reference it cannot read is one the
+    /// reload behind the write would refuse. Refused at the form instead, with
+    /// the form still up to fix it, and the file as it was.
+    #[tokio::test]
+    async fn an_upstream_whose_credential_cannot_be_read_is_refused_at_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_test(dir.path());
+        let before = std::fs::read_to_string(&app.policy.path).unwrap();
+        app.tab = Tab::Upstreams;
+        app.clamp_cursors();
+        app.handle(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        app.handle(KeyEvent::from(KeyCode::Esc)).unwrap();
+        let Some(Modal::Form(form)) = &mut app.modal else {
+            panic!("the upstream form is not open");
+        };
+        set(form, "name", "hf");
+        set(form, "base-url", "https://huggingface.co");
+        let auth = form
+            .fields
+            .iter()
+            .position(|field| field.key == "auth")
+            .unwrap();
+        form.focus(auth);
+        while form.text("auth") != "bearer" {
+            form.handle(KeyEvent::from(KeyCode::Right));
+        }
+        set(form, "secret", "env:AGENT_IAP_TEST_NOT_SET");
+        app.handle(KeyEvent::from(KeyCode::Enter)).unwrap();
+        app.settle().await;
+
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("the form closed on a credential nobody can read");
+        };
+        let error = form.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("env:AGENT_IAP_TEST_NOT_SET") && error.contains("nothing was written"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&app.policy.path).unwrap(), before);
     }
 
     async fn upstream_form_with_a_typed_credential(app: &mut App, name: &str, credential: &str) {
