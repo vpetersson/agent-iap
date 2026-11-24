@@ -237,6 +237,13 @@ impl Field {
     }
 }
 
+/// The byte offset of the `chars`th character, or the end of the string.
+fn byte_at(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index)
+}
+
 /// Where the form drew the things a mouse can hit.
 #[derive(Clone)]
 pub struct Hits {
@@ -280,6 +287,12 @@ pub struct Form {
     pub intent: Intent,
     pub fields: Vec<Field>,
     focus: usize,
+    /// Where the caret is in the focused text field, counted in characters
+    /// back from the end. Counted from the end so that a value written in
+    /// from outside — a picker, a kept reference — leaves the caret where
+    /// typing would resume, and so that zero, the default, is "after the last
+    /// character" in every field without knowing how long any of them is.
+    back: usize,
     pub error: Option<String>,
     /// This form opens on a profile picker, so moving that choice is not an
     /// edit to a field — it is a different form. The console rebuilds it;
@@ -373,6 +386,7 @@ impl Form {
             intent,
             fields,
             focus: 0,
+            back: 0,
             error: None,
             picker: false,
             overlay: None,
@@ -539,17 +553,20 @@ impl Form {
             KeyCode::Tab | KeyCode::Down => {
                 if let Some(at) = at {
                     self.focus = visible[(at + 1) % visible.len()];
+                    self.back = 0;
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Some(at) = at {
                     self.focus = visible[(at + visible.len() - 1) % visible.len()];
+                    self.back = 0;
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(Value::Text(text)) = self.focused_mut() {
                     text.clear();
                 }
+                self.back = 0;
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self.pick(),
             // Never typed into the field, whether or not there is anything to
@@ -568,6 +585,7 @@ impl Form {
         let visible = self.visible();
         if !visible.contains(&self.focus) {
             self.focus = visible.first().copied().unwrap_or(0);
+            self.back = 0;
         }
         Outcome::Continue
     }
@@ -729,15 +747,38 @@ impl Form {
         let Some(field) = self.fields.get_mut(self.focus) else {
             return;
         };
+        if let Value::Text(text) = &mut field.value {
+            // Editing a reference is mostly fixing one segment of it — the
+            // vault in `op://Private/…`, a field name at the end — so the caret
+            // moves, and typing and deleting happen where it is rather than
+            // only at the end.
+            let len = text.chars().count();
+            let back = self.back.min(len);
+            let at = len - back;
+            match code {
+                KeyCode::Char(c) => {
+                    text.insert(byte_at(text, at), c);
+                    field.touched = true;
+                }
+                KeyCode::Backspace if at > 0 => {
+                    text.remove(byte_at(text, at - 1));
+                    field.touched = true;
+                }
+                KeyCode::Delete if back > 0 => {
+                    text.remove(byte_at(text, at));
+                    field.touched = true;
+                    self.back = back - 1;
+                    return;
+                }
+                KeyCode::Left => self.back = (back + 1).min(len),
+                KeyCode::Right => self.back = back.saturating_sub(1),
+                KeyCode::Home => self.back = len,
+                KeyCode::End => self.back = 0,
+                _ => {}
+            }
+            return;
+        }
         match (code, &mut field.value) {
-            (KeyCode::Char(c), Value::Text(text)) => {
-                text.push(c);
-                field.touched = true;
-            }
-            (KeyCode::Backspace, Value::Text(text)) => {
-                text.pop();
-                field.touched = true;
-            }
             (KeyCode::Char(' '), Value::Flag(on)) => *on = !*on,
             (KeyCode::Left, Value::Flag(on)) | (KeyCode::Right, Value::Flag(on)) => *on = !*on,
             (KeyCode::Right, Value::Choice { options, selected }) if !options.is_empty() => {
@@ -754,6 +795,7 @@ impl Form {
     pub fn focus(&mut self, index: usize) {
         if self.visible().contains(&index) {
             self.focus = index;
+            self.back = 0;
         }
     }
 
@@ -835,7 +877,11 @@ impl Form {
                 let value = field.rendered();
                 let blank = value.trim().is_empty();
                 let shown = match (&field.value, focused) {
-                    (Value::Text(_), true) => format!("{value}▏"),
+                    (Value::Text(_), true) => {
+                        let at = value.chars().count().saturating_sub(self.back);
+                        let index = byte_at(&value, at);
+                        format!("{}▏{}", &value[..index], &value[index..])
+                    }
                     (Value::Choice { .. }, _) => format!("◂ {value} ▸"),
                     _ => value,
                 };
@@ -1503,6 +1549,52 @@ mod tests {
         type_in(&mut form, "env:TOKEN");
         assert!(matches!(form.handle(ctrl_k), Outcome::Continue));
         assert_eq!(form.text("secret"), "env:TOKEN");
+    }
+
+    /// A typo in the middle of a reference is fixed where it is, not by
+    /// deleting back to it and typing the rest out again.
+    #[test]
+    fn the_caret_moves_through_a_reference_and_edits_happen_there() {
+        let key = |code| KeyEvent::from(code);
+        let mut form = on_the_secret();
+        type_in(&mut form, "op://Privat/GitHub/token");
+        // Back to just after `Privat`.
+        for _ in 0.."/GitHub/token".len() {
+            form.handle(key(KeyCode::Left));
+        }
+        type_in(&mut form, "e");
+        assert_eq!(form.text("secret"), "op://Private/GitHub/token");
+
+        // Backspace takes the character before the caret, delete the one
+        // after it.
+        form.handle(key(KeyCode::Backspace));
+        form.handle(key(KeyCode::Delete));
+        assert_eq!(form.text("secret"), "op://PrivatGitHub/token");
+
+        // Home and end, and typing at each.
+        form.handle(key(KeyCode::Home));
+        type_in(&mut form, "x");
+        form.handle(key(KeyCode::End));
+        type_in(&mut form, "é");
+        assert_eq!(form.text("secret"), "xop://PrivatGitHub/tokené");
+        // The caret stops at the ends rather than wrapping or panicking.
+        for _ in 0..100 {
+            form.handle(key(KeyCode::Right));
+        }
+        form.handle(key(KeyCode::Delete));
+        assert_eq!(form.text("secret"), "xop://PrivatGitHub/tokené");
+        for _ in 0..100 {
+            form.handle(key(KeyCode::Left));
+        }
+        form.handle(key(KeyCode::Backspace));
+        form.handle(key(KeyCode::Delete));
+        assert_eq!(form.text("secret"), "op://PrivatGitHub/tokené");
+
+        // Leaving the field and coming back puts the caret at the end.
+        form.handle(key(KeyCode::Tab));
+        form.handle(key(KeyCode::BackTab));
+        type_in(&mut form, "!");
+        assert_eq!(form.text("secret"), "op://PrivatGitHub/tokené!");
     }
 
     /// What the console writes back once the store has the value.
