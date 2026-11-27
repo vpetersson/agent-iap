@@ -63,7 +63,7 @@ Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
 sitemap.
 
-Nine levels exist for reasons that are not about permissions:
+Ten levels exist for reasons that are not about permissions:
 
 - **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
   parks everything else for a human. The ACL cannot tell a reasonable POST from
@@ -112,6 +112,12 @@ Nine levels exist for reasons that are not about permissions:
   hands it to another team, so both prompt, and any other DELETE is refused. On
   Anthias, settings, reboot, shutdown and restoring a backup prompt — settings
   can change the very password the proxy holds.
+- **`balena --access operate`** (and `openbalena`) is the person on call for a
+  fleet: every read, plus the device actions that can be done again — identify,
+  restart the app or a service, reboot, check for an update. A shutdown prompts,
+  because a device that is off stays off until someone is standing next to it,
+  and so does a purge, which deletes the app's data. Any other write prompts and
+  DELETE is refused.
 
 ## What is in the catalog
 
@@ -132,6 +138,7 @@ starting point that writes ordinary TOML, not a special case in the proxy.
 | Sentry | `sentry` (sentry.io, `--var region=us\|de`), `sentry-self-hosted` (`--var host=…`), `sentry-mcp`, `sentry-mcp-self-hosted` |
 | sbomify | `sbomify` (API v2), `sbomify-v1` (deprecated, same token, `/sboms` and `team_key` paths), and `sbomify-self-hosted` / `sbomify-v1-self-hosted` for staging or an install of your own (`--var host=…`, `--var scheme=http` for a plain-HTTP one) |
 | Screenly | `screenly` (API v4 and v4.1, `Authorization: Token`), `screenly-mcp` (the CLI's `screenly mcp`, same token), `anthias` (one self-hosted player, `--var host=… --var username=…`) |
+| balena | `balena` (balenaCloud), `openbalena` (an install of your own, `--var host=api.…`) — the same API, the same rules |
 | Hugging Face | `huggingface` (the Hub: search, metadata, downloads and commits), `huggingface-inference` (Inference Providers, the OpenAI-compatible router), `huggingface-mcp` (the hosted MCP server) — all one `hf_…` token |
 | Spotify | `spotify` (client-credentials; the proxy mints the access token) |
 | Stripe | `stripe` (REST, with a `records` level that edits the catalogue and moves no money), `stripe-mcp` (the hosted MCP server, on an agent-tagged key) |
@@ -353,6 +360,35 @@ file in the clear, while the token stays a reference.
   handling and inference to the United States and is an edit to `base_url`,
   not a second profile. xAI's management API is a different host and a
   different credential — a management key — and no profile fronts it.
+- **A balena API key is its user, everywhere.** It reaches every fleet, device
+  and organization that user can, and the ACL cannot narrow it by fleet:
+  resources are addressed by id (`/v7/device(123)`) or by an OData `$filter`
+  in the query string, and rules see only the path. Where "which fleets" has
+  to be a real limit, enrol a key belonging to a user who is a member of only
+  those. `read` therefore also reads environment and service variables, which
+  is where fleets keep their secrets — directly, and through `$expand` on
+  `/v7/device`, which no path rule can tell from listing devices. Three GETs
+  hand back a credential rather than data: `/user/v1/refresh-token` (a new
+  session token), `/auth/v1/token` (a registry token) and `/download-config`
+  (a device `config.json`, carrying a provisioning key for the fleet). They
+  are refused at `read` and `operate`, with the `/api-key/…` POSTs that create
+  keys, and prompt above them. Device actions are POSTs to `/supervisor/…`
+  that the API relays to the device over its VPN, naming the device in the
+  body — where an `appId` in place of a `uuid` means every device in the
+  fleet, which the ACL cannot see. `write` allows them but still asks before a
+  shutdown or purge, before deleting a fleet, device, release or organization,
+  and before a membership, invite, team or SSH public key — the last opens a
+  shell on every device its user reaches. Host OS updates, `balena push`,
+  image pulls, `balena ssh` and public device URLs are other hosts and do not
+  go through this upstream. Enrol an API key, not the token `balena login`
+  leaves behind, which expires after seven days. `verify` calls
+  `/actor/v1/whoami`, which names whatever key it is given — user, fleet or
+  device — and is a 401 for a bad one. `openbalena` is the same API, routes
+  and rules at `--var host=api.<your domain>`; it has one user and no
+  dashboard, so its key comes from `balena api-key generate` with the CLI
+  pointed at the install, and what only balenaCloud has — teams, billing, OS
+  image downloads, public device URLs, remote builds, host OS updates —
+  answers 404 there rather than being denied.
 - **On Hugging Face one token reaches three hosts, and the token is the real
   limit.** A classic `read` token cannot commit however the ACL reads; a
   fine-grained one reaches only the repos and permissions it was given, and is

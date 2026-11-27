@@ -2474,6 +2474,142 @@ fn huggingface_mcp_access() -> Vec<Access> {
     ]
 }
 
+const BALENA_NOTE: &str = "A balena API key is its owner, whole: it reaches every fleet, \
+     device and organization the user can, and the ACL cannot narrow it by fleet — the \
+     resources are addressed by id (`/v7/device(123)`) or by an OData `$filter` in the query \
+     string, and rules see the path alone. Where \"which fleets\" has to be a real limit, \
+     enrol a key belonging to a user who is a member of only those. For the same reason \
+     `read` reads environment and service variables, which is where fleets tend to keep \
+     their secrets: `/v7/device_environment_variable` is a GET, and so is `$expand` on \
+     `/v7/device`, which no path rule can tell apart from listing devices. Three GETs hand \
+     back a credential rather than data, and are refused at `read` and `operate` and asked \
+     about above them: `/user/v1/refresh-token` mints a new session token, `/auth/v1/token` \
+     a registry token, and `/download-config` a device `config.json`, which carries a \
+     provisioning key for the fleet; so are the `/api-key/…` POSTs that create keys. \
+     Device actions are POSTs to `/supervisor/…`, relayed to the device over the VPN, and \
+     the device is named in the body — an `appId` there instead of a `uuid` is every \
+     device in the fleet at once, and the ACL cannot see which. `operate` allows identify, \
+     restart, reboot and update, and asks before a shutdown, which nothing can undo \
+     remotely, and a purge, which deletes the app's data. `write` \
+     still asks before both, before deleting a fleet, device, release or organization, and \
+     before anything that grants access — memberships, invites, teams and SSH public keys, \
+     the last of which opens a shell on every device the user reaches. Not through this \
+     upstream: host OS updates (`actions.…`), `balena push` (the builder), image pulls \
+     (the registry), `balena ssh` and public device URLs are other hosts, and the \
+     dashboard is a browser. Turning a public device URL on is a PATCH to the device, so \
+     `write` allows it. Enrol an API key rather than the token `balena login` leaves \
+     behind: a session token expires after seven days, and the first sign is a 401.";
+
+/// What `read`, `operate`, `ask-writes` and `write` mean for the balena API,
+/// on balenaCloud or on an openBalena install — the routes are the same
+/// codebase.
+fn balena_access() -> Vec<Access> {
+    // Everything that hands back a credential. A key minted here would reach
+    // the API without the proxy, and the three GETs would otherwise come
+    // through `read`, which is why the rule precedes the reads.
+    const CREDENTIALS: &[&str] = &[
+        "/api-key/**",
+        "/application/*/generate-api-key",
+        "/user/v1/refresh-token",
+        "/auth/v1/token",
+        "/download-config",
+        "/login_",
+    ];
+    // Device actions the supervisor answers that change nothing: the
+    // supervisor proxy is a POST whatever the device is asked.
+    const DEVICE_READS: &[&str] = &[
+        "/supervisor/ping",
+        "/supervisor/v1/device",
+        "/supervisor/v1/healthy",
+    ];
+    // What an operator does to a misbehaving device, and can do again: blink
+    // the LED, restart the app or one service, reboot, check for an update.
+    const DEVICE_OPS: &[&str] = &[
+        "/supervisor/v1/blink",
+        "/supervisor/v1/restart",
+        "/supervisor/v1/reboot",
+        "/supervisor/v1/update",
+        "/supervisor/v2/applications/*/restart-service",
+        "/supervisor/v2/applications/*/start-service",
+    ];
+    // A shut-down device stays down until someone is standing next to it, and
+    // a purge deletes the app's `/data`.
+    const DEVICE_LOSS: &[&str] = &["/supervisor/v1/shutdown", "/supervisor/v1/purge"];
+    // Removing the things a fleet is made of, whether by id or by `$filter`.
+    const REMOVALS: &[&str] = &[
+        "/v*/application",
+        "/v*/application(*)",
+        "/v*/device",
+        "/v*/device(*)",
+        "/v*/release",
+        "/v*/release(*)",
+        "/v*/organization",
+        "/v*/organization(*)",
+    ];
+    // Who else gets in: members, invites, teams, and SSH keys, which open a
+    // shell on every device their user reaches.
+    const ACCESS: &[&str] = &[
+        "/v*/*membership*",
+        "/v*/invitee*",
+        "/v*/*has_direct_access*",
+        "/v*/team*",
+        "/v*/*public_key*",
+        "/v*/api_key*",
+    ];
+    const CHANGES: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
+    let credentials = |action| rule("credentials", &["*"], CREDENTIALS, action);
+    let reads = || rule("reads", &["GET", "HEAD"], &["/**"], "allow");
+    let device_reads = || rule("device-reads", &["POST"], DEVICE_READS, "allow");
+    vec![
+        access(
+            "read",
+            "every GET — fleets, devices, releases, variables and logs; nothing that \
+             writes or mints a key",
+            &[],
+            vec![credentials("deny"), reads(), device_reads()],
+        ),
+        access(
+            "operate",
+            "reads, plus identify, restart, reboot and update a device; anything else \
+             prompts, DELETE denied",
+            &[],
+            vec![
+                credentials("deny"),
+                reads(),
+                device_reads(),
+                rule("device-ops", &["POST"], DEVICE_OPS, "allow"),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "ask-writes",
+            "reads allowed, anything else prompts, DELETE denied",
+            &[],
+            vec![
+                credentials("ask"),
+                reads(),
+                device_reads(),
+                rule("deletes", &["DELETE"], &["/**"], "deny"),
+                rule("writes", &["*"], &["/**"], "ask"),
+            ],
+        ),
+        access(
+            "write",
+            "every endpoint; minting keys, shutdown, purge, removals and access grants \
+             still prompt",
+            &[],
+            vec![
+                credentials("ask"),
+                rule("device-loss", &["POST"], DEVICE_LOSS, "ask"),
+                rule("removals", &["DELETE"], REMOVALS, "ask"),
+                rule("access", CHANGES, ACCESS, "ask"),
+                rule("all", &["*"], &["/**"], "allow"),
+            ],
+        ),
+    ]
+}
+
 /// The same three levels for the MCP server, so `--access triage` means the
 /// same thing whichever of the four Sentry profiles it is given to.
 fn sentry_mcp_access() -> Vec<Access> {
@@ -4959,6 +5095,72 @@ pub fn catalog() -> Vec<Profile> {
                     .into(),
             ),
             probe: Some("/v1/api-key".into()),
+        },
+        // ---------------- balena ----------------
+        Profile {
+            id: "balena".into(),
+            title: "balenaCloud API".into(),
+            vendor: "balena".into(),
+            summary: "Fleets, devices, releases and variables on balenaCloud, plus device \
+                      actions relayed to the supervisor."
+                .into(),
+            default_name: "balena".into(),
+            credential: Credential {
+                about: "an API key — `balena api-key generate <name>`, or the dashboard's \
+                        Preferences → Access tokens; it acts as its user, everywhere"
+                    .into(),
+                url: "https://dashboard.balena-cloud.com/preferences/access-tokens".into(),
+            },
+            vars: vec![],
+            service: Service::Http {
+                base_url: "https://api.balena-cloud.com".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: balena_access(),
+            note: Some(BALENA_NOTE.into()),
+            // Names whatever key it is given — user, fleet or device — where
+            // `/user/v1/whoami` takes only a user's, and a bad key is a 401.
+            probe: Some("/actor/v1/whoami".into()),
+        },
+        Profile {
+            id: "openbalena".into(),
+            title: "openBalena API".into(),
+            vendor: "balena".into(),
+            summary: "The same API on an openBalena install of your own.".into(),
+            default_name: "openbalena".into(),
+            credential: Credential {
+                about: "an API key from *that* install — `balena api-key generate <name>` \
+                        with the CLI pointed at it; a balenaCloud key is not valid there"
+                    .into(),
+                url: "https://github.com/balena-io/open-balena#getting-started".into(),
+            },
+            vars: vec![
+                v(
+                    "host",
+                    "your openBalena API host — `api.` and the domain the install was \
+                     configured with, e.g. `api.balena.example.com`; no scheme",
+                    None,
+                ),
+                v(
+                    "scheme",
+                    "`https`, or `http` for an install that terminates TLS nowhere — the \
+                     key crosses that wire in a header",
+                    Some("https"),
+                ),
+            ],
+            service: Service::Http {
+                base_url: "{scheme}://{host}".into(),
+                auth: AuthTemplate::Bearer,
+            },
+            access: balena_access(),
+            note: Some(format!(
+                "openBalena is the core of balenaCloud's API — the routes, the OData model \
+                 and the rules are the same as `balena`'s — but it has one user and no \
+                 dashboard, so keys come from the CLI. Teams, billing, OS image downloads, \
+                 public device URLs, remote builds and host OS updates are balenaCloud's: a path an install \
+                 does not have answers 404 rather than being denied. {BALENA_NOTE}"
+            )),
+            probe: Some("/actor/v1/whoami".into()),
         },
         // ---------------- Hugging Face ----------------
         Profile {
@@ -7644,5 +7846,160 @@ mod tests {
             tool("write", "gr1_flux1_schnell_infer").as_deref(),
             Some("allow")
         );
+    }
+
+    /// balenaCloud and openBalena are one API at two hosts: a bearer key, the
+    /// probe that answers for a key rather than only a session, and the same
+    /// rules — and openBalena's host, being anything, claims no other upstream.
+    #[test]
+    fn balena_and_openbalena_are_one_api_with_a_bearer_key() {
+        let cloud = get("balena").unwrap();
+        let open = get("openbalena").unwrap();
+        for profile in [&cloud, &open] {
+            match build_auth(&profile.service, "env:BALENA_TOKEN", &BTreeMap::new(), &[]).unwrap() {
+                AuthSpec::Bearer { secret } => assert_eq!(secret, "env:BALENA_TOKEN"),
+                other => panic!("`{}` takes a bearer key, got {other:?}", profile.id),
+            }
+            assert_eq!(profile.probe.as_deref(), Some("/actor/v1/whoami"));
+            assert_eq!(profile.default_access().name, "read");
+        }
+        assert_eq!(cloud.endpoint(), "https://api.balena-cloud.com");
+        assert_eq!(open.endpoint(), "{scheme}://{host}");
+        let levels = |p: &Profile| {
+            p.access
+                .iter()
+                .map(|l| (l.name.clone(), format!("{:?}", l.rules)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(levels(&open), levels(&cloud));
+        assert!(resolve_vars(&open, &[]).is_err(), "openBalena needs a host");
+        assert_eq!(
+            probe_for("https://api.balena-cloud.com").as_deref(),
+            Some("/actor/v1/whoami")
+        );
+        assert_eq!(probe_for("https://api.balena.example.com"), None);
+    }
+
+    /// `read` is every GET but the three that hand back a credential, and the
+    /// two supervisor POSTs that only look.
+    #[test]
+    fn balena_read_reads_and_mints_nothing() {
+        let at = |method: &str, path: &str| decides("balena", "read", method, path);
+        for path in [
+            "/actor/v1/whoami",
+            "/v7/application",
+            "/v7/device",
+            "/v7/device(123)",
+            "/v7/device(@id)",
+            "/v7/release",
+            "/v7/device_environment_variable",
+            "/device/v2/0123456789abcdef/logs",
+            "/device-types/v1",
+        ] {
+            assert_eq!(at("GET", path).as_deref(), Some("allow"), "GET {path}");
+        }
+        for path in [
+            "/supervisor/ping",
+            "/supervisor/v1/device",
+            "/supervisor/v1/healthy",
+        ] {
+            assert_eq!(at("POST", path).as_deref(), Some("allow"), "POST {path}");
+        }
+        for (method, path) in [
+            ("GET", "/user/v1/refresh-token"),
+            ("GET", "/auth/v1/token"),
+            ("GET", "/download-config"),
+            ("POST", "/download-config"),
+            ("POST", "/api-key/user/full"),
+            ("POST", "/api-key/v2"),
+            ("POST", "/api-key/application/42/provisioning"),
+            ("POST", "/api-key/device/7/device-key"),
+            ("POST", "/application/42/generate-api-key"),
+            ("POST", "/login_"),
+        ] {
+            assert_eq!(
+                at(method, path).as_deref(),
+                Some("deny"),
+                "{method} {path} hands back a credential"
+            );
+        }
+        assert_eq!(at("POST", "/supervisor/v1/reboot"), None);
+        assert_eq!(at("PATCH", "/v7/device(123)"), None);
+        assert_eq!(at("DELETE", "/v7/device(123)"), None);
+    }
+
+    /// `operate` is the person on call: they may kick a device, not lose one.
+    #[test]
+    fn balena_operate_reboots_and_asks_before_a_shutdown() {
+        let at = |method: &str, path: &str| decides("balena", "operate", method, path);
+        for path in [
+            "/supervisor/v1/blink",
+            "/supervisor/v1/restart",
+            "/supervisor/v1/reboot",
+            "/supervisor/v1/update",
+            "/supervisor/v2/applications/42/restart-service",
+            "/supervisor/v2/applications/42/start-service",
+        ] {
+            assert_eq!(at("POST", path).as_deref(), Some("allow"), "POST {path}");
+        }
+        for (method, path) in [
+            ("POST", "/supervisor/v1/shutdown"),
+            ("POST", "/supervisor/v1/purge"),
+            ("POST", "/supervisor/v2/applications/42/stop-service"),
+            ("POST", "/supervisor/v1/device/host-config"),
+            ("POST", "/supervisor/v1/regenerate-api-key"),
+            // A whole fleet at once, on balenaCloud.
+            ("POST", "/application/42/restart"),
+            ("PATCH", "/v7/device(123)"),
+            ("POST", "/v7/device_environment_variable"),
+        ] {
+            assert_eq!(at(method, path).as_deref(), Some("ask"), "{method} {path}");
+        }
+        assert_eq!(at("DELETE", "/v7/device(123)").as_deref(), Some("deny"));
+        assert_eq!(at("GET", "/user/v1/refresh-token").as_deref(), Some("deny"));
+    }
+
+    /// `write` changes the fleet freely and still asks before what cannot be
+    /// taken back, what lets someone else in, and a key of the agent's own.
+    #[test]
+    fn balena_write_still_asks_before_loss_and_access() {
+        let at = |method: &str, path: &str| decides("balena", "write", method, path);
+        for (method, path) in [
+            ("PATCH", "/v7/device(123)"),
+            ("POST", "/v7/application"),
+            ("POST", "/v7/device_environment_variable"),
+            ("DELETE", "/v7/device_environment_variable(9)"),
+            ("DELETE", "/v7/device_tag(9)"),
+            ("POST", "/supervisor/v1/reboot"),
+            ("GET", "/v7/api_key"),
+        ] {
+            assert_eq!(
+                at(method, path).as_deref(),
+                Some("allow"),
+                "{method} {path}"
+            );
+        }
+        for (method, path) in [
+            ("POST", "/api-key/user/full"),
+            ("GET", "/download-config"),
+            ("POST", "/supervisor/v1/shutdown"),
+            ("POST", "/supervisor/v1/purge"),
+            ("DELETE", "/v7/application(42)"),
+            ("DELETE", "/v7/device"),
+            ("DELETE", "/v7/release(5)"),
+            ("DELETE", "/v7/organization(1)"),
+            ("POST", "/v7/organization_membership"),
+            ("POST", "/v7/invitee__is_invited_to__application"),
+            ("POST", "/v7/user__has__public_key"),
+            ("PATCH", "/v7/api_key(3)"),
+        ] {
+            assert_eq!(at(method, path).as_deref(), Some("ask"), "{method} {path}");
+        }
+
+        let ask = |method: &str, path: &str| decides("balena", "ask-writes", method, path);
+        assert_eq!(ask("GET", "/v7/device").as_deref(), Some("allow"));
+        assert_eq!(ask("GET", "/auth/v1/token").as_deref(), Some("ask"));
+        assert_eq!(ask("POST", "/supervisor/v1/reboot").as_deref(), Some("ask"));
+        assert_eq!(ask("DELETE", "/v7/device(123)").as_deref(), Some("deny"));
     }
 }
