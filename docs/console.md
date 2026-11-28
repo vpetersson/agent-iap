@@ -158,8 +158,27 @@ this much, for how long.
 ```
 
 `←`/`→` picks how long, `↑`/`↓` picks how far, and the line above the buttons
-says what the pair of them will do. All of it is clickable. The durations are
-four different mechanisms:
+says what the pair of them will do. All of it is clickable.
+
+Between "this one path" and "every path on the service" the path row widens
+in place. `g` steps it up one level and `G` steps it back down:
+
+```
+/repos/acme/api/issues/108   →   /repos/acme/api/issues/*   →   /repos/acme/api/**
+                             →   /repos/acme/**             →   /repos/**
+```
+
+The first step covers the siblings (other issues), and each one after that the
+whole subtree of a shorter prefix. `e` lets you type the glob instead, such as
+`/repos/acme/*/issues/*`, with `←`/`→`, `home` and `end` to move inside it. It is checked with the ACL's own matcher (`*` is one
+segment, `**` any depth), and it has to cover the request being answered:
+otherwise the rule it writes would leave the same question coming back. Whatever
+the row says is what every duration uses: the rule written to the file, or the
+answer remembered until quit. An MCP tool name has no parent, so `g` leaves it
+alone, but `e` still works. The method stays the request's own; for more than
+one method, use `agent-iap acl add`.
+
+The durations are four different mechanisms:
 
 - **Once** answers this request — and the identical ones waiting behind it, if
   the agent retried. The next call after that asks again.

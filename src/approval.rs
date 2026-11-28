@@ -70,6 +70,8 @@ impl Outcome {
 /// A `None` field places no constraint. Matching is exact rather than glob:
 /// every scope here is built from a request that actually arrived, so there is
 /// nothing to pattern-match and nothing for a stray `*` in a tool name to do.
+/// The one exception is `path_pattern`, which the operator widened or typed in
+/// the dialogue, and which is matched the way an ACL rule's `paths` are.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub agent: Option<String>,
@@ -77,6 +79,9 @@ pub struct Scope {
     pub target: Option<String>,
     pub method: Option<String>,
     pub path: Option<String>,
+    /// `*` is one segment, `**` any depth — the same matcher as the ACL's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_pattern: Option<String>,
 }
 
 impl Scope {
@@ -88,6 +93,7 @@ impl Scope {
             target: Some(request.target.clone()),
             method: Some(request.method.clone()),
             path: Some(request.path.clone()),
+            path_pattern: None,
         }
     }
 
@@ -97,6 +103,11 @@ impl Scope {
             && self.target.as_ref().is_none_or(|t| *t == request.target)
             && self.method.as_ref().is_none_or(|m| *m == request.method)
             && self.path.as_ref().is_none_or(|p| *p == request.path)
+            && self.path_pattern.as_ref().is_none_or(|pattern| {
+                // shortcut: compiled on every match; cache it if remembered answers grow past a handful.
+                crate::acl::path_glob(pattern)
+                    .is_ok_and(|compiled| crate::acl::path_matches(&[compiled], &request.path))
+            })
     }
 }
 
@@ -547,12 +558,43 @@ impl ApprovalBroker {
 }
 
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
     fn request() -> AccessRequest {
         AccessRequest::http("claude", "gh", "POST", "/repos/x/issues")
+    }
+
+    fn issues_scope() -> Scope {
+        Scope {
+            agent: Some("claude".into()),
+            kind: Some(Kind::Http),
+            target: Some("gh".into()),
+            method: Some("PATCH".into()),
+            path: None,
+            path_pattern: Some("/repos/acme/api/issues/*".into()),
+        }
+    }
+
+    #[test]
+    fn test_scope_matches__when_path_pattern_covers_sibling__should_match() {
+        let sibling = AccessRequest::http("claude", "gh", "PATCH", "/repos/acme/api/issues/109");
+        assert!(issues_scope().matches(&sibling));
+    }
+
+    #[test]
+    fn test_scope_matches__when_path_is_one_segment_deeper__should_not_match() {
+        let deeper =
+            AccessRequest::http("claude", "gh", "PATCH", "/repos/acme/api/issues/109/labels");
+        assert!(!issues_scope().matches(&deeper));
+    }
+
+    #[test]
+    fn test_scope_matches__when_path_is_in_other_repo__should_not_match() {
+        let elsewhere = AccessRequest::http("claude", "gh", "PATCH", "/repos/acme/web/issues/109");
+        assert!(!issues_scope().matches(&elsewhere));
     }
 
     #[tokio::test]
